@@ -1,0 +1,76 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      args:
+        EMBEDDING_MODEL: ${EMBEDDING_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
+
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-gpt-4.1-mini}
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
+
+      # Use the embedding model downloaded during image build.
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+
+      MAX_FILE_SIZE_MB: ${MAX_FILE_SIZE_MB:-25}
+      MAX_FILES_PER_COLLECTION: ${MAX_FILES_PER_COLLECTION:-20}
+      MAX_TOTAL_PAGES: ${MAX_TOTAL_PAGES:-2000}
+      COLLECTION_TTL_MINUTES: ${COLLECTION_TTL_MINUTES:-120}
+      MAX_COLLECTIONS: ${MAX_COLLECTIONS:-100}
+      TOP_K: ${TOP_K:-6}
+      MIN_SIMILARITY: ${MIN_SIMILARITY:-0.20}
+      MAX_CONTEXT_CHARS: ${MAX_CONTEXT_CHARS:-18000}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://localhost:8080}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+    expose:
+      - "8000"
+
+    restart: unless-stopped
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)"
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+
+  frontend:
+    build:
+      context: ./frontend
+    expose:
+      - "80"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  nginx:
+    image: nginx:1.27-alpine
+    depends_on:
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
+    ports:
+      - "8081:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

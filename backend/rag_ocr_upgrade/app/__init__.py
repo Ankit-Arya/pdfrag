@@ -1,0 +1,1 @@
+"""PDF-grounded RAG API."""

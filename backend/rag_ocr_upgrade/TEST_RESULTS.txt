@@ -1,0 +1,13 @@
+Validation performed on 2026-07-24:
+
+- python -m compileall -q app: PASSED
+- PYTHONPATH=. pytest -q: 7 PASSED
+
+Covered behavior:
+- OCR fallback on an image-only PDF
+- Digital table extraction to Markdown
+- Row-safe table chunking with repeated headers
+- Fuzzy retrieval for a misspelled query
+- Hybrid semantic + keyword retrieval
+- AI query rewrite JSON parsing
+- Exact source excerpt tracking after context truncation
