@@ -9,3 +9,7 @@ numpy>=1.26,<3.0
 openai>=1.50,<3.0
 tenacity>=9.0,<10.0
 orjson>=3.10,<4.0
+pdfplumber>=0.11,<1.0
+PyMuPDF>=1.24,<2.0
+Pillow>=10,<13.0
+pytesseract>=0.3.13,<1.0
