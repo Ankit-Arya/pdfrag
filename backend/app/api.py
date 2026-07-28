@@ -1,38 +1,87 @@
-import logging
-from pathlib import PurePath
-from typing import Annotated
+import uuid
+from datetime import UTC, datetime
 
-from fastapi import APIRouter, File, HTTPException, Request, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
 from fastapi.concurrency import run_in_threadpool
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
+from app.auth.dependencies import admin_user, current_user
+from app.auth.security import hash_password
 from app.config import get_settings
+from app.db import get_db
+from app.db_models import (
+    ChatMessage,
+    ChatSession,
+    Document,
+    DocumentStatus,
+    User,
+    UserRole,
+)
 from app.models import (
+    AdminUserCreate,
+    AdminUserOut,
+    AdminUserStatusUpdate,
     AnswerResponse,
-    CollectionInfo,
-    CollectionResponse,
+    ChatDetail,
+    ChatMessageOut,
+    ChatSessionOut,
+    DocumentOut,
     HealthResponse,
+    KnowledgeStatus,
     QuestionRequest,
 )
+from app.rag.embeddings import EmbeddingUnavailableError, embedding_service
 from app.rag.llm import LlmConfigurationError
-from app.rag.pdf import (
-    PdfProcessingError,
-    ocr_available,
-    safe_filename,
-    table_extraction_available,
-)
+from app.rag.pdf import ocr_available, safe_filename, table_extraction_available
 from app.rag.service import rag_service
-from app.rag.store import CollectionNotFoundError, collection_store
 
-logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api")
+
+
+def _document_out(document: Document) -> DocumentOut:
+    return DocumentOut(
+        id=document.id,
+        filename=document.filename,
+        status=document.status.value,
+        size_bytes=document.size_bytes,
+        page_count=document.page_count,
+        chunk_count=document.chunk_count,
+        warnings=document.warnings,
+        error=document.error,
+        created_at=document.created_at,
+    )
+
+
+def _admin_user_out(user: User) -> AdminUserOut:
+    return AdminUserOut(
+        id=user.id,
+        email=user.email,
+        role=user.role.value,
+        is_active=user.is_active,
+        created_at=user.created_at,
+    )
+
+
+def _chat_session_out(chat: ChatSession) -> ChatSessionOut:
+    return ChatSessionOut(
+        id=chat.id,
+        title=chat.title,
+        created_at=chat.created_at,
+        updated_at=chat.updated_at,
+    )
 
 
 @router.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
     settings = get_settings()
     return HealthResponse(
-        status="ok",
+        status="ok" if embedding_service.ready else "degraded",
         embedding_model=settings.embedding_model,
+        embedding_ready=embedding_service.ready,
+        embedding_backend=embedding_service.backend,
+        embedding_fallback=embedding_service.using_fallback,
+        embedding_error=embedding_service.last_error,
         llm_model=settings.llm_model,
         ocr_mode=settings.ocr_mode,
         ocr_available=ocr_available(),
@@ -42,123 +91,263 @@ def health() -> HealthResponse:
     )
 
 
-@router.post(
-    "/collections",
-    response_model=CollectionResponse,
-    status_code=status.HTTP_201_CREATED,
+@router.get("/knowledge/status", response_model=KnowledgeStatus)
+def knowledge_status(
+    db: Session = Depends(get_db),
+    _: User = Depends(current_user),
+) -> KnowledgeStatus:
+    documents = list(
+        db.scalars(select(Document).where(Document.status == DocumentStatus.ready))
+    )
+    return KnowledgeStatus(
+        ready_documents=len(documents),
+        total_chunks=sum(document.chunk_count for document in documents),
+    )
+
+
+@router.post("/admin/documents", response_model=DocumentOut, status_code=201)
+async def upload_document(
+    file: UploadFile = File(...),
+    process: bool = True,
+    db: Session = Depends(get_db),
+    admin: User = Depends(admin_user),
+) -> DocumentOut:
+    settings = get_settings()
+    name = safe_filename(file.filename)
+    data = await file.read(settings.max_file_size_bytes + 1)
+    await file.close()
+
+    if not name.lower().endswith(".pdf"):
+        raise HTTPException(415, "Only PDF files are accepted")
+    if len(data) > settings.max_file_size_bytes:
+        raise HTTPException(413, "File too large")
+
+    document = Document(
+        filename=name,
+        size_bytes=len(data),
+        content=data,
+        uploaded_by=admin.id,
+    )
+    db.add(document)
+    db.commit()
+    db.refresh(document)
+
+    if process:
+        try:
+            await run_in_threadpool(rag_service.process_document, db, document)
+        except EmbeddingUnavailableError as exc:
+            raise HTTPException(503, str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    db.refresh(document)
+    return _document_out(document)
+
+
+@router.get("/admin/documents", response_model=list[DocumentOut])
+def documents(
+    db: Session = Depends(get_db),
+    _: User = Depends(admin_user),
+) -> list[DocumentOut]:
+    rows = db.scalars(select(Document).order_by(Document.created_at.desc()))
+    return [_document_out(document) for document in rows]
+
+
+@router.post("/admin/documents/{document_id}/process", response_model=DocumentOut)
+async def process_document(
+    document_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    _: User = Depends(admin_user),
+) -> DocumentOut:
+    document = db.get(Document, document_id)
+    if not document:
+        raise HTTPException(404, "Document not found")
+    try:
+        await run_in_threadpool(rag_service.process_document, db, document)
+    except EmbeddingUnavailableError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    db.refresh(document)
+    return _document_out(document)
+
+
+@router.delete(
+    "/admin/documents/{document_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
 )
-async def create_collection(
-    files: Annotated[list[UploadFile], File(description="One or more PDF files")],
-) -> CollectionResponse:
-    settings = get_settings()
-    if not files:
-        raise HTTPException(status_code=400, detail="Upload at least one PDF.")
-    if len(files) > settings.max_files_per_collection:
-        raise HTTPException(
-            status_code=413,
-            detail=f"At most {settings.max_files_per_collection} PDFs may be uploaded at once.",
-        )
+def delete_document(
+    document_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    _: User = Depends(admin_user),
+) -> None:
+    document = db.get(Document, document_id)
+    if not document:
+        raise HTTPException(404, "Document not found")
+    db.delete(document)
+    db.commit()
 
-    uploaded: list[tuple[str, bytes]] = []
-    used_names: set[str] = set()
-    total_upload_bytes = 0
-    for file in files:
-        filename = _unique_filename(safe_filename(file.filename), used_names)
-        used_names.add(filename)
-        if not filename.lower().endswith(".pdf"):
-            await file.close()
-            raise HTTPException(status_code=415, detail=f"{filename}: only PDF files are accepted.")
 
-        data = await file.read(settings.max_file_size_bytes + 1)
-        await file.close()
-        if len(data) > settings.max_file_size_bytes:
-            raise HTTPException(
-                status_code=413,
-                detail=f"{filename}: exceeds the {settings.max_file_size_mb} MB limit.",
+@router.get("/admin/users", response_model=list[AdminUserOut])
+def users(
+    db: Session = Depends(get_db),
+    _: User = Depends(admin_user),
+) -> list[AdminUserOut]:
+    rows = db.scalars(select(User).order_by(User.created_at.desc()))
+    return [_admin_user_out(user) for user in rows]
+
+
+@router.post("/admin/users", response_model=AdminUserOut, status_code=201)
+def create_user(
+    payload: AdminUserCreate,
+    db: Session = Depends(get_db),
+    _: User = Depends(admin_user),
+) -> AdminUserOut:
+    email = payload.email.lower()
+    if db.scalar(select(User).where(User.email == email)):
+        raise HTTPException(409, "A user with this email already exists")
+    user = User(
+        email=email,
+        password_hash=hash_password(payload.password),
+        role=UserRole(payload.role),
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return _admin_user_out(user)
+
+
+@router.patch("/admin/users/{user_id}", response_model=AdminUserOut)
+def update_user_status(
+    user_id: uuid.UUID,
+    payload: AdminUserStatusUpdate,
+    db: Session = Depends(get_db),
+    admin: User = Depends(admin_user),
+) -> AdminUserOut:
+    user = db.get(User, user_id)
+    if not user:
+        raise HTTPException(404, "User not found")
+    if user.id == admin.id and not payload.is_active:
+        raise HTTPException(400, "You cannot deactivate your own account")
+    user.is_active = payload.is_active
+    db.commit()
+    db.refresh(user)
+    return _admin_user_out(user)
+
+
+@router.get("/chats", response_model=list[ChatSessionOut])
+def chats(
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> list[ChatSessionOut]:
+    rows = db.scalars(
+        select(ChatSession)
+        .where(ChatSession.user_id == user.id)
+        .order_by(ChatSession.updated_at.desc())
+    )
+    return [_chat_session_out(chat) for chat in rows]
+
+
+@router.get("/chats/{chat_id}", response_model=ChatDetail)
+def chat_detail(
+    chat_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> ChatDetail:
+    chat = db.get(ChatSession, chat_id)
+    if not chat or chat.user_id != user.id:
+        raise HTTPException(404, "Chat not found")
+    messages = db.scalars(
+        select(ChatMessage)
+        .where(ChatMessage.chat_session_id == chat.id)
+        .order_by(ChatMessage.created_at.asc())
+    )
+    return ChatDetail(
+        **_chat_session_out(chat).model_dump(),
+        messages=[
+            ChatMessageOut(
+                id=message.id,
+                role=message.role,
+                content=message.content,
+                metadata=message.message_metadata or {},
+                created_at=message.created_at,
             )
-        total_upload_bytes += len(data)
-        if total_upload_bytes > settings.max_total_upload_bytes:
-            raise HTTPException(
-                status_code=413,
-                detail=(
-                    f"The combined upload exceeds the {settings.max_total_upload_mb} MB limit."
-                ),
-            )
-        uploaded.append((filename, data))
-
-    try:
-        collection = await run_in_threadpool(rag_service.build_collection, uploaded)
-    except (PdfProcessingError, ValueError) as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-    return CollectionResponse(
-        collection_id=collection.collection_id,
-        files=collection.files,
-        total_pages=collection.total_pages,
-        total_chunks=len(collection.chunks),
-        expires_in_minutes=settings.collection_ttl_minutes,
-        warnings=collection.warnings,
+            for message in messages
+        ],
     )
 
 
-@router.get("/collections/{collection_id}", response_model=CollectionInfo)
-def get_collection(collection_id: str) -> CollectionInfo:
-    settings = get_settings()
-    try:
-        collection = collection_store.get(collection_id)
-    except CollectionNotFoundError as exc:
-        raise HTTPException(status_code=404, detail="Collection not found or expired.") from exc
-    return CollectionInfo(
-        collection_id=collection.collection_id,
-        files=collection.files,
-        total_pages=collection.total_pages,
-        total_chunks=len(collection.chunks),
-        expires_in_minutes=settings.collection_ttl_minutes,
-        created_at=collection.created_at_iso,
-        last_accessed_at=collection.last_accessed_at_iso,
-        warnings=collection.warnings,
-    )
-
-
-@router.delete("/collections/{collection_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_collection(collection_id: str) -> None:
-    if not collection_store.delete(collection_id):
-        raise HTTPException(status_code=404, detail="Collection not found or expired.")
+@router.delete("/chats/{chat_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_chat(
+    chat_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> None:
+    chat = db.get(ChatSession, chat_id)
+    if not chat or chat.user_id != user.id:
+        raise HTTPException(404, "Chat not found")
+    db.delete(chat)
+    db.commit()
 
 
 @router.post("/chat", response_model=AnswerResponse)
-async def chat(payload: QuestionRequest, request: Request) -> AnswerResponse:
+async def chat(
+    payload: QuestionRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> AnswerResponse:
+    chat_session = (
+        db.get(ChatSession, payload.chat_session_id)
+        if payload.chat_session_id
+        else None
+    )
+    if chat_session and chat_session.user_id != user.id:
+        raise HTTPException(404, "Chat not found")
+    if not chat_session:
+        chat_session = ChatSession(user_id=user.id, title=payload.question[:100])
+        db.add(chat_session)
+        db.commit()
+        db.refresh(chat_session)
+
+    db.add(
+        ChatMessage(
+            chat_session_id=chat_session.id,
+            role="user",
+            content=payload.question,
+        )
+    )
+    chat_session.updated_at = datetime.now(UTC)
+    db.commit()
+
     try:
         response = await run_in_threadpool(
             rag_service.ask,
-            payload.collection_id,
+            db,
             payload.question,
             payload.top_k,
             payload.rewrite_question,
         )
-    except CollectionNotFoundError as exc:
-        raise HTTPException(status_code=404, detail="Collection not found or expired.") from exc
+    except EmbeddingUnavailableError as exc:
+        raise HTTPException(503, str(exc)) from exc
     except LlmConfigurationError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    except TimeoutError as exc:
-        raise HTTPException(status_code=504, detail="The language model request timed out.") from exc
-    except Exception:
-        logger.exception("Q&A request failed")
-        raise HTTPException(status_code=502, detail="The Q&A dependency request failed.") from None
+        raise HTTPException(503, str(exc)) from exc
 
+    response.chat_session_id = chat_session.id
     response.request_id = getattr(request.state, "request_id", None)
+    db.add(
+        ChatMessage(
+            chat_session_id=chat_session.id,
+            role="assistant",
+            content=response.answer,
+            message_metadata={
+                "sources": [source.model_dump() for source in response.sources],
+                "grounded": response.grounded,
+                "grounding_status": response.grounding_status,
+                "interpreted_question": response.interpreted_question,
+                "search_queries": response.search_queries,
+                "request_id": response.request_id,
+            },
+        )
+    )
+    chat_session.updated_at = datetime.now(UTC)
+    db.commit()
     return response
-
-
-def _unique_filename(filename: str, used_names: set[str]) -> str:
-    if filename not in used_names:
-        return filename
-    path = PurePath(filename)
-    stem = path.stem
-    suffix = path.suffix
-    counter = 2
-    while True:
-        candidate = f"{stem} ({counter}){suffix}"
-        if candidate not in used_names:
-            return candidate
-        counter += 1

@@ -1,37 +1,19 @@
-from pydantic import BaseModel, Field, field_validator
+import uuid
+from datetime import datetime
+from typing import Any, Literal
 
-
-class FileSummary(BaseModel):
-    name: str
-    pages: int
-    chunks: int
-    ocr_pages: int = 0
-    tables: int = 0
-
-
-class CollectionResponse(BaseModel):
-    collection_id: str
-    files: list[FileSummary]
-    total_pages: int
-    total_chunks: int
-    expires_in_minutes: int
-    warnings: list[str] = Field(default_factory=list)
-
-
-class CollectionInfo(CollectionResponse):
-    created_at: str
-    last_accessed_at: str
+from pydantic import BaseModel, EmailStr, Field, field_validator
 
 
 class QuestionRequest(BaseModel):
-    collection_id: str = Field(min_length=8, max_length=128)
     question: str = Field(min_length=2, max_length=4000)
+    chat_session_id: uuid.UUID | None = None
     top_k: int | None = Field(default=None, ge=1, le=20)
     rewrite_question: bool | None = None
 
     @field_validator("question")
     @classmethod
-    def normalize_question(cls, value: str) -> str:
+    def normalize(cls, value: str) -> str:
         normalized = " ".join(value.split())
         if not normalized:
             raise ValueError("Question cannot be empty")
@@ -56,14 +38,73 @@ class AnswerResponse(BaseModel):
     interpreted_question: str | None = None
     search_queries: list[str] = Field(default_factory=list)
     request_id: str | None = None
+    chat_session_id: uuid.UUID | None = None
 
 
 class HealthResponse(BaseModel):
     status: str
     embedding_model: str
+    embedding_ready: bool
+    embedding_backend: str | None = None
+    embedding_fallback: bool = False
+    embedding_error: str | None = None
     llm_model: str
     ocr_mode: str
     ocr_available: bool
     table_extraction: bool
     table_extraction_available: bool
     query_rewrite: bool
+
+
+class DocumentOut(BaseModel):
+    id: uuid.UUID
+    filename: str
+    status: str
+    size_bytes: int
+    page_count: int
+    chunk_count: int
+    warnings: list[Any] = Field(default_factory=list)
+    error: str | None = None
+    created_at: datetime
+
+
+class KnowledgeStatus(BaseModel):
+    ready_documents: int
+    total_chunks: int
+
+
+class AdminUserCreate(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=8, max_length=200)
+    role: Literal["admin", "user"] = "user"
+
+
+class AdminUserStatusUpdate(BaseModel):
+    is_active: bool
+
+
+class AdminUserOut(BaseModel):
+    id: uuid.UUID
+    email: str
+    role: str
+    is_active: bool
+    created_at: datetime
+
+
+class ChatSessionOut(BaseModel):
+    id: uuid.UUID
+    title: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class ChatMessageOut(BaseModel):
+    id: uuid.UUID
+    role: str
+    content: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+
+
+class ChatDetail(ChatSessionOut):
+    messages: list[ChatMessageOut]

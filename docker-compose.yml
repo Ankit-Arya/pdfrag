@@ -1,61 +1,72 @@
 services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-pdfrag}
+      POSTGRES_USER: ${POSTGRES_USER:-pdfrag}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pdfrag}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-pdfrag} -d ${POSTGRES_DB:-pdfrag}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
   backend:
     build:
       context: ./backend
       args:
         EMBEDDING_MODEL: ${EMBEDDING_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
-
+        PRELOAD_EMBEDDING_MODEL: ${PRELOAD_EMBEDDING_MODEL:-0}
+        REQUIRE_EMBEDDING_PRELOAD: ${REQUIRE_EMBEDDING_PRELOAD:-0}
+        ALLOW_INSECURE_HF_DOWNLOAD: ${ALLOW_INSECURE_HF_DOWNLOAD:-0}
+    depends_on:
+      postgres:
+        condition: service_healthy
     environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-pdfrag}:${POSTGRES_PASSWORD:-pdfrag}@postgres:5432/${POSTGRES_DB:-pdfrag}
+      JWT_SECRET: ${JWT_SECRET:-replace-this-with-a-long-random-secret}
+      ACCESS_TOKEN_TTL_MINUTES: ${ACCESS_TOKEN_TTL_MINUTES:-15}
+      REFRESH_TOKEN_TTL_DAYS: ${REFRESH_TOKEN_TTL_DAYS:-30}
+      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-admin@example.com}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-ChangeMe123!}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       LLM_MODEL: ${LLM_MODEL:-gpt-4.1-mini}
       LLM_BASE_URL: ${LLM_BASE_URL:-}
-
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
-
-      # Use the embedding model downloaded during image build.
-      HF_HUB_OFFLINE: "1"
-      TRANSFORMERS_OFFLINE: "1"
-
+      EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-384}
+      EMBEDDING_LOCAL_FILES_ONLY: ${EMBEDDING_LOCAL_FILES_ONLY:-0}
+      EMBEDDING_DOWNLOAD_ENABLED: ${EMBEDDING_DOWNLOAD_ENABLED:-0}
+      EMBEDDING_FALLBACK_MODE: ${EMBEDDING_FALLBACK_MODE:-hashing}
+      REQUIRE_EMBEDDING_AT_STARTUP: ${REQUIRE_EMBEDDING_AT_STARTUP:-0}
+      ALLOW_INSECURE_HF_DOWNLOAD: ${ALLOW_INSECURE_HF_DOWNLOAD:-0}
+      HF_HUB_OFFLINE: ${HF_HUB_OFFLINE:-0}
+      TRANSFORMERS_OFFLINE: ${TRANSFORMERS_OFFLINE:-0}
+      SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+      REQUESTS_CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt
       MAX_FILE_SIZE_MB: ${MAX_FILE_SIZE_MB:-25}
-      MAX_FILES_PER_COLLECTION: ${MAX_FILES_PER_COLLECTION:-20}
-      MAX_TOTAL_PAGES: ${MAX_TOTAL_PAGES:-2000}
-      COLLECTION_TTL_MINUTES: ${COLLECTION_TTL_MINUTES:-120}
-      MAX_COLLECTIONS: ${MAX_COLLECTIONS:-100}
-      TOP_K: ${TOP_K:-6}
-      MIN_SIMILARITY: ${MIN_SIMILARITY:-0.20}
+      TOP_K: ${TOP_K:-8}
+      MIN_SIMILARITY: ${MIN_SIMILARITY:-0.12}
       MAX_CONTEXT_CHARS: ${MAX_CONTEXT_CHARS:-18000}
-      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://localhost:8080}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://localhost:8080,http://localhost:8081}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
-
-    expose:
-      - "8000"
-
+    volumes:
+      - ./models:/models:ro
+    expose: ["8000"]
     restart: unless-stopped
-
     healthcheck:
-      test:
-        [
-          "CMD",
-          "python",
-          "-c",
-          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)"
-        ]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)"]
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 40s
+      start_period: 60s
 
   frontend:
     build:
       context: ./frontend
-    expose:
-      - "80"
+    expose: ["80"]
     restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
 
   nginx:
     image: nginx:1.27-alpine
@@ -63,14 +74,11 @@ services:
       backend:
         condition: service_healthy
       frontend:
-        condition: service_healthy
-    ports:
-      - "8081:80"
+        condition: service_started
+    ports: ["8081:80"]
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
     restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/healthz"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
+
+volumes:
+  postgres_data:
