@@ -1,8 +1,10 @@
 import uuid
 from datetime import UTC, datetime
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
 from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import Response
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -51,6 +53,18 @@ def _document_out(document: Document) -> DocumentOut:
         error=document.error,
         created_at=document.created_at,
     )
+
+
+def _document_download_headers(document: Document) -> dict[str, str]:
+    fallback = document.filename.replace("\\", "_").replace('"', "") or "document.pdf"
+    return {
+        "Content-Disposition": (
+            f"attachment; filename=\"{fallback}\"; "
+            f"filename*=UTF-8''{quote(document.filename)}"
+        ),
+        "Cache-Control": "private, no-store",
+        "X-Content-Type-Options": "nosniff",
+    }
 
 
 def _admin_user_out(user: User) -> AdminUserOut:
@@ -102,6 +116,31 @@ def knowledge_status(
     return KnowledgeStatus(
         ready_documents=len(documents),
         total_chunks=sum(document.chunk_count for document in documents),
+    )
+
+
+@router.get("/documents", response_model=list[DocumentOut])
+def shared_documents(
+    db: Session = Depends(get_db),
+    _: User = Depends(current_user),
+) -> list[DocumentOut]:
+    rows = db.scalars(select(Document).order_by(Document.created_at.desc()))
+    return [_document_out(document) for document in rows]
+
+
+@router.get("/documents/{document_id}/download")
+def download_document(
+    document_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    _: User = Depends(current_user),
+) -> Response:
+    document = db.get(Document, document_id)
+    if not document:
+        raise HTTPException(404, "Document not found")
+    return Response(
+        content=document.content,
+        media_type=document.mime_type or "application/pdf",
+        headers=_document_download_headers(document),
     )
 
 

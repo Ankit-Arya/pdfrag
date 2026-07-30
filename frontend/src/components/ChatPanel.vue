@@ -1,6 +1,12 @@
 <script setup lang="ts">
-import { nextTick, ref } from 'vue'
-import type { AnswerResponse, KnowledgeStatus } from '../services/api'
+import { nextTick, onMounted, ref } from 'vue'
+import {
+  downloadDocument,
+  listDocuments,
+  type AnswerResponse,
+  type DocumentRecord,
+  type KnowledgeStatus,
+} from '../services/api'
 import { renderMarkdown } from '../utils/markdown'
 
 interface Message {
@@ -24,6 +30,38 @@ const emit = defineEmits<{
 const question = defineModel<string>('question', { required: true })
 const messages = defineModel<Message[]>('messages', { required: true })
 const scrollArea = ref<HTMLElement | null>(null)
+const documents = ref<DocumentRecord[]>([])
+const libraryBusy = ref(false)
+const libraryError = ref('')
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+}
+
+async function loadDocumentLibrary(): Promise<void> {
+  libraryBusy.value = true
+  libraryError.value = ''
+  try {
+    documents.value = await listDocuments()
+  } catch (cause) {
+    libraryError.value = cause instanceof Error ? cause.message : 'Could not load PDFs.'
+  } finally {
+    libraryBusy.value = false
+  }
+}
+
+async function downloadPdf(documentRecord: DocumentRecord): Promise<void> {
+  libraryBusy.value = true
+  libraryError.value = ''
+  try {
+    await downloadDocument(documentRecord.id, documentRecord.filename)
+  } catch (cause) {
+    libraryError.value = cause instanceof Error ? cause.message : 'Could not download this PDF.'
+  } finally {
+    libraryBusy.value = false
+  }
+}
 
 async function submit(): Promise<void> {
   const value = question.value.trim()
@@ -42,6 +80,10 @@ function handleKeydown(event: KeyboardEvent): void {
     void submit()
   }
 }
+
+onMounted(() => {
+  void loadDocumentLibrary()
+})
 </script>
 
 <template>
@@ -63,6 +105,57 @@ function handleKeydown(event: KeyboardEvent): void {
     </header>
 
     <section ref="scrollArea" class="conversation" aria-live="polite">
+      <section class="document-library-card" aria-labelledby="document-library-title">
+        <div class="document-library-heading">
+          <div>
+            <span class="eyebrow">Available PDFs</span>
+            <h2 id="document-library-title">
+              {{ documents.length }} uploaded PDF{{ documents.length === 1 ? '' : 's' }}
+            </h2>
+            <p>All signed-in users can view and download the shared PDF library.</p>
+          </div>
+          <button
+            type="button"
+            class="ghost-action compact"
+            :disabled="libraryBusy"
+            @click="loadDocumentLibrary"
+          >
+            {{ libraryBusy ? 'Loading…' : 'Refresh PDFs' }}
+          </button>
+        </div>
+
+        <p v-if="libraryError" class="library-error">{{ libraryError }}</p>
+        <p v-else-if="!documents.length" class="library-empty">
+          No PDFs have been uploaded yet.
+        </p>
+        <div v-else class="library-doc-list">
+          <article
+            v-for="documentRecord in documents"
+            :key="documentRecord.id"
+            class="library-doc-row"
+          >
+            <div class="file-icon">PDF</div>
+            <div class="library-doc-main">
+              <strong>{{ documentRecord.filename }}</strong>
+              <span>
+                {{ formatBytes(documentRecord.size_bytes) }} · {{ documentRecord.page_count }} pages ·
+                {{ documentRecord.chunk_count }} chunks
+              </span>
+              <small v-if="documentRecord.error" class="row-error">{{ documentRecord.error }}</small>
+            </div>
+            <span class="status-tag" :class="documentRecord.status">{{ documentRecord.status }}</span>
+            <button
+              type="button"
+              class="library-download-button"
+              :disabled="libraryBusy"
+              @click="downloadPdf(documentRecord)"
+            >
+              Download
+            </button>
+          </article>
+        </div>
+      </section>
+
       <div v-if="!messages.length" class="empty-state">
         <div class="empty-orb" aria-hidden="true">
           <svg viewBox="0 0 24 24">
@@ -187,3 +280,115 @@ function handleKeydown(event: KeyboardEvent): void {
     </footer>
   </main>
 </template>
+
+<style scoped>
+.document-library-card {
+  max-width: 880px;
+  margin: 0 auto 26px;
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, .9);
+  box-shadow: 0 8px 24px rgba(36, 69, 58, .04);
+}
+
+.document-library-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.document-library-heading h2 {
+  margin: 5px 0 0;
+  font-size: 18px;
+  letter-spacing: -.03em;
+}
+
+.document-library-heading p,
+.library-empty,
+.library-error {
+  margin: 7px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.library-error,
+.row-error {
+  color: #a0362d;
+}
+
+.library-doc-list {
+  margin-top: 12px;
+  display: grid;
+}
+
+.library-doc-row {
+  min-width: 0;
+  padding: 13px 0;
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 12px;
+  border-top: 1px solid #e7ecea;
+}
+
+.library-doc-row:first-child {
+  border-top: 0;
+}
+
+.library-doc-main {
+  min-width: 0;
+}
+
+.library-doc-main strong {
+  display: block;
+  overflow: hidden;
+  color: #283530;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.library-doc-main span,
+.library-doc-main small {
+  display: block;
+  margin-top: 4px;
+  color: #7d8a85;
+  font-size: 9px;
+  line-height: 1.45;
+}
+
+.library-download-button {
+  min-height: 30px;
+  padding: 0 10px;
+  border: 1px solid #d2ddd8;
+  border-radius: 8px;
+  color: #466158;
+  background: #fff;
+  font-size: 9px;
+  font-weight: 800;
+}
+
+.library-download-button:hover:not(:disabled) {
+  border-color: #93b2a6;
+  background: #f7faf9;
+}
+
+@media (max-width: 820px) {
+  .document-library-heading {
+    display: grid;
+  }
+
+  .library-doc-row {
+    grid-template-columns: 34px minmax(0, 1fr);
+  }
+
+  .library-doc-row .status-tag,
+  .library-doc-row .library-download-button {
+    grid-column: 2;
+    justify-self: start;
+  }
+}
+</style>

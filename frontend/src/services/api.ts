@@ -188,11 +188,11 @@ async function refreshAccessToken(): Promise<boolean> {
   }
 }
 
-async function apiRequest<T>(
+async function authenticatedFetch(
   path: string,
   init: RequestInit = {},
   retryAfterRefresh = true,
-): Promise<T> {
+): Promise<Response> {
   const headers = new Headers(init.headers)
   const accessToken = sessionStorage.getItem(ACCESS_KEY)
   if (accessToken) headers.set('Authorization', `Bearer ${accessToken}`)
@@ -200,10 +200,17 @@ async function apiRequest<T>(
   const response = await fetch(path, { ...init, headers })
   if (response.status === 401 && retryAfterRefresh && hasStoredSession()) {
     const refreshed = await refreshAccessToken()
-    if (refreshed) return apiRequest<T>(path, init, false)
+    if (refreshed) return authenticatedFetch(path, init, false)
   }
 
-  return parseResponse<T>(response)
+  return response
+}
+
+async function apiRequest<T>(
+  path: string,
+  init: RequestInit = {},
+): Promise<T> {
+  return parseResponse<T>(await authenticatedFetch(path, init))
 }
 
 export async function login(email: string, password: string): Promise<User> {
@@ -251,7 +258,30 @@ export async function getKnowledgeStatus(): Promise<KnowledgeStatus> {
 }
 
 export async function listDocuments(): Promise<DocumentRecord[]> {
-  return apiRequest<DocumentRecord[]>('/api/admin/documents')
+  return apiRequest<DocumentRecord[]>('/api/documents')
+}
+
+export async function downloadDocument(
+  documentId: string,
+  filename: string,
+): Promise<void> {
+  const response = await authenticatedFetch(
+    `/api/documents/${encodeURIComponent(documentId)}/download`,
+  )
+  if (!response.ok) {
+    await parseResponse<never>(response)
+    return
+  }
+
+  const blob = await response.blob()
+  const objectUrl = URL.createObjectURL(blob)
+  const anchor = window.document.createElement('a')
+  anchor.href = objectUrl
+  anchor.download = filename || 'document.pdf'
+  window.document.body.appendChild(anchor)
+  anchor.click()
+  anchor.remove()
+  window.setTimeout(() => URL.revokeObjectURL(objectUrl), 0)
 }
 
 export async function uploadDocument(
