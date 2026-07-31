@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     llm_model: str = "gpt-4.1-mini"
     llm_base_url: str = ""
     llm_timeout_seconds: float = Field(default=45, ge=5, le=300)
-    max_output_tokens: int = Field(default=1400, ge=100, le=8000)
+    max_output_tokens: int = Field(default=1800, ge=100, le=8000)
 
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     embedding_dimensions: int = 384
@@ -35,18 +35,22 @@ class Settings(BaseSettings):
     require_embedding_at_startup: bool = False
     allow_insecure_hf_download: bool = False
 
-    chunk_size_chars: int = Field(default=1200, ge=400, le=4000)
-    chunk_overlap_chars: int = Field(default=200, ge=0, le=1000)
-    top_k: int = Field(default=8, ge=1, le=20)
-    min_similarity: float = Field(default=0.12, ge=0, le=1)
-    max_context_chars: int = Field(default=18000, ge=2000, le=100000)
-    max_chunks_per_page: int = 3
+    # Metro procedures depend on heading/subheading context. Smaller chunks with
+    # larger overlap keep steps readable while the heading-aware splitter carries
+    # section path, page range, rolling stock/procedure hints, and tags into every
+    # chunk text.
+    chunk_size_chars: int = Field(default=900, ge=400, le=4000)
+    chunk_overlap_chars: int = Field(default=220, ge=0, le=1000)
+    top_k: int = Field(default=12, ge=1, le=20)
+    min_similarity: float = Field(default=0.05, ge=0, le=1)
+    max_context_chars: int = Field(default=30000, ge=2000, le=100000)
+    max_chunks_per_page: int = 6
 
     query_rewrite_enabled: bool = True
     query_rewrite_max_variants: int = 4
     fuzzy_keyword_enabled: bool = True
     fuzzy_match_cutoff: float = 0.78
-    max_query_terms: int = 32
+    max_query_terms: int = 48
 
     ocr_mode: Literal["never", "auto", "always"] = "auto"
     ocr_dpi: int = 220
