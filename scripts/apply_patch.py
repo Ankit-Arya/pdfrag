@@ -334,7 +334,10 @@ def apply(root: Path, dry_run: bool) -> list[str]:
             backup = path.with_name(path.name + BACKUP_SUFFIX)
             if not backup.exists():
                 shutil.copy2(path, backup)
-            path.write_text(updated, encoding="utf-8", newline="\n")
+            # pathlib.Path.write_text gained the newline parameter in Python 3.10.
+            # Use Path.open so the installer also works with Python 3.9 on Windows.
+            with path.open("w", encoding="utf-8", newline="\n") as handle:
+                handle.write(updated)
             written.append((path, backup))
         validate(root)
     except Exception:

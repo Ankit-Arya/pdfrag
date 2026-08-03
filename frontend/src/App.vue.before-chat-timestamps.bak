@@ -42,7 +42,6 @@ interface Message {
   id: string
   role: 'user' | 'assistant'
   text: string
-  createdAt: string
   response?: AnswerResponse
 }
 
@@ -223,7 +222,6 @@ async function openChat(chatId: string): Promise<void> {
         id: message.id,
         role: message.role as 'user' | 'assistant',
         text: message.content,
-        createdAt: message.created_at,
         response:
           message.role === 'assistant'
             ? messageResponse(message.content, message.metadata)
@@ -254,13 +252,7 @@ async function removeChat(chatId: string): Promise<void> {
 }
 
 async function ask(value: string): Promise<void> {
-  const questionMessageId = id()
-  messages.value.push({
-    id: questionMessageId,
-    role: 'user',
-    text: value,
-    createdAt: new Date().toISOString(),
-  })
+  messages.value.push({ id: id(), role: 'user', text: value })
   question.value = ''
   answering.value = true
   error.value = ''
@@ -268,17 +260,10 @@ async function ask(value: string): Promise<void> {
   try {
     const response = await askQuestion(value, activeChatId.value, controller.signal)
     activeChatId.value = response.chat_session_id ?? activeChatId.value
-    if (response.question_created_at) {
-      const savedQuestion = messages.value.find(
-        (message) => message.id === questionMessageId,
-      )
-      if (savedQuestion) savedQuestion.createdAt = response.question_created_at
-    }
     messages.value.push({
       id: id(),
       role: 'assistant',
       text: response.answer,
-      createdAt: response.response_created_at ?? new Date().toISOString(),
       response,
     })
     chats.value = await listChats()

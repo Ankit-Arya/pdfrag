@@ -13,7 +13,6 @@ interface Message {
   id: string
   role: 'user' | 'assistant'
   text: string
-  createdAt: string
   response?: AnswerResponse
 }
 
@@ -34,16 +33,6 @@ const scrollArea = ref<HTMLElement | null>(null)
 const documents = ref<DocumentRecord[]>([])
 const libraryBusy = ref(false)
 const libraryError = ref('')
-const messageDateTimeFormatter = new Intl.DateTimeFormat(undefined, {
-  dateStyle: 'medium',
-  timeStyle: 'short',
-})
-
-function formatMessageTime(value: string): string {
-  const timestamp = new Date(value)
-  if (Number.isNaN(timestamp.getTime())) return ''
-  return messageDateTimeFormatter.format(timestamp)
-}
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`
@@ -211,19 +200,9 @@ onMounted(() => {
           {{ message.role === 'user' ? 'Y' : 'D' }}
         </div>
         <div class="message-content">
-          <div class="message-heading">
-            <span class="message-label">
-              {{ message.role === 'user' ? 'You' : 'DMRC Q&A' }}
-            </span>
-            <time
-              v-if="formatMessageTime(message.createdAt)"
-              class="message-timestamp"
-              :datetime="message.createdAt"
-              :title="formatMessageTime(message.createdAt)"
-            >
-              {{ formatMessageTime(message.createdAt) }}
-            </time>
-          </div>
+          <span class="message-label">
+            {{ message.role === 'user' ? 'You' : 'DMRC Q&A' }}
+          </span>
           <div
             v-if="message.role === 'assistant'"
             class="message-text markdown-body"
@@ -303,26 +282,6 @@ onMounted(() => {
 </template>
 
 <style scoped>
-.message-heading {
-  display: flex;
-  align-items: baseline;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-
-.message-timestamp {
-  color: #89958f;
-  font-size: 9px;
-  font-weight: 600;
-  letter-spacing: 0;
-  line-height: 1.4;
-  white-space: nowrap;
-}
-
-.message.user .message-heading {
-  justify-content: flex-end;
-}
-
 .document-library-card {
   max-width: 880px;
   margin: 0 auto 26px;

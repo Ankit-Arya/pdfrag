@@ -11,3 +11,7 @@ Summary of source changes (the installer applies these edits safely):
    server timestamp when the response arrives.
 6. ChatPanel formats timestamps with Intl.DateTimeFormat and renders a <time>
    element beside each message label.
+
+## Installer compatibility fix
+
+- Replaced `Path.write_text(..., newline="\\n")` with `Path.open(...)` so the installer works with Python 3.9 on Windows.

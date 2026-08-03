@@ -78,3 +78,7 @@ docker compose up -d --force-recreate backend frontend nginx
 ```bash
 python3 scripts/revert_patch.py /path/to/pdfrag
 ```
+
+### Python 3.9 compatibility
+
+This revision fixes the Windows installer for Python 3.9 by avoiding the Python 3.10-only `Path.write_text(..., newline=...)` argument.

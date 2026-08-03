@@ -433,15 +433,15 @@ async def chat(
         db.commit()
         db.refresh(chat_session)
 
-    user_message = ChatMessage(
-        chat_session_id=chat_session.id,
-        role="user",
-        content=payload.question,
+    db.add(
+        ChatMessage(
+            chat_session_id=chat_session.id,
+            role="user",
+            content=payload.question,
+        )
     )
-    db.add(user_message)
     chat_session.updated_at = datetime.now(UTC)
     db.commit()
-    db.refresh(user_message)
 
     try:
         response = await run_in_threadpool(
@@ -485,22 +485,22 @@ async def chat(
 
     response.chat_session_id = chat_session.id
     response.request_id = getattr(request.state, "request_id", None)
-    response.question_created_at = user_message.created_at
     source_details = [source.model_dump() for source in response.sources]
-    assistant_message = ChatMessage(
-        chat_session_id=chat_session.id,
-        role="assistant",
-        content=response.answer,
-        message_metadata={
-            "sources": source_details,
-            "grounded": response.grounded,
-            "grounding_status": response.grounding_status,
-            "interpreted_question": response.interpreted_question,
-            "search_queries": response.search_queries,
-            "request_id": response.request_id,
-        },
+    db.add(
+        ChatMessage(
+            chat_session_id=chat_session.id,
+            role="assistant",
+            content=response.answer,
+            message_metadata={
+                "sources": source_details,
+                "grounded": response.grounded,
+                "grounding_status": response.grounding_status,
+                "interpreted_question": response.interpreted_question,
+                "search_queries": response.search_queries,
+                "request_id": response.request_id,
+            },
+        )
     )
-    db.add(assistant_message)
     add_audit_event(
         db,
         event_type="chat_exchange",
@@ -520,6 +520,4 @@ async def chat(
     )
     chat_session.updated_at = datetime.now(UTC)
     db.commit()
-    db.refresh(assistant_message)
-    response.response_created_at = assistant_message.created_at
     return response

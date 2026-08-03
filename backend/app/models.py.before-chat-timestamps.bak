@@ -39,8 +39,6 @@ class AnswerResponse(BaseModel):
     search_queries: list[str] = Field(default_factory=list)
     request_id: str | None = None
     chat_session_id: uuid.UUID | None = None
-    question_created_at: datetime | None = None
-    response_created_at: datetime | None = None
 
 
 class HealthResponse(BaseModel):

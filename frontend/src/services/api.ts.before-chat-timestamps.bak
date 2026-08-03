@@ -68,8 +68,6 @@ export interface AnswerResponse {
   search_queries: string[]
   request_id?: string | null
   chat_session_id?: string | null
-  question_created_at?: string | null
-  response_created_at?: string | null
 }
 
 export interface ChatSession {
