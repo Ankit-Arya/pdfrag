@@ -1,12 +1,11 @@
 param(
-    [string]$Target = (Get-Location).Path
+    [Parameter(Mandatory = $true)]
+    [string]$RepositoryPath
 )
 
-$PatchRoot = Split-Path -Parent $PSScriptRoot
-$BackendApp = Join-Path $Target "backend\app"
-if (!(Test-Path $BackendApp)) {
-    Write-Error "Target does not look like a pdfrag repository root: $Target"
-    exit 1
+$ErrorActionPreference = "Stop"
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+python (Join-Path $ScriptDir "apply_patch.py") $RepositoryPath
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
 }
-Copy-Item -Path (Join-Path $PatchRoot "backend\app\*") -Destination $BackendApp -Recurse -Force
-Write-Host "Patch files copied. Rebuild and run: docker compose exec backend python -m app.reprocess_documents"

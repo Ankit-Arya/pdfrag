@@ -1,18 +1,30 @@
+import logging
 import uuid
 from datetime import UTC, datetime
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+    status,
+)
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.audit import add_audit_event
 from app.auth.dependencies import admin_user, current_user
 from app.auth.security import hash_password
 from app.config import get_settings
 from app.db import get_db
 from app.db_models import (
+    AuditLog,
     ChatMessage,
     ChatSession,
     Document,
@@ -25,6 +37,7 @@ from app.models import (
     AdminUserOut,
     AdminUserStatusUpdate,
     AnswerResponse,
+    AuditLogOut,
     ChatDetail,
     ChatMessageOut,
     ChatSessionOut,
@@ -38,6 +51,7 @@ from app.rag.llm import LlmConfigurationError
 from app.rag.pdf import ocr_available, safe_filename, table_extraction_available
 from app.rag.service import rag_service
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api")
 
 
@@ -84,6 +98,49 @@ def _chat_session_out(chat: ChatSession) -> ChatSessionOut:
         created_at=chat.created_at,
         updated_at=chat.updated_at,
     )
+
+
+def _audit_log_out(row: AuditLog) -> AuditLogOut:
+    return AuditLogOut(
+        id=row.id,
+        event_type=row.event_type,
+        success=row.success,
+        user_id=row.user_id,
+        actor_email=row.actor_email,
+        chat_session_id=row.chat_session_id,
+        question=row.question,
+        response=row.response,
+        error_message=row.error_message,
+        details=row.event_metadata or {},
+        ip_address=row.ip_address,
+        user_agent=row.user_agent,
+        request_id=row.request_id,
+        created_at=row.created_at,
+    )
+
+
+def _record_chat_failure(
+    db: Session,
+    *,
+    request: Request,
+    user: User,
+    chat_session: ChatSession,
+    question: str,
+    error: Exception,
+) -> None:
+    db.rollback()
+    add_audit_event(
+        db,
+        event_type="chat_error",
+        request=request,
+        success=False,
+        user=user,
+        chat_session_id=chat_session.id,
+        question=question,
+        error_message=str(error)[:4000],
+        details={"error_type": type(error).__name__},
+    )
+    db.commit()
 
 
 @router.get("/health", response_model=HealthResponse)
@@ -272,6 +329,35 @@ def update_user_status(
     return _admin_user_out(user)
 
 
+@router.get("/admin/audit-logs", response_model=list[AuditLogOut])
+def audit_logs(
+    event_type: str | None = None,
+    user_id: uuid.UUID | None = None,
+    email: str | None = None,
+    success: bool | None = None,
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+    _: User = Depends(admin_user),
+) -> list[AuditLogOut]:
+    statement = select(AuditLog)
+    if event_type:
+        statement = statement.where(AuditLog.event_type == event_type)
+    if user_id:
+        statement = statement.where(AuditLog.user_id == user_id)
+    if email:
+        statement = statement.where(
+            AuditLog.actor_email.ilike(f"%{email.strip()}%")
+        )
+    if success is not None:
+        statement = statement.where(AuditLog.success == success)
+
+    rows = db.scalars(
+        statement.order_by(AuditLog.created_at.desc()).offset(offset).limit(limit)
+    )
+    return [_audit_log_out(row) for row in rows]
+
+
 @router.get("/chats", response_model=list[ChatSessionOut])
 def chats(
     db: Session = Depends(get_db),
@@ -366,19 +452,47 @@ async def chat(
             payload.rewrite_question,
         )
     except EmbeddingUnavailableError as exc:
+        _record_chat_failure(
+            db,
+            request=request,
+            user=user,
+            chat_session=chat_session,
+            question=payload.question,
+            error=exc,
+        )
         raise HTTPException(503, str(exc)) from exc
     except LlmConfigurationError as exc:
+        _record_chat_failure(
+            db,
+            request=request,
+            user=user,
+            chat_session=chat_session,
+            question=payload.question,
+            error=exc,
+        )
         raise HTTPException(503, str(exc)) from exc
+    except Exception as exc:
+        _record_chat_failure(
+            db,
+            request=request,
+            user=user,
+            chat_session=chat_session,
+            question=payload.question,
+            error=exc,
+        )
+        logger.exception("Q&A request failed")
+        raise HTTPException(502, "The language model request failed") from exc
 
     response.chat_session_id = chat_session.id
     response.request_id = getattr(request.state, "request_id", None)
+    source_details = [source.model_dump() for source in response.sources]
     db.add(
         ChatMessage(
             chat_session_id=chat_session.id,
             role="assistant",
             content=response.answer,
             message_metadata={
-                "sources": [source.model_dump() for source in response.sources],
+                "sources": source_details,
                 "grounded": response.grounded,
                 "grounding_status": response.grounding_status,
                 "interpreted_question": response.interpreted_question,
@@ -386,6 +500,23 @@ async def chat(
                 "request_id": response.request_id,
             },
         )
+    )
+    add_audit_event(
+        db,
+        event_type="chat_exchange",
+        request=request,
+        success=True,
+        user=user,
+        chat_session_id=chat_session.id,
+        question=payload.question,
+        response=response.answer,
+        details={
+            "grounded": response.grounded,
+            "grounding_status": response.grounding_status,
+            "interpreted_question": response.interpreted_question,
+            "search_queries": response.search_queries,
+            "sources": source_details,
+        },
     )
     chat_session.updated_at = datetime.now(UTC)
     db.commit()

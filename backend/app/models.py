@@ -108,3 +108,20 @@ class ChatMessageOut(BaseModel):
 
 class ChatDetail(ChatSessionOut):
     messages: list[ChatMessageOut]
+
+
+class AuditLogOut(BaseModel):
+    id: uuid.UUID
+    event_type: str
+    success: bool
+    user_id: uuid.UUID | None = None
+    actor_email: str | None = None
+    chat_session_id: uuid.UUID | None = None
+    question: str | None = None
+    response: str | None = None
+    error_message: str | None = None
+    details: dict[str, Any] = Field(default_factory=dict)
+    ip_address: str | None = None
+    user_agent: str | None = None
+    request_id: str | None = None
+    created_at: datetime

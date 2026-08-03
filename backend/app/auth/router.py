@@ -6,6 +6,7 @@ from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.audit import add_audit_event
 from app.auth.dependencies import current_user
 from app.auth.security import (
     create_access_token,
@@ -51,7 +52,13 @@ class SessionOut(BaseModel):
     ip_address: str | None
 
 
-def _pair(db: Session, user: User, request: Request) -> TokenPair:
+def _pair(
+    db: Session,
+    user: User,
+    request: Request,
+    *,
+    audit_login: bool = False,
+) -> TokenPair:
     settings = get_settings()
     refresh = new_refresh_token()
     session = UserSession(
@@ -63,6 +70,21 @@ def _pair(db: Session, user: User, request: Request) -> TokenPair:
         ip_address=request.client.host if request.client else None,
     )
     db.add(session)
+    db.flush()
+
+    if audit_login:
+        add_audit_event(
+            db,
+            event_type="login_success",
+            request=request,
+            success=True,
+            user=user,
+            details={
+                "role": user.role.value,
+                "session_id": str(session.id),
+            },
+        )
+
     db.commit()
     db.refresh(session)
     return TokenPair(
@@ -72,15 +94,30 @@ def _pair(db: Session, user: User, request: Request) -> TokenPair:
 
 
 @router.post("/login", response_model=TokenPair)
-def login(payload: Login, request: Request, db: Session = Depends(get_db)) -> TokenPair:
-    user = db.scalar(select(User).where(User.email == payload.email.lower()))
+def login(
+    payload: Login,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> TokenPair:
+    email = payload.email.lower()
+    user = db.scalar(select(User).where(User.email == email))
     if (
         not user
         or not verify_password(payload.password, user.password_hash)
         or not user.is_active
     ):
+        add_audit_event(
+            db,
+            event_type="login_failed",
+            request=request,
+            success=False,
+            user=user,
+            actor_email=email,
+            error_message="Invalid credentials or inactive account",
+        )
+        db.commit()
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    return _pair(db, user, request)
+    return _pair(db, user, request, audit_login=True)
 
 
 @router.post("/refresh", response_model=TokenPair)
