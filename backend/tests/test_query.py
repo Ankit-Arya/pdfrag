@@ -1,4 +1,4 @@
-from app.rag.query import _validate_plan
+from app.rag.query import _extract_context_terms, _validate_plan
 
 
 def test_domain_acronym_is_not_expanded_from_general_knowledge() -> None:
@@ -37,6 +37,8 @@ def test_domain_acronym_is_not_expanded_from_general_knowledge() -> None:
         "FDS operating procedure document",
     ]
     assert "FDS" in plan.keywords
+    assert plan.intent == "procedure"
+    assert "FDS" in plan.context_terms
 
 
 def test_non_acronym_question_can_be_rewritten() -> None:
@@ -63,3 +65,29 @@ def test_non_acronym_question_can_be_rewritten() -> None:
     )
     assert plan.search_queries[0] == "door reset procedure"
     assert "train door reset procedure" in plan.search_queries
+    assert plan.intent == "procedure"
+
+
+def test_model_cannot_invent_context_terms() -> None:
+    plan = _validate_plan(
+        "door reset procedure",
+        {
+            "rewritten_question": "door reset procedure",
+            "search_queries": ["door reset procedure"],
+            "keywords": ["door", "reset"],
+            "intent": "procedure",
+            "focus_terms": ["door", "reset", "procedure"],
+            "context_terms": ["Type B rolling stock"],
+        },
+        max_variants=4,
+    )
+
+    assert plan.context_terms == []
+
+
+def test_context_terms_are_extracted_without_ai_rewrite() -> None:
+    assert _extract_context_terms("Reset doors for rolling stock Type A on Line 2") == [
+        "Type A",
+        "Line 2",
+        "2",
+    ]

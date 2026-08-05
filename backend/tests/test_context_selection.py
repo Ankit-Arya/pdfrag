@@ -1,4 +1,4 @@
-from app.rag.service import RagService
+from app.rag.relevance import select_context_chunks
 from app.rag.types import QueryPlan, RetrievedChunk, TextChunk
 
 
@@ -60,7 +60,7 @@ def test_acronym_query_removes_unrelated_manual_sections() -> None:
         ),
     ]
 
-    selected = RagService._select_context_chunks(plan, retrieved)
+    selected = select_context_chunks(plan, retrieved)
     selected_ids = [item.chunk.chunk_id for item in selected]
 
     assert "fds-main" in selected_ids
@@ -87,5 +87,98 @@ def test_short_request_limits_context_size() -> None:
         for index in range(8)
     ]
 
-    selected = RagService._select_context_chunks(plan, retrieved)
+    selected = select_context_chunks(plan, retrieved)
     assert len(selected) <= 4
+
+
+def test_intent_reranking_rejects_irrelevant_high_vector_match() -> None:
+    plan = QueryPlan(
+        original_question="What is the annual leave policy?",
+        rewritten_question="What is the annual leave policy?",
+        search_queries=["annual leave policy"],
+        intent="definition",
+        focus_terms=["annual", "leave", "policy"],
+    )
+    retrieved = [
+        result(
+            "generic-high-vector",
+            "handbook.pdf",
+            1,
+            "General company introduction, purpose, and values.",
+            0.91,
+        ),
+        result(
+            "answerable",
+            "handbook.pdf",
+            14,
+            "Annual leave policy means eligible employees receive 20 days of leave.",
+            0.56,
+        ),
+    ]
+
+    selected = select_context_chunks(plan, retrieved)
+
+    assert [item.chunk.chunk_id for item in selected] == ["answerable"]
+
+
+def test_context_constraint_prevents_cross_procedure_mixing() -> None:
+    plan = QueryPlan(
+        original_question="FDS reset procedure",
+        rewritten_question="FDS reset procedure",
+        search_queries=["FDS reset procedure"],
+        keywords=["FDS"],
+        intent="procedure",
+        focus_terms=["FDS", "reset", "procedure"],
+        context_terms=["FDS"],
+    )
+    retrieved = [
+        result(
+            "fds",
+            "manual.pdf",
+            10,
+            "FDS reset procedure: acknowledge the alarm and verify the indication.",
+            0.61,
+        ),
+        result(
+            "doors",
+            "manual.pdf",
+            80,
+            "Passenger door reset procedure: isolate the affected doorway.",
+            0.74,
+        ),
+    ]
+
+    selected = select_context_chunks(plan, retrieved)
+
+    assert [item.chunk.chunk_id for item in selected] == ["fds"]
+
+
+def test_multiword_context_constraint_requires_the_complete_context() -> None:
+    plan = QueryPlan(
+        original_question="How do I reset doors for rolling stock Type A?",
+        rewritten_question="How do I reset doors for rolling stock Type A?",
+        search_queries=["door reset rolling stock Type A"],
+        intent="procedure",
+        focus_terms=["reset", "doors", "rolling", "stock", "Type", "A"],
+        context_terms=["rolling stock Type A"],
+    )
+    retrieved = [
+        result(
+            "wrong-type",
+            "manual.pdf",
+            20,
+            "ROLLING STOCK TYPE B - Door reset procedure.",
+            0.82,
+        ),
+        result(
+            "right-type",
+            "manual.pdf",
+            30,
+            "ROLLING STOCK TYPE A - Door reset procedure.",
+            0.59,
+        ),
+    ]
+
+    selected = select_context_chunks(plan, retrieved)
+
+    assert [item.chunk.chunk_id for item in selected] == ["right-type"]

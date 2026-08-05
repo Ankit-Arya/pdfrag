@@ -17,7 +17,8 @@ from app.rag.pdf import extract_pdf_pages
 from app.rag.postgres_store import fetch_neighbor_chunks, search_chunks
 from app.rag.prompts import NO_ANSWER, build_citation_repair_prompt, build_user_prompt
 from app.rag.query import query_planner
-from app.rag.types import RetrievedChunk
+from app.rag.relevance import select_context_chunks
+from app.rag.types import QueryPlan, RetrievedChunk
 
 logger = logging.getLogger(__name__)
 
@@ -108,21 +109,24 @@ class RagService:
                 search_queries=plan.search_queries,
             )
 
-        threshold = min(settings.min_similarity, 0.05)
-        relevant = [item for item in candidates if item.score >= threshold]
-        if len(relevant) < min(requested_limit, 6):
-            # For operational documents, losing evidence is worse than showing a
-            # lower scoring but cited source to the model. Keep the best fallbacks.
-            relevant = candidates[: max(requested_limit, 8)]
-        else:
-            relevant = relevant[: max(requested_limit * 2, 16)]
+        relevant = self._select_context_chunks(plan, candidates, requested_limit)
+        if not relevant:
+            return AnswerResponse(
+                answer=NO_ANSWER,
+                sources=[],
+                grounded=False,
+                grounding_status="insufficient_evidence",
+                interpreted_question=plan.rewritten_question,
+                search_queries=plan.search_queries,
+            )
 
-        expanded = self._expand_context(db, relevant, requested_limit)
+        expanded = self._expand_context(db, plan, relevant, requested_limit)
         prompt, context = build_user_prompt(
             plan.original_question,
             plan.rewritten_question,
             expanded,
             settings.max_context_chars,
+            question_intent=plan.intent,
         )
         if not context:
             return AnswerResponse(
@@ -182,26 +186,32 @@ class RagService:
     def _expand_context(
         self,
         db: Session,
+        plan: QueryPlan,
         relevant: list[RetrievedChunk],
         requested_limit: int,
     ) -> list[RetrievedChunk]:
-        seeds = relevant[: max(requested_limit, 10)]
-        neighbors = fetch_neighbor_chunks(db, seeds[: min(len(seeds), 8)], window=1)
+        seeds = relevant[: min(len(relevant), 8)]
+        neighbors = fetch_neighbor_chunks(db, seeds, window=1)
         merged: dict[str, RetrievedChunk] = {}
-        for item in [*seeds, *neighbors, *relevant]:
+        for item in [*seeds, *neighbors]:
             old = merged.get(item.chunk.chunk_id)
             if old is None or item.score > old.score:
                 merged[item.chunk.chunk_id] = item
 
-        ordered = sorted(
-            merged.values(),
-            key=lambda item: (
-                -item.score,
-                item.chunk.filename,
-                item.chunk.chunk_index if item.chunk.chunk_index is not None else 0,
-            ),
+        selected = self._select_context_chunks(
+            plan,
+            list(merged.values()),
+            requested_limit,
         )
-        return ordered[: max(requested_limit * 2, 18)]
+        return selected or relevant
+
+    @staticmethod
+    def _select_context_chunks(
+        plan: QueryPlan,
+        candidates: list[RetrievedChunk],
+        max_chunks: int | None = None,
+    ) -> list[RetrievedChunk]:
+        return select_context_chunks(plan, candidates, max_chunks=max_chunks)
 
 
 rag_service = RagService()

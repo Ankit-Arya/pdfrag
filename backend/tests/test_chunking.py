@@ -24,4 +24,5 @@ def test_short_page_becomes_one_chunk() -> None:
         overlap=50,
     )
     assert len(chunks) == 1
-    assert chunks[0].text == "A short paragraph."
+    assert chunks[0].text.endswith("A short paragraph.")
+    assert "Section path: Unsectioned content" in chunks[0].text

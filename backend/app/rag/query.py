@@ -15,6 +15,65 @@ logger = logging.getLogger(__name__)
 # Terms such as FDS, OCC, HVAC, ATP, PEA, and TIMS are domain-dependent.
 # They must not be expanded using general model knowledge.
 _ACRONYM_PATTERN = re.compile(r"(?<![A-Za-z0-9])[A-Z][A-Z0-9]{1,9}(?![A-Za-z0-9])")
+_TERM_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./:#-]*")
+_CONTEXT_PATTERN = re.compile(
+    r"\b(?:class|coach|line|mode|model|phase|train|type|unit|variant|version)"
+    r"\s+[A-Za-z0-9][A-Za-z0-9._/-]*\b",
+    re.IGNORECASE,
+)
+_VALID_INTENTS = {
+    "comparison",
+    "definition",
+    "fact_lookup",
+    "list",
+    "procedure",
+    "requirement",
+    "summary",
+    "troubleshooting",
+}
+_FOCUS_STOPWORDS = {
+    "a",
+    "about",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "can",
+    "could",
+    "do",
+    "does",
+    "for",
+    "from",
+    "give",
+    "how",
+    "i",
+    "in",
+    "is",
+    "it",
+    "me",
+    "of",
+    "on",
+    "or",
+    "please",
+    "should",
+    "that",
+    "the",
+    "this",
+    "to",
+    "was",
+    "were",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "why",
+    "with",
+    "would",
+}
 
 
 class QueryPlanner:
@@ -28,6 +87,9 @@ class QueryPlanner:
             rewritten_question=normalized,
             search_queries=[normalized],
             keywords=_extract_acronyms(normalized),
+            intent=_infer_intent(normalized),
+            focus_terms=_extract_focus_terms(normalized),
+            context_terms=_extract_context_terms(normalized),
             used_ai_rewrite=False,
         )
         if not should_rewrite:
@@ -122,11 +184,24 @@ def _validate_plan(
     )
     keywords = _unique([*acronyms, *[item for item in model_keywords if item]])[:24]
 
+    raw_intent = _clean_string(payload.get("intent")).casefold()
+    intent = raw_intent if raw_intent in _VALID_INTENTS else _infer_intent(original)
+
+    heuristic_focus = _extract_focus_terms(original)
+    model_focus = _validated_original_terms(payload.get("focus_terms"), original)
+    focus_terms = _unique([*heuristic_focus, *model_focus])[:32]
+
+    model_context = _validated_original_terms(payload.get("context_terms"), original)
+    context_terms = _unique([*_extract_context_terms(original), *model_context])[:20]
+
     return QueryPlan(
         original_question=original,
         rewritten_question=rewritten,
         search_queries=queries or [original],
         keywords=keywords,
+        intent=intent,
+        focus_terms=focus_terms,
+        context_terms=context_terms,
         used_ai_rewrite=rewritten != original or len(queries) > 1,
     )
 
@@ -144,6 +219,62 @@ def _clean_string(value: Any) -> str:
     if not isinstance(value, str):
         return ""
     return " ".join(value.split())[:1000]
+
+
+def _validated_original_terms(value: Any, original: str) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    original_terms = {token.casefold() for token in _TERM_PATTERN.findall(original)}
+    result: list[str] = []
+    for item in value:
+        clean = _clean_string(item)
+        item_terms = {token.casefold() for token in _TERM_PATTERN.findall(clean)}
+        if clean and item_terms and item_terms.issubset(original_terms):
+            result.append(clean)
+    return _unique(result)
+
+
+def _extract_focus_terms(value: str) -> list[str]:
+    return _unique(
+        [
+            token
+            for token in _TERM_PATTERN.findall(value)
+            if len(token) > 1 and token.casefold() not in _FOCUS_STOPWORDS
+        ]
+    )
+
+
+def _extract_context_terms(value: str) -> list[str]:
+    codes = [
+        token
+        for token in _TERM_PATTERN.findall(value)
+        if any(char.isdigit() for char in token)
+        or (len(token) >= 2 and token.upper() == token and any(char.isalpha() for char in token))
+    ]
+    return _unique([*_ACRONYM_PATTERN.findall(value), *_CONTEXT_PATTERN.findall(value), *codes])
+
+
+def _infer_intent(value: str) -> str:
+    lowered = value.casefold()
+    terms = {token.casefold() for token in _TERM_PATTERN.findall(value)}
+    if {"compare", "comparison", "difference", "differences", "versus", "vs"} & terms:
+        return "comparison"
+    if {"troubleshoot", "troubleshooting", "fault", "failure", "error", "alarm"} & terms:
+        return "troubleshooting"
+    if (
+        lowered.startswith("how ")
+        or {"procedure", "steps", "reset", "isolate", "operate"} & terms
+    ):
+        return "procedure"
+    if {"required", "requirement", "requirements", "must", "shall", "prerequisite"} & terms:
+        return "requirement"
+    if lowered.startswith("what is ") or lowered.startswith("what does ") or "define" in terms:
+        return "definition"
+    if {"summarize", "summary", "overview"} & terms:
+        return "summary"
+    if lowered.startswith("list ") or {"list", "types"} & terms:
+        return "list"
+    return "fact_lookup"
 
 
 def _unique(values: list[str]) -> list[str]:

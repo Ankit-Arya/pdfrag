@@ -48,4 +48,7 @@ class QueryPlan:
     rewritten_question: str
     search_queries: list[str] = field(default_factory=list)
     keywords: list[str] = field(default_factory=list)
+    intent: str = "fact_lookup"
+    focus_terms: list[str] = field(default_factory=list)
+    context_terms: list[str] = field(default_factory=list)
     used_ai_rewrite: bool = False
