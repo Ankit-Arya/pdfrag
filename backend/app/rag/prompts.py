@@ -230,6 +230,7 @@ def build_user_prompt(
     results: list[RetrievedChunk] | None = None,
     max_context_chars: int = 30000,
     question_intent: str = "fact_lookup",
+    response_mode: str = "concise",
 ) -> tuple[str, list[PromptSource] | list[RetrievedChunk]]:
     legacy_call = isinstance(interpreted_question, list)
     if legacy_call:
@@ -243,6 +244,7 @@ def build_user_prompt(
         if interpreted_question and interpreted_question != original_question
         else "No separate interpretation was needed."
     )
+    mode_instructions = _response_mode_instructions(response_mode)
 
     prompt = f"""Produce a complete final answer to the ORIGINAL QUESTION using only the supplied excerpts.
 
@@ -254,6 +256,12 @@ SEARCH INTERPRETATION (retrieval aid only; it must not change the user's intent)
 
 QUESTION INTENT:
 {question_intent}
+
+RESPONSE MODE:
+{response_mode}
+
+MODE-SPECIFIC INSTRUCTIONS:
+{mode_instructions}
 
 SOURCE EXCERPTS:
 {context}
@@ -313,8 +321,10 @@ def build_citation_repair_prompt(
     previous_answer: str,
     results: list[RetrievedChunk],
     max_context_chars: int,
+    response_mode: str = "concise",
 ) -> tuple[str, list[PromptSource]]:
     context, included = _build_source_blocks(results, max_context_chars)
+    mode_instructions = _response_mode_instructions(response_mode)
 
     prompt = f"""Rewrite the previous draft as a complete, fully grounded final answer.
 
@@ -329,6 +339,12 @@ PREVIOUS ANSWER THAT FAILED VALIDATION:
 
 SOURCE EXCERPTS:
 {context}
+
+RESPONSE MODE:
+{response_mode}
+
+MODE-SPECIFIC INSTRUCTIONS:
+{mode_instructions}
 
 The previous answer is only a draft and is not a factual source.
 
@@ -353,3 +369,20 @@ Instructions:
 {NO_ANSWER}"""
 
     return prompt, included
+
+
+def _response_mode_instructions(response_mode: str) -> str:
+    if response_mode == "evidence":
+        return """This is a broad evidence lookup.
+- For each relevant document, show the heading/subheading or Section path from the chunk context.
+- Write it as `**Heading/subheading:** <section path>` and then show the relevant document passage as a Markdown blockquote.
+- Reproduce the directly relevant document passage closely and completely enough to preserve its original context, conditions, sequence, and terminology.
+- Do not reduce the passage to a one-line conclusion.
+- Keep passages from different documents in separate document subsections.
+- Do not add a derived "therefore" statement; let each document's wording stand on its own.
+- Cite every displayed passage with its source label."""
+    return """This is a specific answer lookup.
+- Under each relevant document, answer the exact question in one or two concise bullets.
+- Show `**Heading/subheading:** <section path>`, then state the controlling context, condition, or exception needed to understand when the answer applies.
+- Do not reproduce a whole paragraph when a shorter supported answer is sufficient.
+- Preserve the document's terminology and cite every factual bullet."""

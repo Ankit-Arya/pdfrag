@@ -1,4 +1,5 @@
 from app.rag.guardrails import (
+    cited_source_numbers,
     grounding_failure_reason,
     validate_grounded_answer,
 )
@@ -96,3 +97,33 @@ def test_bold_heading_does_not_need_citation() -> None:
         source_count=1,
     )
     assert grounded is True
+
+
+def test_document_page_heading_attributes_the_whole_section() -> None:
+    answer, grounded = validate_grounded_answer(
+        "## Information found in the documents\n\n"
+        "### 02. MRGR 2020.pdf — pages 78-79\n\n"
+        "The wake-up process is initiated by UTMS.\n\n"
+        "The wake-up test checks required train functions. [S2]\n\n"
+        "### Line-7 procedure.pdf — page 2\n\n"
+        "DDSC siding is equipped for the process. [S1]",
+        source_count=2,
+    )
+
+    assert grounded is True
+    assert answer.startswith("## Information")
+
+
+def test_document_section_without_any_source_label_fails() -> None:
+    _, grounded = validate_grounded_answer(
+        "## Information found in the documents\n\n"
+        "### MRGR.pdf — page 78\n\n"
+        "Unattributed statement.",
+        source_count=1,
+    )
+
+    assert grounded is False
+
+
+def test_cited_source_numbers_support_evidence_filtering() -> None:
+    assert cited_source_numbers("Supported by [S2] and [S4][S2].", 4) == [2, 4]

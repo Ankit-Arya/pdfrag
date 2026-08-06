@@ -10,6 +10,10 @@ _BOLD_HEADING_PATTERN = re.compile(
 )
 _TABLE_ROW_PATTERN = re.compile(r"^\|.*\|$")
 _TABLE_SEPARATOR_PATTERN = re.compile(r"^\|(?:\s*:?-+:?\s*\|)+$")
+_DOCUMENT_HEADING_PATTERN = re.compile(
+    r"^(?:#{1,6}\s+)?[^\n]{1,500}\.pdf\s+[—-]\s+pages?\s+\d+(?:\s*[-–]\s*\d+)?\s*$",
+    re.IGNORECASE,
+)
 
 
 def validate_grounded_answer(answer: str, source_count: int) -> tuple[str, bool]:
@@ -44,7 +48,44 @@ def grounding_failure_reason(answer: str, source_count: int) -> str | None:
     return None
 
 
+def cited_source_numbers(answer: str, source_count: int) -> list[int]:
+    """Return valid cited source numbers in first-use order."""
+    seen: set[int] = set()
+    result: list[int] = []
+    for raw_value in _CITATION_PATTERN.findall(answer):
+        value = int(raw_value)
+        if 1 <= value <= source_count and value not in seen:
+            seen.add(value)
+            result.append(value)
+    return result
+
+
 def _claim_units_are_reasonably_cited(answer: str) -> bool:
+    lines = answer.splitlines()
+    document_heading_indexes = [
+        index
+        for index, line in enumerate(lines)
+        if _DOCUMENT_HEADING_PATTERN.match(line.strip())
+    ]
+    if document_heading_indexes:
+        prefix = "\n".join(lines[: document_heading_indexes[0]])
+        if prefix.strip() and not _claim_blocks_are_cited(prefix):
+            return False
+        for position, start in enumerate(document_heading_indexes):
+            end = (
+                document_heading_indexes[position + 1]
+                if position + 1 < len(document_heading_indexes)
+                else len(lines)
+            )
+            section = "\n".join(lines[start + 1 : end]).strip()
+            if section and _CITATION_PATTERN.search(section) is None:
+                return False
+        return True
+
+    return _claim_blocks_are_cited(answer)
+
+
+def _claim_blocks_are_cited(answer: str) -> bool:
     for block in re.split(r"\n\s*\n", answer):
         lines = [line.strip() for line in block.splitlines() if line.strip()]
         if not lines:
@@ -98,6 +139,4 @@ def _looks_like_claim(line: str) -> bool:
         return False
     if _CITATION_PATTERN.fullmatch(line):
         return False
-    if len(line) <= 80 and line.endswith(":"):
-        return False
-    return True
+    return not (len(line) <= 80 and line.endswith(":"))

@@ -91,6 +91,7 @@ class QueryPlanner:
             )[: settings.query_rewrite_max_variants],
             keywords=_extract_acronyms(normalized),
             intent=fallback_intent,
+            response_mode=_infer_response_mode(normalized),
             focus_terms=_extract_focus_terms(normalized),
             context_terms=_extract_context_terms(normalized),
             used_ai_rewrite=False,
@@ -203,6 +204,7 @@ def _validate_plan(
         search_queries=queries or [original],
         keywords=keywords,
         intent=intent,
+        response_mode=_infer_response_mode(original),
         focus_terms=focus_terms,
         context_terms=context_terms,
         used_ai_rewrite=rewritten != original or len(queries) > 1,
@@ -307,6 +309,30 @@ def _structural_queries(value: str, intent: str) -> list[str]:
         variants.append("wake up test examination train functions safety devices")
 
     return _unique(variants)
+
+
+def _infer_response_mode(value: str) -> str:
+    normalized = " ".join(value.split())
+    lowered = normalized.casefold()
+    terms = [token.casefold() for token in _TERM_PATTERN.findall(normalized)]
+    question_starts = (
+        "can ",
+        "do ",
+        "does ",
+        "how ",
+        "is ",
+        "should ",
+        "what ",
+        "when ",
+        "where ",
+        "which ",
+        "who ",
+        "why ",
+    )
+    is_specific_question = normalized.endswith("?") or lowered.startswith(question_starts)
+    if not is_specific_question and len(terms) <= 5:
+        return "evidence"
+    return "concise"
 
 
 def _unique(values: list[str]) -> list[str]:

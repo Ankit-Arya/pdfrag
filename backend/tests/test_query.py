@@ -98,3 +98,10 @@ def test_process_query_searches_for_associated_test_evidence() -> None:
     assert plan.intent == "procedure"
     assert "wake up test" in plan.search_queries
     assert any("examination" in query for query in plan.search_queries)
+    assert plan.response_mode == "evidence"
+
+
+def test_specific_question_uses_concise_response_mode() -> None:
+    plan = QueryPlanner().plan("When do we operate the train at 15 kmph?", enabled=False)
+
+    assert plan.response_mode == "concise"

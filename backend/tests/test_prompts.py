@@ -82,3 +82,38 @@ def test_citation_repair_keeps_document_specific_format() -> None:
 
     assert "one `### <filename> — page <number or range>` subsection" in prompt
     assert "no timing is specified" in prompt
+
+
+def test_evidence_mode_requests_document_language_and_section_path() -> None:
+    result = RetrievedChunk(
+        TextChunk("speed", "MRGR.pdf", 15, "Train shall operate at 15 kmph."),
+        0.9,
+    )
+
+    prompt, _ = build_user_prompt(
+        "15 kmph",
+        [result],
+        max_context_chars=2000,
+        response_mode="evidence",
+    )
+
+    assert "This is a broad evidence lookup" in prompt
+    assert "heading/subheading or Section path" in prompt
+    assert "preserve its original context" in prompt
+
+
+def test_concise_mode_asks_for_the_controlling_condition() -> None:
+    result = RetrievedChunk(
+        TextChunk("speed", "MRGR.pdf", 15, "Train shall operate at 15 kmph."),
+        0.9,
+    )
+
+    prompt, _ = build_user_prompt(
+        "When is 15 kmph required?",
+        [result],
+        max_context_chars=2000,
+        response_mode="concise",
+    )
+
+    assert "This is a specific answer lookup" in prompt
+    assert "controlling context, condition, or exception" in prompt

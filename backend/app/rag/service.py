@@ -11,7 +11,7 @@ from app.db_models import Document, DocumentChunk, DocumentStatus
 from app.models import AnswerResponse, SourceResult
 from app.rag.chunking import chunk_pages
 from app.rag.embeddings import embedding_service
-from app.rag.guardrails import validate_grounded_answer
+from app.rag.guardrails import cited_source_numbers, validate_grounded_answer
 from app.rag.llm import llm_service
 from app.rag.pdf import extract_pdf_pages
 from app.rag.postgres_store import fetch_neighbor_chunks, search_chunks
@@ -127,6 +127,7 @@ class RagService:
             expanded,
             settings.max_context_chars,
             question_intent=plan.intent,
+            response_mode=plan.response_mode,
         )
         if not context:
             return AnswerResponse(
@@ -149,6 +150,7 @@ class RagService:
                 answer,
                 expanded,
                 settings.max_context_chars,
+                response_mode=plan.response_mode,
             )
             if repair_context:
                 repaired_raw = llm_service.answer(repair_prompt)
@@ -162,6 +164,7 @@ class RagService:
                     grounding_status = "verified_after_repair" if grounded else "citation_validation_failed"
                     context = repair_context
 
+        used_source_numbers = set(cited_source_numbers(answer, len(context)))
         sources = [
             SourceResult(
                 id=f"S{index}",
@@ -173,6 +176,7 @@ class RagService:
                 retrieval_method=source.result.method,
             )
             for index, source in enumerate(context, 1)
+            if index in used_source_numbers
         ]
         return AnswerResponse(
             answer=answer,
