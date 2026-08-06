@@ -1,4 +1,9 @@
-from app.rag.prompts import NO_ANSWER, SYSTEM_PROMPT, build_user_prompt
+from app.rag.prompts import (
+    NO_ANSWER,
+    SYSTEM_PROMPT,
+    build_citation_repair_prompt,
+    build_user_prompt,
+)
 from app.rag.types import RetrievedChunk, TextChunk
 
 
@@ -47,3 +52,33 @@ def test_user_prompt_rejects_unrelated_nearby_material() -> None:
 
     assert "adjacent but unrelated rules" in prompt
     assert "Do not say that no more detail exists" in prompt
+    assert "## Information found in the documents" in prompt
+    assert "### <filename> — page <number or range>" in prompt
+    assert "## Summary" not in prompt
+
+
+def test_prompt_groups_chunks_from_the_same_document() -> None:
+    results = [
+        RetrievedChunk(TextChunk("a-2", "a.pdf", 2, "Second page."), 0.9),
+        RetrievedChunk(TextChunk("b-1", "b.pdf", 1, "Other document."), 0.8),
+        RetrievedChunk(TextChunk("a-1", "a.pdf", 1, "First page."), 0.7),
+    ]
+
+    _, included = build_user_prompt("question", results, max_context_chars=5000)
+
+    assert [item.chunk.chunk_id for item in included] == ["a-1", "a-2", "b-1"]
+
+
+def test_citation_repair_keeps_document_specific_format() -> None:
+    result = RetrievedChunk(TextChunk("a", "rules.pdf", 8, "Supported fact."), 0.8)
+
+    prompt, _ = build_citation_repair_prompt(
+        "question",
+        "question",
+        "Unsupported draft.",
+        [result],
+        2000,
+    )
+
+    assert "one `### <filename> — page <number or range>` subsection" in prompt
+    assert "no timing is specified" in prompt

@@ -60,33 +60,15 @@ Completeness rules:
 27. Do not stop after the first relevant excerpt. Integrate all relevant supplied excerpts.
 
 Response structure:
-28. Unless the user explicitly requests a different format, provide:
-    - **Applicable context**: document/source, page range when visible, section/procedure, rolling stock or train context when visible;
-    - **Summary**: the direct answer;
-    - **Detailed answer**: complete supported details.
-29. Avoid repeating the same sentence in Summary and Detailed answer.
-30. For procedures, workflows, operating instructions, or "how" questions:
-    - start with prerequisites/applicability;
-    - use numbered chronological steps;
-    - include exact settings, timings, limits, checks, warnings, branches, and exceptions under the relevant step;
-    - include post-action verification or records when stated.
-31. For comparisons:
-    - start with a brief comparison summary;
-    - use a Markdown table when the excerpts provide common fields;
-    - preserve all relevant row-level values and citations;
-    - add conditions or exceptions below the table when needed.
-32. For summaries:
-    - provide a concise overview first;
-    - then provide a comprehensive, grouped breakdown;
-    - retain important facts, figures, names, dates, requirements, and exceptions.
-33. For definitions or direct factual questions:
-    - answer directly first;
-    - then include scope, exact values, related conditions, and exceptions found in the excerpts.
-34. For troubleshooting:
-    - include the stated symptom, condition, cause only when documented, action, sequence, limits, and verification;
-    - use a table only when consistent fields are supported.
-35. For fact-heavy material, include a **Facts and figures** table when it improves completeness and readability.
-36. Do not add generic introductions, filler, motivational language, or a generic conclusion.
+28. Present evidence source by source instead of turning multiple documents into one narrative.
+29. Start with `## Information found in the documents`.
+30. Create one subsection per relevant document using `### <filename> — page <number or range>`.
+31. Under each document, give concise bullets containing only what that document says about the question.
+32. Keep similar statements from different documents in their separate document subsections; do not merge them into one claim.
+33. When a source provides steps, tests, checks, prerequisites, warnings, or records, preserve their order under that source.
+34. If documents describe different scopes or terminology, state the distinction briefly inside the relevant subsection.
+35. Do not add separate Applicable context, Summary, Detailed answer, Facts and figures, Conditions, or Conclusion sections unless the user requests them.
+36. Prefer short bullets over prose and tables. Omit retrieved sources that do not directly answer or qualify the question.
 
 Citation rules:
 37. Cite every factual paragraph, bullet, numbered step, and factual table row with exact labels such as [S1] or [S1][S2].
@@ -120,6 +102,7 @@ Rules:
 - Correct spelling only when confidence is high.
 - Create semantically equivalent retrieval variants that improve recall.
 - Include variants for requested facts, figures, requirements, conditions, exceptions, warnings, procedures, headings, subheadings, and tables when applicable.
+- For a process or procedure question, include variants for its documented steps, tests, checks, examinations, prerequisites, and resulting records when those may contain the operational detail.
 - Every search variant must retain the important exact terms from the original question.
 - Return valid JSON only with:
   - rewritten_question: string
@@ -193,7 +176,7 @@ def _build_source_blocks(
     included: list[PromptSource] = []
     used = 0
 
-    for source_number, result in enumerate(results, start=1):
+    for source_number, result in enumerate(_group_results_by_document(results), start=1):
         header = _source_header(source_number, result)
         available = max_context_chars - used - len(header)
         if available <= 0:
@@ -213,6 +196,32 @@ def _build_source_blocks(
         used += len(block)
 
     return "\n\n---\n\n".join(source_blocks), included
+
+
+def _group_results_by_document(
+    results: list[RetrievedChunk],
+) -> list[RetrievedChunk]:
+    document_order: list[str] = []
+    groups: dict[str, list[RetrievedChunk]] = {}
+    for result in results:
+        key = result.chunk.document_id or result.chunk.filename.casefold()
+        if key not in groups:
+            document_order.append(key)
+            groups[key] = []
+        groups[key].append(result)
+
+    ordered: list[RetrievedChunk] = []
+    for key in document_order:
+        ordered.extend(
+            sorted(
+                groups[key],
+                key=lambda item: (
+                    item.chunk.page_number,
+                    item.chunk.chunk_index if item.chunk.chunk_index is not None else -1,
+                ),
+            )
+        )
+    return ordered
 
 
 def build_user_prompt(
@@ -268,12 +277,13 @@ Required drafting process:
 5. Draft the answer so none of those relevant items is lost.
 
 Required answer format:
-- Start with `## Applicable context` and state the exact context supported by the sources.
-- Continue with `## Summary` and give a direct overview.
-- Continue with `## Detailed answer` and provide the complete supported explanation.
-- Add `## Facts and figures` when the excerpts contain multiple important numeric, dated, coded, or tabular facts.
-- Add `## Conditions, exceptions, and warnings` when such qualifications are present.
-- Omit a heading only when there is genuinely no material for it.
+- Start with `## Information found in the documents`.
+- Group the response by document, using `### <filename> — page <number or range>` for each relevant document.
+- Under each document heading, provide concise bullets stating only what that document says about the original question.
+- Keep statements from different documents separate even when they are similar. Do not combine them into one synthesized story.
+- For a process or procedure, include its documented tests, checks, steps, prerequisites, outcomes, and records under the document that states them.
+- Do not add separate Applicable context, Summary, Detailed answer, Facts and figures, Conditions, or Conclusion sections.
+- Omit any retrieved document that does not directly answer or materially qualify the question.
 
 Applicability and safety requirements:
 - If multiple rolling stocks/procedures/sections appear and the question does not specify which one, ask the user to specify the context instead of blending procedures.
@@ -328,22 +338,18 @@ Instructions:
 3. Remove every unsupported claim.
 4. Preserve exact values, dates, units, names, identifiers, qualifiers, and procedural order.
 5. Do not merge instructions across different rolling stocks/procedures/sections unless the excerpts explicitly support doing so.
-6. Do not make the revised answer shorter merely to repair citations.
-7. Unless the user requested another format, use:
-   - `## Applicable context`
-   - `## Summary`
-   - `## Detailed answer`
-   - `## Facts and figures` when useful
-   - `## Conditions, exceptions, and warnings` when present
-8. For procedures, include prerequisites, complete chronological steps, settings, timings, checks, branches, warnings, and verification.
-9. If the earlier answer used the no-answer sentence but relevant evidence exists, answer now.
-10. If evidence is partial, include every supported detail and identify what is not established.
-11. If excerpts conflict, report the conflict with citations to both sides.
-12. Cite every factual paragraph, bullet, numbered step, and factual table row using exact labels such as [S1].
-13. A negative or absence claim such as "no timing is specified" is factual and must be cited or removed.
-14. Never replace [S1] with (S1), Source 1, [Source 1], footnotes, URLs, or invented labels.
-15. Do not add a generic conclusion.
-16. Reply exactly with the following sentence only if no supported answer can be written:
+6. Keep the revised answer concise and remove repetition or unrelated nearby material.
+7. Use `## Information found in the documents`, followed by one `### <filename> — page <number or range>` subsection per relevant document.
+8. Under each document, use concise bullets and keep that document's facts separate from every other document.
+9. For procedures, include documented prerequisites, chronological steps, settings, timings, checks, branches, warnings, verification, and records under their source document.
+10. If the earlier answer used the no-answer sentence but relevant evidence exists, answer now.
+11. If evidence is partial, include every supported detail without claiming that the documents contain nothing more.
+12. If excerpts conflict, report the conflict within the relevant source subsections.
+13. Cite every factual bullet or numbered step using exact labels such as [S1].
+14. A negative or absence claim such as "no timing is specified" is factual and must be cited or removed.
+15. Never replace [S1] with (S1), Source 1, [Source 1], footnotes, URLs, or invented labels.
+16. Do not add a generic conclusion.
+17. Reply exactly with the following sentence only if no supported answer can be written:
 {NO_ANSWER}"""
 
     return prompt, included

@@ -81,13 +81,16 @@ class QueryPlanner:
         settings = get_settings()
         should_rewrite = settings.query_rewrite_enabled if enabled is None else enabled
         normalized = " ".join(question.split())
+        fallback_intent = _infer_intent(normalized)
 
         fallback = QueryPlan(
             original_question=normalized,
             rewritten_question=normalized,
-            search_queries=[normalized],
+            search_queries=_unique(
+                [normalized, *_structural_queries(normalized, fallback_intent)]
+            )[: settings.query_rewrite_max_variants],
             keywords=_extract_acronyms(normalized),
-            intent=_infer_intent(normalized),
+            intent=fallback_intent,
             focus_terms=_extract_focus_terms(normalized),
             context_terms=_extract_context_terms(normalized),
             used_ai_rewrite=False,
@@ -163,7 +166,10 @@ def _validate_plan(
     )
     model_queries = [query for query in model_queries if query]
 
-    candidate_queries = [original, rewritten, *model_queries]
+    raw_intent = _clean_string(payload.get("intent")).casefold()
+    intent = raw_intent if raw_intent in _VALID_INTENTS else _infer_intent(original)
+    structural_queries = _structural_queries(original, intent)
+    candidate_queries = [original, rewritten, *structural_queries, *model_queries]
 
     # When acronyms are present, discard model variants that removed them.
     # This removes incorrect variants such as "Fire Dynamics Simulator..." for FDS.
@@ -183,9 +189,6 @@ def _validate_plan(
         else []
     )
     keywords = _unique([*acronyms, *[item for item in model_keywords if item]])[:24]
-
-    raw_intent = _clean_string(payload.get("intent")).casefold()
-    intent = raw_intent if raw_intent in _VALID_INTENTS else _infer_intent(original)
 
     heuristic_focus = _extract_focus_terms(original)
     model_focus = _validated_original_terms(payload.get("focus_terms"), original)
@@ -263,7 +266,7 @@ def _infer_intent(value: str) -> str:
         return "troubleshooting"
     if (
         lowered.startswith("how ")
-        or {"procedure", "steps", "reset", "isolate", "operate"} & terms
+        or {"process", "procedure", "steps", "reset", "isolate", "operate"} & terms
     ):
         return "procedure"
     if {"required", "requirement", "requirements", "must", "shall", "prerequisite"} & terms:
@@ -275,6 +278,35 @@ def _infer_intent(value: str) -> str:
     if lowered.startswith("list ") or {"list", "types"} & terms:
         return "list"
     return "fact_lookup"
+
+
+def _structural_queries(value: str, intent: str) -> list[str]:
+    """Add evidence-shape variants without changing the question being answered."""
+    normalized = " ".join(value.split())
+    lowered = normalized.casefold()
+    variants: list[str] = []
+
+    if re.search(r"\bprocess\b", lowered):
+        subject = re.sub(r"\bprocess\b", "", normalized, flags=re.IGNORECASE)
+        subject = " ".join(subject.split()).strip(" -:;,.?")
+        if subject:
+            variants.extend(
+                [
+                    f"{subject} test",
+                    f"{subject} procedure steps checks examination",
+                ]
+            )
+    elif intent == "procedure":
+        subject = re.sub(r"\bprocedure\b", "", normalized, flags=re.IGNORECASE)
+        subject = " ".join(subject.split()).strip(" -:;,.?")
+        if subject:
+            variants.append(f"{subject} steps instructions checks")
+
+    terms = {token.casefold() for token in _TERM_PATTERN.findall(normalized)}
+    if {"wake", "wake-up", "wakeup"} & terms:
+        variants.append("wake up test examination train functions safety devices")
+
+    return _unique(variants)
 
 
 def _unique(values: list[str]) -> list[str]:

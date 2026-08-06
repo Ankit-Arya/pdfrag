@@ -224,3 +224,33 @@ def test_short_query_keeps_evidence_from_every_relevant_document() -> None:
         "document-4.pdf",
         "document-5.pdf",
     }
+
+
+def test_process_query_keeps_wake_up_test_but_rejects_process_only_noise() -> None:
+    plan = QueryPlan(
+        original_question="wake up process",
+        rewritten_question="wake up process",
+        search_queries=["wake up process", "wake up test"],
+        intent="procedure",
+        focus_terms=["wake", "up", "process"],
+    )
+    retrieved = [
+        result(
+            "examination",
+            "gazette.pdf",
+            128,
+            "Wake-up test examination shall ensure train safety devices are working.",
+            0.71,
+        ),
+        result(
+            "noise",
+            "unrelated.pdf",
+            4,
+            "The approval process for station signage is described here.",
+            0.86,
+        ),
+    ]
+
+    selected = select_context_chunks(plan, retrieved, max_chunks=12)
+
+    assert [item.chunk.chunk_id for item in selected] == ["examination"]

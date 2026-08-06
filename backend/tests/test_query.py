@@ -1,4 +1,4 @@
-from app.rag.query import _extract_context_terms, _validate_plan
+from app.rag.query import QueryPlanner, _extract_context_terms, _validate_plan
 
 
 def test_domain_acronym_is_not_expanded_from_general_knowledge() -> None:
@@ -32,10 +32,9 @@ def test_domain_acronym_is_not_expanded_from_general_knowledge() -> None:
         "Fire Dynamics Simulator user manual"
         not in plan.search_queries
     )
-    assert plan.search_queries == [
-        "FDS operating procedure",
-        "FDS operating procedure document",
-    ]
+    assert plan.search_queries[0] == "FDS operating procedure"
+    assert "FDS operating steps instructions checks" in plan.search_queries
+    assert "FDS operating procedure document" in plan.search_queries
     assert "FDS" in plan.keywords
     assert plan.intent == "procedure"
     assert "FDS" in plan.context_terms
@@ -91,3 +90,11 @@ def test_context_terms_are_extracted_without_ai_rewrite() -> None:
         "Line 2",
         "2",
     ]
+
+
+def test_process_query_searches_for_associated_test_evidence() -> None:
+    plan = QueryPlanner().plan("wake up process", enabled=False)
+
+    assert plan.intent == "procedure"
+    assert "wake up test" in plan.search_queries
+    assert any("examination" in query for query in plan.search_queries)

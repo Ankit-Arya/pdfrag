@@ -147,7 +147,7 @@ def select_context_chunks(
     eligible: list[_ScoredChunk] = []
 
     for item in scored:
-        has_focus = item.coverage >= 0.28 or not focus_terms
+        has_focus = item.coverage >= 0.50 or not focus_terms
         required_anchor_coverage = (
             1.0 / len(anchor_groups)
             if anchor_groups and plan.intent == "comparison"
