@@ -40,3 +40,31 @@ def test_heading_path_carries_across_pages() -> None:
 
     assert any("Pages: 1-2" in chunk.text for chunk in chunks)
     assert all("Door Reset Procedure" in chunk.text for chunk in chunks)
+
+
+def test_dash_terminated_rule_headings_are_preserved_as_subsections() -> None:
+    pages = [
+        PageText(
+            "rules.pdf",
+            42,
+            "CHAPTER X\n"
+            "PERMANENT WAY AND WORKS\n"
+            "67.\n"
+            "General ––\n"
+            "All running tracks shall be inspected as specified.\n"
+            "Track work in non-traffic hours ––\n"
+            "No maintenance staff shall enter a running line without permission. "
+            "The controller shall record the location, authorised person, start time, "
+            "completion report, equipment clearance and confirmation that service may "
+            "resume safely after the work is complete.\n",
+        )
+    ]
+
+    chunks = chunk_pages(pages, chunk_size=700, overlap=80)
+    paths = {chunk.section_path for chunk in chunks}
+
+    assert ("PERMANENT WAY AND WORKS", "67 General") in paths
+    assert (
+        "PERMANENT WAY AND WORKS",
+        "Track work in non-traffic hours",
+    ) in paths

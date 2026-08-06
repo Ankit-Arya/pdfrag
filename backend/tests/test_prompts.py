@@ -98,7 +98,8 @@ def test_evidence_mode_requests_document_language_and_section_path() -> None:
     )
 
     assert "This is a broad evidence lookup" in prompt
-    assert "heading/subheading or Section path" in prompt
+    assert "extracted Section path" in prompt
+    assert "Never print a `Heading/subheading:` label" in prompt
     assert "preserve its original context" in prompt
 
 

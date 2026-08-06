@@ -374,8 +374,8 @@ Instructions:
 def _response_mode_instructions(response_mode: str) -> str:
     if response_mode == "evidence":
         return """This is a broad evidence lookup.
-- For each relevant document, show the heading/subheading or Section path from the chunk context.
-- Write it as `**Heading/subheading:** <section path>` and show the relevant document passage in bullets.
+- When an extracted Section path is useful, show its most specific relevant part as a short Markdown subheading such as `#### Track work in non-traffic hours`.
+- Never print a `Heading/subheading:` label. If the extracted heading is missing or noisy, omit it rather than exposing extraction metadata.
 - Reproduce the directly relevant document passage closely and completely enough to preserve its original context, conditions, sequence, and terminology.
 - Do not reduce the passage to a one-line conclusion.
 - Keep passages from different documents in separate document subsections.
@@ -383,6 +383,7 @@ def _response_mode_instructions(response_mode: str) -> str:
 - Cite every displayed passage with its source label."""
     return """This is a specific answer lookup.
 - Under each relevant document, answer the exact question in one or two concise bullets.
-- Show `**Heading/subheading:** <section path>`, then state the controlling context, condition, or exception needed to understand when the answer applies.
+- If useful, show a concise extracted or evidence-grounded Markdown subheading; never print a `Heading/subheading:` label.
+- State the controlling context, condition, or exception needed to understand when the answer applies.
 - Do not reproduce a whole paragraph when a shorter supported answer is sufficient.
 - Preserve the document's terminology and cite every factual bullet."""

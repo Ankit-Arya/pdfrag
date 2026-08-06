@@ -279,3 +279,65 @@ def test_evidence_mode_keeps_multiple_chunks_from_one_document() -> None:
     selected = select_context_chunks(plan, retrieved, max_chunks=16)
 
     assert len(selected) == 10
+
+
+def test_major_section_heading_outranks_incidental_body_mention() -> None:
+    title = "ELECTRICAL SAFETY AND CONTROL"
+    plan = QueryPlan(
+        original_question=title,
+        rewritten_question=title,
+        search_queries=[title],
+        intent="fact_lookup",
+        response_mode="evidence",
+        focus_terms=["ELECTRICAL", "SAFETY", "AND", "CONTROL"],
+        context_terms=["ELECTRICAL", "SAFETY", "AND", "CONTROL"],
+    )
+    retrieved = [
+        result(
+            "incidental",
+            "definitions.pdf",
+            4,
+            "An incident may affect electrical safety and control equipment.",
+            0.97,
+        ),
+        result(
+            "chapter",
+            "rules.pdf",
+            80,
+            "[PDF CHUNK CONTEXT]\n"
+            "Section path: ELECTRICAL SAFETY AND CONTROL > General\n"
+            "[/PDF CHUNK CONTEXT]\n\n"
+            "All authorised staff shall follow the inspection schedule.",
+            0.42,
+        ),
+    ]
+
+    selected = select_context_chunks(plan, retrieved, max_chunks=12)
+
+    assert [item.chunk.chunk_id for item in selected] == ["chapter"]
+
+
+def test_numeric_anchor_matches_number_word_in_document() -> None:
+    plan = QueryPlan(
+        original_question="3 month absence",
+        rewritten_question="3 month absence",
+        search_queries=["3 month absence", "three month absence"],
+        intent="fact_lookup",
+        response_mode="evidence",
+        focus_terms=["month", "absence"],
+        context_terms=["3"],
+    )
+    retrieved = [
+        result(
+            "absence",
+            "handbook.pdf",
+            25,
+            "Duration of absence. A Train Operator absent for three months shall "
+            "be given road learning trips.",
+            0.61,
+        )
+    ]
+
+    selected = select_context_chunks(plan, retrieved)
+
+    assert [item.chunk.chunk_id for item in selected] == ["absence"]

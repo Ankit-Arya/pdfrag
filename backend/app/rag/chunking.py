@@ -2,17 +2,20 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Iterable
 
 from app.rag.types import PageText, TextChunk
-
 
 _NUMBERED_HEADING = re.compile(
     r"^(?P<num>(?:\d{1,3})(?:\.\d{1,3}){0,8})(?:[.)])?\s+(?P<title>[A-Za-z0-9][^|]{2,180})$"
 )
 _ALPHA_HEADING = re.compile(r"^(?P<num>[A-Z])\.\s+(?P<title>[A-Za-z0-9][^|]{2,160})$")
 _ROMAN_HEADING = re.compile(r"^(?P<num>[IVXLCM]{1,8})\.\s+(?P<title>[A-Za-z0-9][^|]{2,160})$")
+_DASH_HEADING = re.compile(
+    r"^(?P<title>[A-Za-z][A-Za-z0-9 /&()'\u2019,-]{2,155}?)\s*[-\u2013\u2014]{1,3}$"
+)
+_STANDALONE_RULE_NUMBER = re.compile(r"^(?P<number>\d{1,3})[.)]$")
 _ACRONYM_OR_CODE = re.compile(r"(?<![A-Za-z0-9])[A-Z][A-Z0-9/-]{1,14}(?![A-Za-z0-9])")
 _MULTISPACE = re.compile(r"[ \t]+")
 _PROCEDURE_WORDS = {
@@ -159,6 +162,7 @@ def _build_sections(pages: list[PageText]) -> list[_Section]:
     sections: list[_Section] = []
     heading_stack: list[_Heading] = []
     current: _Section | None = None
+    pending_rule_number: str | None = None
 
     def flush() -> None:
         nonlocal current
@@ -190,9 +194,24 @@ def _build_sections(pages: list[PageText]) -> list[_Section]:
                     current.blocks.append("")
                 continue
 
+            standalone_number = _STANDALONE_RULE_NUMBER.match(line)
+            if standalone_number:
+                # PDF extraction often places a rule number on its own line
+                # immediately before the rule heading. Keep the most recent
+                # marker and attach it once the following line reveals whether
+                # it is a heading or ordinary body text.
+                pending_rule_number = standalone_number.group("number")
+                continue
+
             heading = _detect_heading(line)
             if heading:
                 flush()
+                if pending_rule_number:
+                    heading = _Heading(
+                        text=f"{pending_rule_number} {heading.text}",
+                        level=heading.level,
+                    )
+                    pending_rule_number = None
                 heading_stack = _push_heading(heading_stack, heading)
                 continue
 
@@ -207,9 +226,14 @@ def _build_sections(pages: list[PageText]) -> list[_Section]:
                     rolling_stock=_infer_rolling_stock(path),
                     procedure=_infer_procedure(path),
                 )
+            if pending_rule_number:
+                current.blocks.append(f"{pending_rule_number}.")
+                pending_rule_number = None
             current.page_end = page.page_number
             current.blocks.append(line)
 
+    if pending_rule_number and current:
+        current.blocks.append(f"{pending_rule_number}.")
     flush()
     return _merge_tiny_sections(sections)
 
@@ -246,6 +270,10 @@ def _detect_heading(line: str) -> _Heading | None:
     if _is_uppercase_heading(line):
         return _Heading(text=_clean_heading_title(line), level=1)
 
+    dash = _DASH_HEADING.match(line)
+    if dash and _is_short_heading_phrase(dash.group("title")):
+        return _Heading(text=_clean_heading_title(dash.group("title")), level=2)
+
     # Common procedure-manual subheading style: "Brake Isolation:".
     if line.endswith(":") and 4 <= len(line) <= 120 and len(line.split()) <= 10:
         lowered = line.casefold()
@@ -269,9 +297,7 @@ def _looks_like_non_heading(line: str) -> bool:
     # Dense numeric rows are usually table data, not headings.
     tokens = line.split()
     numeric_tokens = sum(bool(re.search(r"\d", token)) for token in tokens)
-    if len(tokens) >= 5 and numeric_tokens / max(len(tokens), 1) > 0.55:
-        return True
-    return False
+    return len(tokens) >= 5 and numeric_tokens / max(len(tokens), 1) > 0.55
 
 
 def _clean_heading_title(value: str) -> str:
@@ -299,6 +325,13 @@ def _heading_case_score(value: str) -> float:
     if not letters:
         return 0.0
     return sum(char.isupper() for char in letters) / len(letters)
+
+
+def _is_short_heading_phrase(value: str) -> bool:
+    words = value.split()
+    if not 1 <= len(words) <= 18 or any(mark in value for mark in ".;:"):
+        return False
+    return bool(value[:1].isupper())
 
 
 def _merge_tiny_sections(sections: list[_Section]) -> list[_Section]:
@@ -329,7 +362,11 @@ def _same_parent_path(left: list[str], right: list[str]) -> bool:
 
 
 def _context_header(section: _Section) -> str:
-    pages = str(section.page_start) if section.page_start == section.page_end else f"{section.page_start}-{section.page_end}"
+    pages = (
+        str(section.page_start)
+        if section.page_start == section.page_end
+        else f"{section.page_start}-{section.page_end}"
+    )
     path = " > ".join(section.section_path) if section.section_path else "Unsectioned content"
     lines = [
         "[PDF CHUNK CONTEXT]",
@@ -431,7 +468,9 @@ def _paragraphs(text: str) -> list[str]:
     parts = [part.strip() for part in re.split(r"\n\s*\n", text) if part.strip()]
     if len(parts) <= 1:
         # Preserve numbered steps better than a raw character splitter.
-        parts = [part.strip() for part in re.split(r"(?=\n?(?:\d+[.)]|[-*•])\s+)", text) if part.strip()]
+        parts = [
+            part.strip() for part in re.split(r"(?=\n?(?:\d+[.)]|[-*•])\s+)", text) if part.strip()
+        ]
     return parts or ([text] if text else [])
 
 

@@ -242,24 +242,32 @@ onMounted(() => {
             This answer is shown, but its citation format did not pass automatic validation.
           </div>
 
-          <div v-if="message.response?.sources.length" class="sources">
-            <span class="eyebrow">Retrieved evidence</span>
-            <details
-              v-for="source in message.response.sources"
-              :key="source.id"
-              class="source-card"
-            >
-              <summary>
-                <span class="source-id">{{ source.id }}</span>
-                <span class="source-title">{{ source.filename }}</span>
-                <span class="source-page">p. {{ source.page }}</span>
-              </summary>
-              <p>{{ source.excerpt }}</p>
-              <span class="score">
-                {{ source.retrieval_method }} · score {{ source.score.toFixed(3) }}
+          <details v-if="message.response?.sources.length" class="sources">
+            <summary class="sources-summary">
+              <span>Retrieved evidence</span>
+              <span class="sources-count">
+                {{ message.response.sources.length }}
+                source{{ message.response.sources.length === 1 ? '' : 's' }}
               </span>
-            </details>
-          </div>
+            </summary>
+            <div class="source-list">
+              <details
+                v-for="source in message.response.sources"
+                :key="source.id"
+                class="source-card"
+              >
+                <summary>
+                  <span class="source-id">{{ source.id }}</span>
+                  <span class="source-title">{{ source.filename }}</span>
+                  <span class="source-page">p. {{ source.page }}</span>
+                </summary>
+                <p>{{ source.excerpt }}</p>
+                <span class="score">
+                  {{ source.retrieval_method }} · score {{ source.score.toFixed(3) }}
+                </span>
+              </details>
+            </div>
+          </details>
         </div>
       </article>
 

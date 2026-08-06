@@ -4,6 +4,9 @@ import re
 from collections import OrderedDict
 from dataclasses import dataclass
 
+from app.rag.normalization import search_terms
+from app.rag.structure import major_section_match_score, section_match_score
+from app.rag.table_quality import is_plausible_table
 from app.rag.types import PromptSource
 
 _CONTEXT_BLOCK_RE = re.compile(
@@ -13,7 +16,6 @@ _CONTEXT_BLOCK_RE = re.compile(
 _SECTION_RE = re.compile(r"^Section path:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
 _PAGES_RE = re.compile(r"^Pages:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
 _SOURCE_LABEL_RE = re.compile(r"\[S(\d+)]")
-_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./:#-]*")
 _NEW_UNIT_RE = re.compile(
     r"^(?P<marker>\(?\d+[.)]|\([a-zivxlcdm]+\)|[a-z][.)]|[-*•])(?:\s+|$)",
     re.IGNORECASE,
@@ -22,7 +24,7 @@ _ARABIC_MARKER_RE = re.compile(r"^\(?\d+[.)](?:\s+|$)")
 _SUBITEM_MARKER_RE = re.compile(r"^(?:\([a-zivxlcdm]+\)|[a-z][.)])(?:\s+|$)", re.IGNORECASE)
 _TABLE_SEPARATOR_RE = re.compile(r"^\|?(?:\s*:?-+:?\s*\|)+\s*$")
 _NOISY_SECTION_RE = re.compile(
-    r"(?:THE GAZETTE OF INDIA|\[PART\s+II|DURATIONOF ABSENCE|^\d+$)",
+    r"(?:THE GAZETTE OF INDIA|\[PART\s+II|^\d+$)",
     re.IGNORECASE,
 )
 _PAGE_HEADER_RE = re.compile(
@@ -71,7 +73,7 @@ def build_evidence_answer(
 ) -> tuple[str, list[PromptSource]]:
     """Render readable broad evidence without LLM paraphrasing or omission."""
     question_terms = _query_terms(question)
-    candidates = _collect_units(question_terms, sources)
+    candidates = _collect_units(question, question_terms, sources)
     candidates = _deduplicate_units(candidates)
     used_sources = _used_sources(candidates)
     source_numbers = {id(source): index for index, source in enumerate(used_sources, 1)}
@@ -98,11 +100,11 @@ def build_evidence_answer(
             [
                 "",
                 f"### {filename} — {page_label} {pages}",
-                "",
-                f"**Heading/subheading:** {section}",
-                "",
             ]
         )
+        if section != "Not clearly identified in extracted text":
+            lines.extend(["", f"#### {section}"])
+        lines.append("")
         for unit in units:
             source_number = source_numbers[id(unit.source)]
             clean = _SOURCE_LABEL_RE.sub(r"(document reference S\1)", unit.text)
@@ -114,32 +116,50 @@ def build_evidence_answer(
 
 
 def _collect_units(
+    question: str,
     question_terms: set[str],
     sources: list[PromptSource],
 ) -> list[_EvidenceUnit]:
     collected: list[_EvidenceUnit] = []
-    for source_order, source in enumerate(sources):
+    prepared = [_prepare_source(source) for source in sources]
+    major_matches = [
+        item for item in prepared if major_section_match_score(question, item[3]) >= 0.9
+    ]
+    active_sources = major_matches or prepared
+
+    for source_order, (source, header, body, raw_section) in enumerate(active_sources):
         chunk = source.result.chunk
-        header, body = _split_context(source.excerpt)
         pages = _metadata_value(_PAGES_RE, header) or str(chunk.page_number)
-        raw_section = (
-            " > ".join(chunk.section_path)
-            if chunk.section_path
-            else _metadata_value(_SECTION_RE, header) or chunk.heading or ""
-        )
         section = _clean_section(raw_section)
+        structural_match = section_match_score(question, raw_section)
+        source_relevant = _is_relevant(
+            f"{raw_section}\n{body}",
+            question_terms,
+        )
 
         if chunk.content_type == "table":
-            units = _readable_table_rows(body, question_terms)
+            units = _readable_table_rows(
+                body,
+                question_terms,
+                include_all=structural_match >= 0.88,
+                source_relevant=source_relevant,
+            )
             included = units
         else:
             units = _document_units(body)
-            relevant_indexes = {
-                index
-                for index, unit in enumerate(units)
-                if _is_relevant(unit, question_terms)
-            }
-            included = _expand_structured_context(units, relevant_indexes)
+            if structural_match >= 0.88:
+                included = units
+            else:
+                relevant_indexes = {
+                    index
+                    for index, unit in enumerate(units)
+                    if _is_relevant(
+                        f"{raw_section}\n{unit}",
+                        question_terms,
+                        minimum=1 if source_relevant else None,
+                    )
+                }
+                included = _expand_structured_context(units, relevant_indexes)
 
         for unit in included:
             clean = _clean_unit(unit)
@@ -156,6 +176,17 @@ def _collect_units(
                 )
             )
     return collected
+
+
+def _prepare_source(source: PromptSource) -> tuple[PromptSource, str, str, str]:
+    chunk = source.result.chunk
+    header, body = _split_context(source.excerpt)
+    raw_section = (
+        " > ".join(chunk.section_path)
+        if chunk.section_path
+        else _metadata_value(_SECTION_RE, header) or chunk.heading or ""
+    )
+    return source, header, body, raw_section
 
 
 def _expand_structured_context(units: list[str], relevant: set[int]) -> list[str]:
@@ -180,7 +211,13 @@ def _expand_structured_context(units: list[str], relevant: set[int]) -> list[str
     return [unit for index, unit in enumerate(units) if index in include]
 
 
-def _readable_table_rows(value: str, question_terms: set[str]) -> list[str]:
+def _readable_table_rows(
+    value: str,
+    question_terms: set[str],
+    *,
+    include_all: bool = False,
+    source_relevant: bool = False,
+) -> list[str]:
     lines = [line.strip() for line in value.splitlines() if line.strip()]
     table_lines = [line for line in lines if line.startswith("|") and line.endswith("|")]
     if len(table_lines) < 3:
@@ -190,10 +227,20 @@ def _readable_table_rows(value: str, question_terms: set[str]) -> list[str]:
     if not header or not _TABLE_SEPARATOR_RE.match(table_lines[1]):
         return []
 
+    parsed_rows = [header, *[_table_cells(line) for line in table_lines[2:]]]
+    if not is_plausible_table(parsed_rows):
+        return []
+
     rows: list[str] = []
-    for line in table_lines[2:]:
-        cells = _table_cells(line)
-        if not cells or not _is_relevant(" ".join(cells), question_terms):
+    for cells in parsed_rows[1:]:
+        if not cells or (
+            not include_all
+            and not _is_relevant(
+                " ".join([*header, *cells]),
+                question_terms,
+                minimum=1 if source_relevant else None,
+            )
+        ):
             continue
         fields = [
             f"{header[index]}: {cell}"
@@ -290,7 +337,7 @@ def _document_units(value: str) -> list[str]:
 def _clean_unit(value: str) -> str:
     value = _PAGE_HEADER_RE.sub("", value)
     value = re.sub(r"\s+", " ", value).strip(" |")
-    if not value or _TABLE_SEPARATOR_RE.match(value):
+    if not value or _TABLE_SEPARATOR_RE.match(value) or re.fullmatch(r"\d{1,3}[.)]", value):
         return ""
     return value
 
@@ -300,19 +347,19 @@ def _query_terms(value: str) -> set[str]:
 
 
 def _tokens(value: str) -> set[str]:
-    result: set[str] = set()
-    for raw in _TOKEN_RE.findall(value):
-        token = raw.casefold()
-        result.add(token)
-        result.update(part for part in re.split(r"[._/:#-]+", token) if part)
-    return result
+    return search_terms(value, keep_single=True)
 
 
-def _is_relevant(value: str, question_terms: set[str]) -> bool:
+def _is_relevant(
+    value: str,
+    question_terms: set[str],
+    *,
+    minimum: int | None = None,
+) -> bool:
     if not question_terms:
         return True
     value_terms = _tokens(value)
-    required = 1 if len(question_terms) == 1 else 2
+    required = minimum if minimum is not None else (1 if len(question_terms) == 1 else 2)
     return len(question_terms & value_terms) >= min(required, len(question_terms))
 
 

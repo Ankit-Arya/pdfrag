@@ -7,6 +7,7 @@ from typing import Any
 
 from app.config import get_settings
 from app.rag.llm import LlmConfigurationError, llm_service
+from app.rag.normalization import canonical_phrase, number_word_variant
 from app.rag.prompts import QUERY_REWRITE_SYSTEM_PROMPT, build_query_rewrite_prompt
 from app.rag.types import QueryPlan
 
@@ -86,9 +87,9 @@ class QueryPlanner:
         fallback = QueryPlan(
             original_question=normalized,
             rewritten_question=normalized,
-            search_queries=_unique(
-                [normalized, *_structural_queries(normalized, fallback_intent)]
-            )[: settings.query_rewrite_max_variants],
+            search_queries=_unique([normalized, *_structural_queries(normalized, fallback_intent)])[
+                : settings.query_rewrite_max_variants
+            ],
             keywords=_extract_acronyms(normalized),
             intent=fallback_intent,
             response_mode=_infer_response_mode(normalized),
@@ -161,9 +162,7 @@ def _validate_plan(
 
     raw_queries = payload.get("search_queries")
     model_queries = (
-        [_clean_string(item) for item in raw_queries]
-        if isinstance(raw_queries, list)
-        else []
+        [_clean_string(item) for item in raw_queries] if isinstance(raw_queries, list) else []
     )
     model_queries = [query for query in model_queries if query]
 
@@ -185,9 +184,7 @@ def _validate_plan(
 
     raw_keywords = payload.get("keywords")
     model_keywords = (
-        [_clean_string(item) for item in raw_keywords]
-        if isinstance(raw_keywords, list)
-        else []
+        [_clean_string(item) for item in raw_keywords] if isinstance(raw_keywords, list) else []
     )
     keywords = _unique([*acronyms, *[item for item in model_keywords if item]])[:24]
 
@@ -287,6 +284,13 @@ def _structural_queries(value: str, intent: str) -> list[str]:
     normalized = " ".join(value.split())
     lowered = normalized.casefold()
     variants: list[str] = []
+
+    canonical = canonical_phrase(normalized)
+    if canonical and canonical.casefold() != normalized.casefold():
+        variants.append(canonical)
+    number_variant = number_word_variant(normalized)
+    if number_variant.casefold() != normalized.casefold():
+        variants.append(number_variant)
 
     if re.search(r"\bprocess\b", lowered):
         subject = re.sub(r"\bprocess\b", "", normalized, flags=re.IGNORECASE)

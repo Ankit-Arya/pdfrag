@@ -126,15 +126,11 @@ class RagService:
                 search_queries=plan.search_queries,
             )
 
-        # Broad evidence requests should show only chunks that matched the query.
-        # Neighbor expansion is useful for answering a specific question, but it
-        # also pulls unrelated paragraphs and broken continuation tables into a
-        # document-by-document evidence view.
-        expanded = (
-            relevant
-            if plan.response_mode == "evidence"
-            else self._expand_context(db, plan, relevant, context_limit)
-        )
+        # A heading, its controlling paragraph and a related table can be stored
+        # in adjacent chunks. Expand for every response mode, then run the same
+        # relevance selector again so evidence lookups recover that local context
+        # without forwarding unrelated neighboring material.
+        expanded = self._expand_context(db, plan, relevant, context_limit)
         prompt, context = build_user_prompt(
             plan.original_question,
             plan.rewritten_question,
@@ -188,7 +184,9 @@ class RagService:
                 if repaired_grounded or repaired_answer != NO_ANSWER:
                     answer = repaired_answer
                     grounded = repaired_grounded
-                    grounding_status = "verified_after_repair" if grounded else "citation_validation_failed"
+                    grounding_status = (
+                        "verified_after_repair" if grounded else "citation_validation_failed"
+                    )
                     context = repair_context
 
         used_source_numbers = set(cited_source_numbers(answer, len(context)))

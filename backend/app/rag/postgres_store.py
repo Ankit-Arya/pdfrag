@@ -6,6 +6,8 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
+from app.rag.normalization import canonical_phrase, search_terms
+from app.rag.structure import section_match_score, section_path_from_text
 from app.rag.types import RetrievedChunk, TextChunk
 
 _TERM_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_/-]{1,}")
@@ -31,7 +33,9 @@ def search_chunks(
         """
         WITH q AS (
           SELECT CAST(:embedding AS vector) AS embedding,
-                 plainto_tsquery('simple', :query) AS tsq
+                 plainto_tsquery('simple', :query) AS tsq,
+                 to_tsquery('simple', :any_query) AS tsq_any,
+                 CAST(:normalized_section_query AS text) AS normalized_section_query
         ),
         ready_documents AS (
           SELECT id, filename
@@ -42,7 +46,10 @@ def search_chunks(
           SELECT c.id, c.document_id, c.chunk_index, c.page_number, c.content_type,
                  c.text, d.filename,
                  GREATEST(0.0, 1 - (c.embedding <=> q.embedding)) AS vector_score,
-                 ts_rank_cd(to_tsvector('simple', c.text), q.tsq) AS keyword_score
+                 GREATEST(
+                   ts_rank_cd(to_tsvector('simple', c.text), q.tsq),
+                   ts_rank_cd(to_tsvector('simple', c.text), q.tsq_any) * 0.65
+                 ) AS keyword_score
           FROM document_chunks c
           JOIN ready_documents d ON d.id = c.document_id
           CROSS JOIN q
@@ -53,19 +60,25 @@ def search_chunks(
           SELECT c.id, c.document_id, c.chunk_index, c.page_number, c.content_type,
                  c.text, d.filename,
                  GREATEST(0.0, 1 - (c.embedding <=> q.embedding)) AS vector_score,
-                 ts_rank_cd(to_tsvector('simple', c.text), q.tsq) AS keyword_score
+                 GREATEST(
+                   ts_rank_cd(to_tsvector('simple', c.text), q.tsq),
+                   ts_rank_cd(to_tsvector('simple', c.text), q.tsq_any) * 0.65
+                 ) AS keyword_score
           FROM document_chunks c
           JOIN ready_documents d ON d.id = c.document_id
           CROSS JOIN q
-          WHERE to_tsvector('simple', c.text) @@ q.tsq
-          ORDER BY ts_rank_cd(to_tsvector('simple', c.text), q.tsq) DESC
+          WHERE to_tsvector('simple', c.text) @@ q.tsq_any
+          ORDER BY ts_rank_cd(to_tsvector('simple', c.text), q.tsq_any) DESC
           LIMIT :candidate_limit
         ),
         per_document_vector_candidates AS (
           SELECT c.id, c.document_id, c.chunk_index, c.page_number, c.content_type,
                  c.text, d.filename,
                  GREATEST(0.0, 1 - (c.embedding <=> q.embedding)) AS vector_score,
-                 ts_rank_cd(to_tsvector('simple', c.text), q.tsq) AS keyword_score
+                 GREATEST(
+                   ts_rank_cd(to_tsvector('simple', c.text), q.tsq),
+                   ts_rank_cd(to_tsvector('simple', c.text), q.tsq_any) * 0.65
+                 ) AS keyword_score
           FROM ready_documents d
           CROSS JOIN q
           CROSS JOIN LATERAL (
@@ -80,17 +93,39 @@ def search_chunks(
           SELECT c.id, c.document_id, c.chunk_index, c.page_number, c.content_type,
                  c.text, d.filename,
                  GREATEST(0.0, 1 - (c.embedding <=> q.embedding)) AS vector_score,
-                 ts_rank_cd(to_tsvector('simple', c.text), q.tsq) AS keyword_score
+                 GREATEST(
+                   ts_rank_cd(to_tsvector('simple', c.text), q.tsq),
+                   ts_rank_cd(to_tsvector('simple', c.text), q.tsq_any) * 0.65
+                 ) AS keyword_score
           FROM ready_documents d
           CROSS JOIN q
           CROSS JOIN LATERAL (
             SELECT candidate.*
             FROM document_chunks candidate
             WHERE candidate.document_id = d.id
-              AND to_tsvector('simple', candidate.text) @@ q.tsq
-            ORDER BY ts_rank_cd(to_tsvector('simple', candidate.text), q.tsq) DESC
+              AND to_tsvector('simple', candidate.text) @@ q.tsq_any
+            ORDER BY ts_rank_cd(to_tsvector('simple', candidate.text), q.tsq_any) DESC
             LIMIT :per_document_limit
           ) c
+        ),
+        section_path_candidates AS (
+          SELECT c.id, c.document_id, c.chunk_index, c.page_number, c.content_type,
+                 c.text, d.filename,
+                 GREATEST(0.0, 1 - (c.embedding <=> q.embedding)) AS vector_score,
+                 GREATEST(
+                   ts_rank_cd(to_tsvector('simple', c.text), q.tsq),
+                   ts_rank_cd(to_tsvector('simple', c.text), q.tsq_any) * 0.65
+                 ) AS keyword_score
+          FROM document_chunks c
+          JOIN ready_documents d ON d.id = c.document_id
+          CROSS JOIN q
+          WHERE length(q.normalized_section_query) >= 3
+            AND btrim(regexp_replace(
+                  lower(split_part(split_part(c.text, 'Section path:', 2), E'\n', 1)),
+                  '[^a-z0-9]+', ' ', 'g'
+                )) LIKE '%' || q.normalized_section_query || '%'
+          ORDER BY c.document_id, c.chunk_index
+          LIMIT :candidate_limit
         ),
         candidates AS (
           SELECT * FROM global_vector_candidates
@@ -100,6 +135,8 @@ def search_chunks(
           SELECT * FROM per_document_vector_candidates
           UNION
           SELECT * FROM per_document_keyword_candidates
+          UNION
+          SELECT * FROM section_path_candidates
         )
         SELECT * FROM candidates
         """
@@ -109,6 +146,8 @@ def search_chunks(
         {
             "embedding": str(query_vector),
             "query": query_text,
+            "any_query": _keyword_or_query(query_text),
+            "normalized_section_query": _normalize_phrase(query_text),
             "candidate_limit": candidate_limit,
             "per_document_limit": per_document_limit,
         },
@@ -121,17 +160,26 @@ def search_chunks(
         keyword_score = min(float(row["keyword_score"] or 0.0) * 4.0, 1.0)
         lexical_score = _lexical_overlap(query_terms, row["text"])
         phrase_score = _phrase_match(query_text, row["text"])
-        score = min(
+        section_score = _section_phrase_match(query_text, row["text"])
+        blended_score = min(
             1.0,
             max(
                 0.0,
-                vector_score * 0.42
-                + keyword_score * 0.28
-                + lexical_score * 0.20
-                + phrase_score * 0.10,
+                vector_score * 0.36
+                + keyword_score * 0.24
+                + lexical_score * 0.18
+                + phrase_score * 0.10
+                + section_score * 0.12,
             ),
         )
-        method = _method(vector_score, keyword_score, lexical_score, phrase_score)
+        score = max(blended_score, 0.78 + section_score * 0.18) if section_score else blended_score
+        method = _method(
+            vector_score,
+            keyword_score,
+            lexical_score,
+            phrase_score,
+            section_score,
+        )
         results.append(
             RetrievedChunk(
                 chunk=TextChunk(
@@ -179,9 +227,7 @@ def fetch_neighbor_chunks(
 
     # Build a compact VALUES list because SQLAlchemy text() cannot bind tuple
     # arrays portably for all psycopg/pgvector combinations.
-    values_sql = ",".join(
-        f"(:doc_{index}, :idx_{index})" for index, _ in enumerate(pairs)
-    )
+    values_sql = ",".join(f"(:doc_{index}, :idx_{index})" for index, _ in enumerate(pairs))
     params: dict[str, object] = {"window": window}
     for index, (document_id, chunk_index) in enumerate(pairs):
         params[f"doc_{index}"] = document_id
@@ -199,7 +245,8 @@ def fetch_neighbor_chunks(
          AND c.chunk_index BETWEEN seeds.chunk_index - :window AND seeds.chunk_index + :window
         JOIN documents d ON d.id = c.document_id
         WHERE d.status = 'ready'
-        GROUP BY c.id, c.document_id, c.chunk_index, c.page_number, c.content_type, c.text, d.filename
+        GROUP BY c.id, c.document_id, c.chunk_index, c.page_number,
+                 c.content_type, c.text, d.filename
         ORDER BY c.document_id, c.chunk_index
         """
     )
@@ -233,7 +280,10 @@ def _method(
     keyword_score: float,
     lexical_score: float,
     phrase_score: float,
+    section_score: float,
 ) -> str:
+    if section_score >= 0.88:
+        return "section-heading"
     if phrase_score:
         return "pgvector+exact-phrase"
     if keyword_score >= 0.08 and keyword_score >= vector_score * 0.5:
@@ -244,16 +294,11 @@ def _method(
 
 
 def _terms(value: str) -> set[str]:
-    terms: set[str] = set()
-    for raw_token in _TERM_RE.findall(value):
-        token = raw_token.casefold()
-        candidates = [token, *re.split(r"[_/-]+", token)]
-        terms.update(
-            candidate
-            for candidate in candidates
-            if len(candidate) >= 2 and candidate not in _STOPWORDS
-        )
-    return terms
+    return {
+        term
+        for term in search_terms(value, keep_single=True)
+        if term not in _STOPWORDS and (len(term) > 1 or term.isdigit())
+    }
 
 
 def _lexical_overlap(query_terms: set[str], text_value: str) -> float:
@@ -272,9 +317,17 @@ def _phrase_match(query: str, text_value: str) -> float:
     return 1.0 if normalized_query in _normalize_phrase(text_value[:10000]) else 0.0
 
 
+def _section_phrase_match(query: str, text_value: str) -> float:
+    return section_match_score(query, section_path_from_text(text_value))
+
+
 def _normalize_phrase(value: str) -> str:
-    tokens = re.findall(r"[A-Za-z0-9]+", value.casefold())
-    return " ".join(tokens)
+    return canonical_phrase(value)
+
+
+def _keyword_or_query(value: str) -> str:
+    terms = sorted(term for term in _terms(value) if re.fullmatch(r"[a-z0-9]+", term))
+    return " | ".join(f"{term}:*" for term in terms) or "pdfrag_no_match"
 
 
 def _document_diverse_results(

@@ -275,8 +275,13 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 .message-label { display: block; margin-bottom: 6px; color: #4e5956; font-size: 10px; font-weight: 800; }
 .message-text { color: #202927; font-size: 14px; line-height: 1.75; overflow-wrap: anywhere; }
 .message.user .message-text { color: #46504e; white-space: pre-wrap; }
-.sources { margin-top: 16px; display: flex; flex-direction: column; gap: 7px; }
-.sources > .eyebrow { margin-bottom: 2px; }
+.sources { margin-top: 16px; border: 1px solid var(--line); border-radius: 12px; background: rgba(255,255,255,.6); }
+.sources-summary { min-height: 42px; padding: 9px 12px; display: flex; align-items: center; justify-content: space-between; gap: 12px; list-style: none; cursor: pointer; color: #596762; font-size: 10px; font-weight: 850; text-transform: uppercase; letter-spacing: .08em; }
+.sources-summary::-webkit-details-marker { display: none; }
+.sources-summary::after { content: '+'; width: 20px; height: 20px; margin-left: auto; border-radius: 6px; display: grid; place-items: center; color: var(--green-dark); background: var(--green-soft); font-size: 14px; line-height: 1; }
+.sources[open] > .sources-summary::after { content: '−'; }
+.sources-count { color: #87938f; font-size: 9px; font-weight: 750; text-transform: none; letter-spacing: 0; }
+.source-list { padding: 0 7px 7px; display: flex; flex-direction: column; gap: 7px; }
 .source-card { border: 1px solid var(--line); border-radius: 12px; overflow: hidden; background: rgba(255,255,255,.82); }
 .source-card summary { min-height: 42px; padding: 9px 12px; display: flex; align-items: center; gap: 9px; list-style: none; cursor: pointer; }
 .source-card summary::-webkit-details-marker { display: none; }

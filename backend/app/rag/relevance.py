@@ -3,6 +3,12 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, replace
 
+from app.rag.normalization import search_terms
+from app.rag.structure import (
+    major_section_match_score,
+    section_match_score,
+    section_path_from_text,
+)
 from app.rag.types import QueryPlan, RetrievedChunk, TextChunk
 
 _TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./:#-]*")
@@ -113,6 +119,8 @@ class _ScoredChunk:
     coverage: float
     anchor_coverage: float
     intent_evidence: float
+    section_match: float
+    major_section_match: float
     context_key: tuple[str, str]
 
 
@@ -134,10 +142,16 @@ def select_context_chunks(
     focus_terms = _focus_terms(plan)
     anchor_groups = _anchor_groups(plan)
     scored = [
-        _score_candidate(plan, candidate, focus_terms, anchor_groups)
-        for candidate in candidates
+        _score_candidate(plan, candidate, focus_terms, anchor_groups) for candidate in candidates
     ]
     scored.sort(key=lambda item: item.relevance, reverse=True)
+
+    # A bare chapter-title request should resolve the chapter itself. Once a
+    # major section-path match exists, incidental mentions in definitions or
+    # accident descriptions are not alternative answers to that title query.
+    major_matches = [item for item in scored if item.major_section_match >= 0.9]
+    if plan.response_mode == "evidence" and major_matches:
+        scored = major_matches
 
     best = scored[0].relevance
     if best < 0.12:
@@ -147,15 +161,15 @@ def select_context_chunks(
     eligible: list[_ScoredChunk] = []
 
     for item in scored:
-        has_focus = item.coverage >= 0.50 or not focus_terms
+        has_focus = item.coverage >= 0.50 or item.section_match >= 0.88 or not focus_terms
         required_anchor_coverage = (
-            1.0 / len(anchor_groups)
-            if anchor_groups and plan.intent == "comparison"
-            else 1.0
+            1.0 / len(anchor_groups) if anchor_groups and plan.intent == "comparison" else 1.0
         )
         has_anchor = item.anchor_coverage >= required_anchor_coverage or not anchor_groups
         has_intent = item.intent_evidence >= 0.12
-        constraint_ok = has_anchor if anchor_groups else (has_focus or has_intent)
+        constraint_ok = item.section_match >= 0.88 or (
+            has_anchor if anchor_groups else (has_focus or has_intent)
+        )
         if item.relevance >= cutoff and has_focus and constraint_ok:
             eligible.append(item)
 
@@ -206,9 +220,15 @@ def _score_candidate(
     text_terms = _tokens(chunk.text)
     exact_text_terms = _tokens(chunk.text, keep_single=True)
     heading_terms = _tokens(_heading_text(chunk))
+    section_path = _context_label(chunk)
     coverage = _coverage(focus_terms, text_terms)
     heading_coverage = _coverage(focus_terms, heading_terms)
     anchor_coverage = _group_coverage(anchor_groups, exact_text_terms)
+    structural_match = section_match_score(plan.original_question, section_path)
+    major_structural_match = major_section_match_score(
+        plan.original_question,
+        section_path,
+    )
 
     cues = _INTENT_CUES.get(plan.intent, set())
     intent_evidence = _coverage(cues, text_terms)
@@ -222,6 +242,7 @@ def _score_candidate(
         + heading_coverage * 0.13
         + intent_evidence * 0.10
         + anchor_coverage * 0.05
+        + structural_match * 0.28
     )
 
     if focus_terms and coverage < 0.18:
@@ -237,6 +258,8 @@ def _score_candidate(
         coverage=coverage,
         anchor_coverage=anchor_coverage,
         intent_evidence=intent_evidence,
+        section_match=structural_match,
+        major_section_match=major_structural_match,
         context_key=(chunk.filename.casefold(), _context_label(chunk).casefold()),
     )
 
@@ -329,6 +352,8 @@ def _anchor_groups(plan: QueryPlan) -> list[set[str]]:
     groups: list[set[str]] = []
     seen: set[frozenset[str]] = set()
     for value in values:
+        if value.casefold() in _STOPWORDS:
+            continue
         group = _tokens(value, keep_single=True)
         key = frozenset(group)
         if group and key not in seen:
@@ -349,23 +374,11 @@ def _heading_text(chunk: TextChunk) -> str:
 def _context_label(chunk: TextChunk) -> str:
     if chunk.section_path:
         return " > ".join(chunk.section_path)
-    section = _SECTION_RE.search(chunk.text[:2500])
-    if section:
-        return section.group(1).strip()
-    return ""
+    return section_path_from_text(chunk.text)
 
 
 def _tokens(value: str, *, keep_single: bool = False) -> set[str]:
-    terms: set[str] = set()
-    for raw_token in _TOKEN_RE.findall(value):
-        token = raw_token.casefold()
-        candidates = [token, *re.split(r"[._/:#-]+", token)]
-        terms.update(
-            candidate
-            for candidate in candidates
-            if candidate and (keep_single or len(candidate) > 1)
-        )
-    return terms
+    return search_terms(value, keep_single=keep_single)
 
 
 def _coverage(required: set[str], available: set[str]) -> float:

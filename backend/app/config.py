@@ -6,9 +6,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(
-        env_file=".env", extra="ignore", case_sensitive=False
-    )
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore", case_sensitive=False)
 
     app_name: str = "Grounded PDF Q&A"
     log_level: str = "INFO"
@@ -56,9 +54,19 @@ class Settings(BaseSettings):
     evidence_top_k: int = Field(default=16, ge=4, le=30)
 
     ocr_mode: Literal["never", "auto", "always"] = "auto"
-    ocr_dpi: int = 220
+    ocr_dpi: int = Field(default=300, ge=150, le=450)
     ocr_languages: str = "eng"
     ocr_min_native_chars: int = 80
+    ocr_min_text_quality: float = Field(default=0.62, ge=0, le=1)
+    ocr_min_native_consensus: float = Field(default=0.42, ge=0, le=1)
+    ocr_rotated_text_threshold: float = Field(default=0.08, ge=0, le=1)
+    ocr_corruption_threshold: float = Field(default=0.12, ge=0, le=1)
+    ocr_verify_all_pages: bool = True
+    ocr_verify_dpi: int = Field(default=180, ge=120, le=300)
+    ocr_verify_min_novel_terms: int = Field(default=10, ge=3, le=100)
+    ocr_verify_novelty_threshold: float = Field(default=0.20, ge=0.05, le=0.8)
+    ocr_primary_psm: int = Field(default=3, ge=1, le=13)
+    ocr_fallback_psm: int = Field(default=6, ge=1, le=13)
     extract_tables: bool = True
     table_min_rows: int = 2
 
@@ -70,16 +78,12 @@ class Settings(BaseSettings):
     max_chunks_per_collection: int = 25_000
     collection_ttl_minutes: int = 120
     max_collections: int = 100
-    cors_origins: str = (
-        "http://localhost:5173,http://localhost:8080,http://localhost:8081"
-    )
+    cors_origins: str = "http://localhost:5173,http://localhost:8080,http://localhost:8081"
 
     @model_validator(mode="after")
     def validate_related(self) -> "Settings":
         if self.chunk_overlap_chars >= self.chunk_size_chars:
-            raise ValueError(
-                "CHUNK_OVERLAP_CHARS must be smaller than CHUNK_SIZE_CHARS"
-            )
+            raise ValueError("CHUNK_OVERLAP_CHARS must be smaller than CHUNK_SIZE_CHARS")
         return self
 
     @property
