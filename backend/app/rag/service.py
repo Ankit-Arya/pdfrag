@@ -126,7 +126,15 @@ class RagService:
                 search_queries=plan.search_queries,
             )
 
-        expanded = self._expand_context(db, plan, relevant, context_limit)
+        # Broad evidence requests should show only chunks that matched the query.
+        # Neighbor expansion is useful for answering a specific question, but it
+        # also pulls unrelated paragraphs and broken continuation tables into a
+        # document-by-document evidence view.
+        expanded = (
+            relevant
+            if plan.response_mode == "evidence"
+            else self._expand_context(db, plan, relevant, context_limit)
+        )
         prompt, context = build_user_prompt(
             plan.original_question,
             plan.rewritten_question,
@@ -145,11 +153,20 @@ class RagService:
                 search_queries=plan.search_queries,
             )
 
-        raw = (
-            build_evidence_answer(context)
-            if plan.response_mode == "evidence"
-            else llm_service.answer(prompt)
-        )
+        if plan.response_mode == "evidence":
+            raw, used_context = build_evidence_answer(plan.original_question, context)
+            context = used_context
+            if not raw or not context:
+                return AnswerResponse(
+                    answer=NO_ANSWER,
+                    sources=[],
+                    grounded=False,
+                    grounding_status="insufficient_evidence",
+                    interpreted_question=plan.rewritten_question,
+                    search_queries=plan.search_queries,
+                )
+        else:
+            raw = llm_service.answer(prompt)
         answer, grounded = validate_grounded_answer(raw, len(context))
         grounding_status = "verified" if grounded else "citation_validation_failed"
 

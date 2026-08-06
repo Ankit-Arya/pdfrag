@@ -1,18 +1,8 @@
+# syntax=docker/dockerfile:1.7
 FROM python:3.12-slim AS runtime
-
-ARG EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
-ARG PRELOAD_EMBEDDING_MODEL=0
-ARG REQUIRE_EMBEDDING_PRELOAD=0
-ARG ALLOW_INSECURE_HF_DOWNLOAD=0
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=0 \
-    HF_HOME=/opt/huggingface \
-    EMBEDDING_MODEL=${EMBEDDING_MODEL} \
-    PRELOAD_EMBEDDING_MODEL=${PRELOAD_EMBEDDING_MODEL} \
-    REQUIRE_EMBEDDING_PRELOAD=${REQUIRE_EMBEDDING_PRELOAD} \
-    ALLOW_INSECURE_HF_DOWNLOAD=${ALLOW_INSECURE_HF_DOWNLOAD} \
     SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
     REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \
     CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
@@ -36,7 +26,15 @@ RUN update-ca-certificates \
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --upgrade pip \
+
+# Install the CPU wheel first so sentence-transformers does not pull the much
+# larger CUDA/NVIDIA dependency set. The cache mount survives layer rebuilds,
+# while this layer itself remains reusable whenever requirements.txt is unchanged.
+ARG TORCH_VERSION=2.7.1
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
+RUN --mount=type=cache,id=pdfrag-pip,target=/root/.cache/pip \
+    pip install --upgrade pip \
+    && pip install "torch==${TORCH_VERSION}" --index-url "${TORCH_INDEX_URL}" \
     && pip install -r requirements.txt
 
 RUN tesseract --version \
@@ -48,6 +46,15 @@ COPY docker/preload_embedding.py /usr/local/bin/preload_embedding.py
 # Model preload is disabled by default. Enable PRELOAD_EMBEDDING_MODEL=1 only
 # when the build environment can reach Hugging Face. Runtime otherwise uses a
 # mounted/cached transformer model or the built-in local hashing fallback.
+ARG EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
+ARG PRELOAD_EMBEDDING_MODEL=0
+ARG REQUIRE_EMBEDDING_PRELOAD=0
+ARG ALLOW_INSECURE_HF_DOWNLOAD=0
+ENV HF_HOME=/opt/huggingface \
+    EMBEDDING_MODEL=${EMBEDDING_MODEL} \
+    PRELOAD_EMBEDDING_MODEL=${PRELOAD_EMBEDDING_MODEL} \
+    REQUIRE_EMBEDDING_PRELOAD=${REQUIRE_EMBEDDING_PRELOAD} \
+    ALLOW_INSECURE_HF_DOWNLOAD=${ALLOW_INSECURE_HF_DOWNLOAD}
 RUN python /usr/local/bin/preload_embedding.py
 
 COPY app ./app
