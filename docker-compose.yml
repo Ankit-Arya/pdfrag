@@ -49,6 +49,7 @@ services:
       TOP_K: ${TOP_K:-8}
       MIN_SIMILARITY: ${MIN_SIMILARITY:-0.12}
       MAX_CONTEXT_CHARS: ${MAX_CONTEXT_CHARS:-18000}
+      EVIDENCE_TOP_K: ${EVIDENCE_TOP_K:-16}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://localhost:8080,http://localhost:8081}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:

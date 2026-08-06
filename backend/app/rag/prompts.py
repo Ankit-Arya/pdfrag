@@ -375,7 +375,7 @@ def _response_mode_instructions(response_mode: str) -> str:
     if response_mode == "evidence":
         return """This is a broad evidence lookup.
 - For each relevant document, show the heading/subheading or Section path from the chunk context.
-- Write it as `**Heading/subheading:** <section path>` and then show the relevant document passage as a Markdown blockquote.
+- Write it as `**Heading/subheading:** <section path>` and show the relevant document passage in bullets.
 - Reproduce the directly relevant document passage closely and completely enough to preserve its original context, conditions, sequence, and terminology.
 - Do not reduce the passage to a one-line conclusion.
 - Keep passages from different documents in separate document subsections.

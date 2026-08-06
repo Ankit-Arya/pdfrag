@@ -264,6 +264,9 @@ def _selection_limit(
     requested: int | None,
     relevant_document_count: int,
 ) -> int:
+    if plan.response_mode == "evidence":
+        return min(max(requested or 16, 12), 30)
+
     question_terms = _tokens(plan.original_question)
     complex_question = (
         plan.intent in {"comparison", "summary", "troubleshooting"}

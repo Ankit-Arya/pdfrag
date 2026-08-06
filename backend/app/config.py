@@ -53,6 +53,7 @@ class Settings(BaseSettings):
     max_query_terms: int = 48
     retrieval_chunks_per_document: int = Field(default=4, ge=1, le=12)
     max_retrieval_candidates: int = Field(default=1000, ge=50, le=10000)
+    evidence_top_k: int = Field(default=16, ge=4, le=30)
 
     ocr_mode: Literal["never", "auto", "always"] = "auto"
     ocr_dpi: int = 220

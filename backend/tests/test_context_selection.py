@@ -254,3 +254,28 @@ def test_process_query_keeps_wake_up_test_but_rejects_process_only_noise() -> No
     selected = select_context_chunks(plan, retrieved, max_chunks=12)
 
     assert [item.chunk.chunk_id for item in selected] == ["examination"]
+
+
+def test_evidence_mode_keeps_multiple_chunks_from_one_document() -> None:
+    plan = QueryPlan(
+        original_question="wake up process",
+        rewritten_question="wake up process",
+        search_queries=["wake up process", "wake up test"],
+        intent="procedure",
+        response_mode="evidence",
+        focus_terms=["wake", "up", "process"],
+    )
+    retrieved = [
+        result(
+            f"wake-{index}",
+            "MRGR.pdf",
+            index,
+            "Wake-up test and wake-up process requirements.",
+            0.9 - index * 0.01,
+        )
+        for index in range(10)
+    ]
+
+    selected = select_context_chunks(plan, retrieved, max_chunks=16)
+
+    assert len(selected) == 10

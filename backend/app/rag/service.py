@@ -11,6 +11,7 @@ from app.db_models import Document, DocumentChunk, DocumentStatus
 from app.models import AnswerResponse, SourceResult
 from app.rag.chunking import chunk_pages
 from app.rag.embeddings import embedding_service
+from app.rag.evidence import build_evidence_answer
 from app.rag.guardrails import cited_source_numbers, validate_grounded_answer
 from app.rag.llm import llm_service
 from app.rag.pdf import extract_pdf_pages
@@ -89,7 +90,12 @@ class RagService:
         vectors = embedding_service.encode(plan.search_queries)
 
         requested_limit = top_k or settings.top_k
-        retrieval_limit = max(requested_limit * 8, 48)
+        context_limit = (
+            max(requested_limit, settings.evidence_top_k)
+            if plan.response_mode == "evidence"
+            else requested_limit
+        )
+        retrieval_limit = max(context_limit * 8, 48)
         merged: dict[str, RetrievedChunk] = {}
 
         for query, vector in zip(plan.search_queries, vectors, strict=True):
@@ -109,7 +115,7 @@ class RagService:
                 search_queries=plan.search_queries,
             )
 
-        relevant = self._select_context_chunks(plan, candidates, requested_limit)
+        relevant = self._select_context_chunks(plan, candidates, context_limit)
         if not relevant:
             return AnswerResponse(
                 answer=NO_ANSWER,
@@ -120,7 +126,7 @@ class RagService:
                 search_queries=plan.search_queries,
             )
 
-        expanded = self._expand_context(db, plan, relevant, requested_limit)
+        expanded = self._expand_context(db, plan, relevant, context_limit)
         prompt, context = build_user_prompt(
             plan.original_question,
             plan.rewritten_question,
@@ -139,11 +145,15 @@ class RagService:
                 search_queries=plan.search_queries,
             )
 
-        raw = llm_service.answer(prompt)
+        raw = (
+            build_evidence_answer(context)
+            if plan.response_mode == "evidence"
+            else llm_service.answer(prompt)
+        )
         answer, grounded = validate_grounded_answer(raw, len(context))
         grounding_status = "verified" if grounded else "citation_validation_failed"
 
-        if not grounded and answer != NO_ANSWER:
+        if plan.response_mode != "evidence" and not grounded and answer != NO_ANSWER:
             repair_prompt, repair_context = build_citation_repair_prompt(
                 plan.original_question,
                 plan.rewritten_question,
