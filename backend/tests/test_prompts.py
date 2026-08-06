@@ -26,3 +26,24 @@ def test_user_prompt_labels_sources() -> None:
     assert "contract.pdf" in prompt
     assert "Page: 4" in prompt
     assert "When is payment due?" in prompt
+
+
+def test_user_prompt_rejects_unrelated_nearby_material() -> None:
+    result = RetrievedChunk(
+        chunk=TextChunk(
+            chunk_id="wake-up",
+            filename="rules.pdf",
+            page_number=128,
+            text="Wake-up test requirements. Unrelated passenger evacuation rule.",
+        ),
+        score=0.8,
+    )
+
+    prompt, _ = build_user_prompt(
+        "wake up test",
+        [result],
+        max_context_chars=2000,
+    )
+
+    assert "adjacent but unrelated rules" in prompt
+    assert "Do not say that no more detail exists" in prompt

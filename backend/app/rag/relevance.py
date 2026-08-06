@@ -143,9 +143,8 @@ def select_context_chunks(
     if best < 0.12:
         return []
 
-    limit = _selection_limit(plan, max_chunks)
     cutoff = max(0.16, best * 0.48)
-    selected: list[_ScoredChunk] = []
+    eligible: list[_ScoredChunk] = []
 
     for item in scored:
         has_focus = item.coverage >= 0.28 or not focus_terms
@@ -158,16 +157,18 @@ def select_context_chunks(
         has_intent = item.intent_evidence >= 0.12
         constraint_ok = has_anchor if anchor_groups else (has_focus or has_intent)
         if item.relevance >= cutoff and has_focus and constraint_ok:
-            selected.append(item)
-        if len(selected) >= limit:
-            break
+            eligible.append(item)
 
-    if not selected:
+    if not eligible:
         top = scored[0]
         if top.coverage >= 0.25 or top.anchor_coverage > 0:
-            selected.append(top)
+            eligible.append(top)
         else:
             return []
+
+    eligible_document_count = len({_document_key(item.result.chunk) for item in eligible})
+    limit = _selection_limit(plan, max_chunks, eligible_document_count)
+    selected = _document_diverse_selection(eligible, limit)
 
     # A continuation can omit the acronym or full subject while still containing
     # essential steps. Keep it only when it is close to a selected anchor and has
@@ -258,7 +259,11 @@ def _supports_anchor(candidate: _ScoredChunk, anchor: _ScoredChunk) -> bool:
     return abs(left.page_number - right.page_number) <= 1
 
 
-def _selection_limit(plan: QueryPlan, requested: int | None) -> int:
+def _selection_limit(
+    plan: QueryPlan,
+    requested: int | None,
+    relevant_document_count: int,
+) -> int:
     question_terms = _tokens(plan.original_question)
     complex_question = (
         plan.intent in {"comparison", "summary", "troubleshooting"}
@@ -266,9 +271,41 @@ def _selection_limit(plan: QueryPlan, requested: int | None) -> int:
         or bool({"and", "versus", "vs"} & question_terms)
     )
     adaptive = 8 if complex_question else 4
+    adaptive = max(adaptive, min(relevant_document_count, 12))
     if requested is not None:
         adaptive = min(adaptive, max(1, requested))
     return adaptive
+
+
+def _document_diverse_selection(
+    eligible: list[_ScoredChunk],
+    limit: int,
+) -> list[_ScoredChunk]:
+    selected: list[_ScoredChunk] = []
+    selected_ids: set[str] = set()
+    seen_documents: set[str] = set()
+
+    for item in eligible:
+        document_key = _document_key(item.result.chunk)
+        if document_key in seen_documents:
+            continue
+        selected.append(item)
+        selected_ids.add(item.result.chunk.chunk_id)
+        seen_documents.add(document_key)
+        if len(selected) >= limit:
+            return selected
+
+    for item in eligible:
+        if item.result.chunk.chunk_id in selected_ids:
+            continue
+        selected.append(item)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def _document_key(chunk: TextChunk) -> str:
+    return chunk.document_id or chunk.filename.casefold()
 
 
 def _focus_terms(plan: QueryPlan) -> set[str]:
@@ -316,11 +353,16 @@ def _context_label(chunk: TextChunk) -> str:
 
 
 def _tokens(value: str, *, keep_single: bool = False) -> set[str]:
-    return {
-        token.casefold()
-        for token in _TOKEN_RE.findall(value)
-        if keep_single or len(token) > 1
-    }
+    terms: set[str] = set()
+    for raw_token in _TOKEN_RE.findall(value):
+        token = raw_token.casefold()
+        candidates = [token, *re.split(r"[._/:#-]+", token)]
+        terms.update(
+            candidate
+            for candidate in candidates
+            if candidate and (keep_single or len(candidate) > 1)
+        )
+    return terms
 
 
 def _coverage(required: set[str], available: set[str]) -> float:

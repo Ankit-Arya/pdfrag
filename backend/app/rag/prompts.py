@@ -26,13 +26,17 @@ Grounding rules:
 11. Reply exactly with the following sentence only when no supplied excerpt contains relevant evidence:
 {NO_ANSWER}
 
+Additional relevance rules:
+- A source excerpt may contain nearby text unrelated to the question. Exclude it even when it appears in an otherwise relevant excerpt.
+- Do not claim that the uploaded documents contain no further details. You may only state what the supplied excerpts establish or do not establish.
+
 Metro applicability rules:
 12. Context is safety-critical. Never merge instructions across different rolling stocks, train types, equipment variants, systems, procedures, modes, locations, or document sections unless the excerpts explicitly say they are the same.
 13. Every answer about an operation, fault, emergency, isolation, maintenance action, reset, inspection, test, or troubleshooting step must state the applicable context first when available: file, page, section path, rolling stock/train context, and procedure context.
 14. If the question does not specify a rolling stock/procedure and the supplied excerpts show multiple possible contexts, do not give one blended procedure. Ask the user to specify the context and list the distinct available contexts with citations.
 15. If the supplied excerpts show only one applicable context, state that context and answer from it.
 16. If a step, limit, warning, prerequisite, or exception appears under a heading/subheading, keep it tied to that heading/subheading.
-17. If the excerpts contain warnings, cautions, mandatory/prohibited actions, prerequisites, permissions, records, communication requirements, or verification checks, include them under the relevant step.
+17. Include warnings, prerequisites, permissions, records, communication requirements, and checks only when they directly apply to the question's subject.
 18. Do not infer a cause, safety classification, responsibility, or permission unless the excerpts state it.
 
 Completeness rules:
@@ -248,11 +252,13 @@ SOURCE EXCERPTS:
 Important note about SOURCE EXCERPTS:
 - Each excerpt may begin with [PDF CHUNK CONTEXT]. Treat File, Pages, Section path, Rolling stock / train context, Procedure context, and Important tags as part of the source evidence.
 - Use that context to avoid mixing instructions from different rolling stocks, procedures, systems, or headings.
+- An excerpt can contain adjacent but unrelated rules. Do not include them merely because they share a page or source label.
 
 Required drafting process:
 1. Silently review every source excerpt, not only the highest-ranked excerpt.
 2. Identify the applicable document, page range, section path, rolling stock/train context, equipment/system, and procedure context.
 3. Identify all material that directly answers or qualifies the original question.
+   Reject material that only shares broad terms, a page, or a document but does not answer or qualify the question.
 4. Silently inventory exact facts and figures, including:
    - numbers, units, amounts, percentages, ranges, capacities, tolerances, and thresholds;
    - dates, times, durations, intervals, frequencies, deadlines, and validity periods;
@@ -274,6 +280,8 @@ Applicability and safety requirements:
 - If only one context is supported, say so and answer only for that context.
 - For procedures, include prerequisites, chronological steps, warnings/cautions, branches, and verification/records where supplied.
 - Keep every warning, exception, and limit attached to the relevant step or context.
+- Do not add nearby procedures, passenger-handling rules, failures, or exceptions unless their relationship to the question is explicit in the excerpt.
+- Do not say that no more detail exists in the documents; state only that a specific point is not established by the cited excerpts when necessary.
 - Never use prior knowledge or conversation history.
 
 Citation requirements:
@@ -332,9 +340,10 @@ Instructions:
 10. If evidence is partial, include every supported detail and identify what is not established.
 11. If excerpts conflict, report the conflict with citations to both sides.
 12. Cite every factual paragraph, bullet, numbered step, and factual table row using exact labels such as [S1].
-13. Never replace [S1] with (S1), Source 1, [Source 1], footnotes, URLs, or invented labels.
-14. Do not add a generic conclusion.
-15. Reply exactly with the following sentence only if no supported answer can be written:
+13. A negative or absence claim such as "no timing is specified" is factual and must be cited or removed.
+14. Never replace [S1] with (S1), Source 1, [Source 1], footnotes, URLs, or invented labels.
+15. Do not add a generic conclusion.
+16. Reply exactly with the following sentence only if no supported answer can be written:
 {NO_ANSWER}"""
 
     return prompt, included

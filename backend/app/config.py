@@ -51,6 +51,8 @@ class Settings(BaseSettings):
     fuzzy_keyword_enabled: bool = True
     fuzzy_match_cutoff: float = 0.78
     max_query_terms: int = 48
+    retrieval_chunks_per_document: int = Field(default=4, ge=1, le=12)
+    max_retrieval_candidates: int = Field(default=1000, ge=50, le=10000)
 
     ocr_mode: Literal["never", "auto", "always"] = "auto"
     ocr_dpi: int = 220

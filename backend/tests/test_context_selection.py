@@ -182,3 +182,45 @@ def test_multiword_context_constraint_requires_the_complete_context() -> None:
     selected = select_context_chunks(plan, retrieved)
 
     assert [item.chunk.chunk_id for item in selected] == ["right-type"]
+
+
+def test_short_query_keeps_evidence_from_every_relevant_document() -> None:
+    plan = QueryPlan(
+        original_question="wake up test",
+        rewritten_question="wake up test",
+        search_queries=["wake up test"],
+        intent="fact_lookup",
+        focus_terms=["wake", "up", "test"],
+    )
+    retrieved = [
+        result(
+            f"primary-{index}",
+            "frequent-source.pdf",
+            index,
+            "Wake up test requirements and conditions.",
+            0.94 - index * 0.01,
+        )
+        for index in range(6)
+    ]
+    retrieved.extend(
+        result(
+            f"document-{index}",
+            f"document-{index}.pdf",
+            index,
+            "Wake-up test examination and safety devices.",
+            0.70 - index * 0.01,
+        )
+        for index in range(1, 6)
+    )
+
+    selected = select_context_chunks(plan, retrieved, max_chunks=12)
+    filenames = {item.chunk.filename for item in selected}
+
+    assert filenames == {
+        "frequent-source.pdf",
+        "document-1.pdf",
+        "document-2.pdf",
+        "document-3.pdf",
+        "document-4.pdf",
+        "document-5.pdf",
+    }

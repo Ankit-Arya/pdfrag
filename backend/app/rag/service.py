@@ -190,7 +190,7 @@ class RagService:
         relevant: list[RetrievedChunk],
         requested_limit: int,
     ) -> list[RetrievedChunk]:
-        seeds = relevant[: min(len(relevant), 8)]
+        seeds = relevant[: min(len(relevant), requested_limit, 12)]
         neighbors = fetch_neighbor_chunks(db, seeds, window=1)
         merged: dict[str, RetrievedChunk] = {}
         for item in [*seeds, *neighbors]:

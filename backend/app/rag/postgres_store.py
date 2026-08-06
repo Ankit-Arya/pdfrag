@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import re
+
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from app.config import get_settings
 from app.rag.types import RetrievedChunk, TextChunk
 
 _TERM_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_/-]{1,}")
@@ -22,42 +24,82 @@ def search_chunks(
     identifiers; the exact identifier must be able to pull a chunk even when the
     semantic vector score is not high.
     """
-    candidate_limit = max(limit * 4, 40)
+    settings = get_settings()
+    candidate_limit = max(limit * 2, 40)
+    per_document_limit = settings.retrieval_chunks_per_document
     sql = text(
         """
         WITH q AS (
           SELECT CAST(:embedding AS vector) AS embedding,
                  plainto_tsquery('simple', :query) AS tsq
         ),
-        vector_candidates AS (
+        ready_documents AS (
+          SELECT id, filename
+          FROM documents
+          WHERE status = 'ready'
+        ),
+        global_vector_candidates AS (
           SELECT c.id, c.document_id, c.chunk_index, c.page_number, c.content_type,
                  c.text, d.filename,
                  GREATEST(0.0, 1 - (c.embedding <=> q.embedding)) AS vector_score,
                  ts_rank_cd(to_tsvector('simple', c.text), q.tsq) AS keyword_score
           FROM document_chunks c
-          JOIN documents d ON d.id = c.document_id
+          JOIN ready_documents d ON d.id = c.document_id
           CROSS JOIN q
-          WHERE d.status = 'ready'
           ORDER BY c.embedding <=> q.embedding
           LIMIT :candidate_limit
         ),
-        keyword_candidates AS (
+        global_keyword_candidates AS (
           SELECT c.id, c.document_id, c.chunk_index, c.page_number, c.content_type,
                  c.text, d.filename,
                  GREATEST(0.0, 1 - (c.embedding <=> q.embedding)) AS vector_score,
                  ts_rank_cd(to_tsvector('simple', c.text), q.tsq) AS keyword_score
           FROM document_chunks c
-          JOIN documents d ON d.id = c.document_id
+          JOIN ready_documents d ON d.id = c.document_id
           CROSS JOIN q
-          WHERE d.status = 'ready'
-            AND to_tsvector('simple', c.text) @@ q.tsq
+          WHERE to_tsvector('simple', c.text) @@ q.tsq
           ORDER BY ts_rank_cd(to_tsvector('simple', c.text), q.tsq) DESC
           LIMIT :candidate_limit
         ),
+        per_document_vector_candidates AS (
+          SELECT c.id, c.document_id, c.chunk_index, c.page_number, c.content_type,
+                 c.text, d.filename,
+                 GREATEST(0.0, 1 - (c.embedding <=> q.embedding)) AS vector_score,
+                 ts_rank_cd(to_tsvector('simple', c.text), q.tsq) AS keyword_score
+          FROM ready_documents d
+          CROSS JOIN q
+          CROSS JOIN LATERAL (
+            SELECT candidate.*
+            FROM document_chunks candidate
+            WHERE candidate.document_id = d.id
+            ORDER BY candidate.embedding <=> q.embedding
+            LIMIT :per_document_limit
+          ) c
+        ),
+        per_document_keyword_candidates AS (
+          SELECT c.id, c.document_id, c.chunk_index, c.page_number, c.content_type,
+                 c.text, d.filename,
+                 GREATEST(0.0, 1 - (c.embedding <=> q.embedding)) AS vector_score,
+                 ts_rank_cd(to_tsvector('simple', c.text), q.tsq) AS keyword_score
+          FROM ready_documents d
+          CROSS JOIN q
+          CROSS JOIN LATERAL (
+            SELECT candidate.*
+            FROM document_chunks candidate
+            WHERE candidate.document_id = d.id
+              AND to_tsvector('simple', candidate.text) @@ q.tsq
+            ORDER BY ts_rank_cd(to_tsvector('simple', candidate.text), q.tsq) DESC
+            LIMIT :per_document_limit
+          ) c
+        ),
         candidates AS (
-          SELECT * FROM vector_candidates
+          SELECT * FROM global_vector_candidates
           UNION
-          SELECT * FROM keyword_candidates
+          SELECT * FROM global_keyword_candidates
+          UNION
+          SELECT * FROM per_document_vector_candidates
+          UNION
+          SELECT * FROM per_document_keyword_candidates
         )
         SELECT * FROM candidates
         """
@@ -68,6 +110,7 @@ def search_chunks(
             "embedding": str(query_vector),
             "query": query_text,
             "candidate_limit": candidate_limit,
+            "per_document_limit": per_document_limit,
         },
     ).mappings()
 
@@ -77,11 +120,18 @@ def search_chunks(
         vector_score = float(row["vector_score"] or 0.0)
         keyword_score = min(float(row["keyword_score"] or 0.0) * 4.0, 1.0)
         lexical_score = _lexical_overlap(query_terms, row["text"])
+        phrase_score = _phrase_match(query_text, row["text"])
         score = min(
             1.0,
-            max(0.0, vector_score * 0.50 + keyword_score * 0.35 + lexical_score * 0.15),
+            max(
+                0.0,
+                vector_score * 0.42
+                + keyword_score * 0.28
+                + lexical_score * 0.20
+                + phrase_score * 0.10,
+            ),
         )
-        method = _method(vector_score, keyword_score, lexical_score)
+        method = _method(vector_score, keyword_score, lexical_score, phrase_score)
         results.append(
             RetrievedChunk(
                 chunk=TextChunk(
@@ -101,7 +151,7 @@ def search_chunks(
         )
 
     results.sort(key=lambda item: item.score, reverse=True)
-    return results[:limit]
+    return _document_diverse_results(results, settings.max_retrieval_candidates)
 
 
 def fetch_neighbor_chunks(
@@ -178,7 +228,14 @@ def fetch_neighbor_chunks(
     return neighbors
 
 
-def _method(vector_score: float, keyword_score: float, lexical_score: float) -> str:
+def _method(
+    vector_score: float,
+    keyword_score: float,
+    lexical_score: float,
+    phrase_score: float,
+) -> str:
+    if phrase_score:
+        return "pgvector+exact-phrase"
     if keyword_score >= 0.08 and keyword_score >= vector_score * 0.5:
         return "pgvector+fts"
     if lexical_score >= 0.35:
@@ -187,11 +244,16 @@ def _method(vector_score: float, keyword_score: float, lexical_score: float) -> 
 
 
 def _terms(value: str) -> set[str]:
-    return {
-        token.casefold()
-        for token in _TERM_RE.findall(value)
-        if len(token) >= 2 and token.casefold() not in _STOPWORDS
-    }
+    terms: set[str] = set()
+    for raw_token in _TERM_RE.findall(value):
+        token = raw_token.casefold()
+        candidates = [token, *re.split(r"[_/-]+", token)]
+        terms.update(
+            candidate
+            for candidate in candidates
+            if len(candidate) >= 2 and candidate not in _STOPWORDS
+        )
+    return terms
 
 
 def _lexical_overlap(query_terms: set[str], text_value: str) -> float:
@@ -201,6 +263,56 @@ def _lexical_overlap(query_terms: set[str], text_value: str) -> float:
     if not text_terms:
         return 0.0
     return min(1.0, len(query_terms & text_terms) / max(len(query_terms), 1))
+
+
+def _phrase_match(query: str, text_value: str) -> float:
+    normalized_query = _normalize_phrase(query)
+    if len(normalized_query) < 4:
+        return 0.0
+    return 1.0 if normalized_query in _normalize_phrase(text_value[:10000]) else 0.0
+
+
+def _normalize_phrase(value: str) -> str:
+    tokens = re.findall(r"[A-Za-z0-9]+", value.casefold())
+    return " ".join(tokens)
+
+
+def _document_diverse_results(
+    results: list[RetrievedChunk],
+    limit: int,
+) -> list[RetrievedChunk]:
+    """Keep each probed document represented before adding extra chunks."""
+    if limit <= 0:
+        return []
+
+    deduplicated: list[RetrievedChunk] = []
+    seen_chunks: set[str] = set()
+    for item in results:
+        if item.chunk.chunk_id in seen_chunks:
+            continue
+        seen_chunks.add(item.chunk.chunk_id)
+        deduplicated.append(item)
+
+    selected: list[RetrievedChunk] = []
+    selected_ids: set[str] = set()
+    seen_documents: set[str] = set()
+    for item in deduplicated:
+        document_key = item.chunk.document_id or item.chunk.filename.casefold()
+        if document_key in seen_documents:
+            continue
+        selected.append(item)
+        selected_ids.add(item.chunk.chunk_id)
+        seen_documents.add(document_key)
+        if len(selected) >= limit:
+            return selected
+
+    for item in deduplicated:
+        if item.chunk.chunk_id in selected_ids:
+            continue
+        selected.append(item)
+        if len(selected) >= limit:
+            break
+    return selected
 
 
 _STOPWORDS = {
