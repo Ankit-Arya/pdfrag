@@ -62,7 +62,10 @@ export interface SourceResult {
 
 export interface AnswerResponse {
   answer: string
+  /** Only evidence actually cited by the final answer. */
   sources: SourceResult[]
+  /** Every evidence chunk reviewed by the answer/summarization pipeline. */
+  evidence: SourceResult[]
   grounded: boolean
   grounding_status:
     | 'verified'
@@ -71,6 +74,11 @@ export interface AnswerResponse {
     | 'citation_validation_failed'
     | string
   interpreted_question: string | null
+  contextual_question?: string | null
+  retrieval_mode?: 'answer' | 'references' | string
+  resolved_abbreviations?: string[]
+  candidate_chunks?: number
+  evidence_chunks?: number
   search_queries: string[]
   request_id?: string | null
   chat_session_id?: string | null

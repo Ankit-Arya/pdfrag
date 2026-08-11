@@ -4,8 +4,25 @@ from dataclasses import dataclass
 
 from app.config import get_settings
 from app.rag.llm import llm_service
-from app.rag.prompts import NO_ANSWER, build_user_prompt
+from app.rag.prompts import NO_ANSWER
 from app.rag.types import PromptSource, QueryPlan, RetrievedChunk
+
+
+_ANSWER_SYSTEM_PROMPT = """You are a document-grounded assistant for official internal metro documents.
+Use only the supplied PDF evidence. Conversation context may clarify intent but is never factual evidence.
+
+Answer the user's exact question at the shortest length that is complete and safe:
+- A simple fact, figure, date, name, speed, limit or yes/no lookup should normally be one direct sentence.
+- A request for several facts should use a compact list.
+- A procedure, comparison, summary or safety-critical operational question may be longer when the evidence requires it.
+- Never dump or restate all source excerpts merely because they were retrieved; the UI exposes those separately.
+- Do not add an introductory heading such as "Information found in the documents" unless it genuinely improves a multi-part answer.
+- Preserve applicability: line, rolling stock, mode, equipment, procedure, location, conditions, warnings and exceptions.
+- Never merge incompatible contexts. If the user's context is ambiguous and the evidence contains materially different answers, state the alternatives succinctly instead of inventing one.
+- Cite each factual sentence/bullet with the supplied [S#] labels.
+- Use no source label that is not supplied.
+- If no supported answer exists, reply exactly with the configured no-answer sentence.
+"""
 
 
 _SUMMARY_SYSTEM_PROMPT = """You are an evidence compressor for official internal metro documents.
@@ -38,27 +55,19 @@ def synthesize_answer(
     settings = get_settings()
     estimated_chars = sum(len(item.chunk.text) + len(item.chunk.filename) + 180 for item in results)
 
+    sources = _prompt_sources(results)
     if estimated_chars <= int(settings.max_context_chars * 0.85):
-        prompt, included = build_user_prompt(
-            plan.original_question,
-            plan.contextual_question or plan.rewritten_question,
-            results,
-            settings.max_context_chars,
-            question_intent=plan.intent,
-            response_mode="concise",
-        )
-        typed_sources = [source for source in included if isinstance(source, PromptSource)]
+        prompt = _build_direct_answer_prompt(plan, sources)
         return SynthesisBundle(
-            raw_answer=llm_service.answer(prompt),
-            sources=typed_sources,
+            raw_answer=_answer(prompt),
+            sources=sources,
             used_hierarchy=False,
         )
 
-    sources = _prompt_sources(results)
     digests = _summarize_all_sources(plan, sources)
     final_prompt = _build_digest_answer_prompt(plan, sources, digests)
     return SynthesisBundle(
-        raw_answer=llm_service.answer(final_prompt),
+        raw_answer=_answer(final_prompt),
         sources=sources,
         used_hierarchy=True,
         digests=digests,
@@ -95,7 +104,42 @@ EVIDENCE DIGESTS:
 If the digests contain no supported answer, reply exactly:
 {NO_ANSWER}
 """
-    return llm_service.answer(prompt)
+    return _answer(prompt)
+
+
+def repair_direct_answer(
+    plan: QueryPlan,
+    previous_answer: str,
+    sources: list[PromptSource],
+) -> str:
+    prompt = f"""Repair the previous draft using ONLY the supplied source chunks. Keep the answer proportional to the question: a simple fact should remain one sentence; expand only when necessary. Preserve valid [S#] labels and remove unsupported claims.
+
+ORIGINAL QUESTION:
+{plan.original_question}
+
+CONTEXTUAL INTERPRETATION (intent only):
+{plan.contextual_question or plan.rewritten_question}
+
+PREVIOUS DRAFT:
+{previous_answer}
+
+SOURCE CHUNKS:
+{_source_blocks(sources)}
+
+If no supported answer exists, reply exactly:
+{NO_ANSWER}
+"""
+    return _answer(prompt)
+
+
+def _answer(prompt: str) -> str:
+    settings = get_settings()
+    return llm_service.generate(
+        _ANSWER_SYSTEM_PROMPT,
+        prompt,
+        model=settings.llm_model,
+        reasoning_effort=settings.llm_reasoning_effort,
+    )
 
 
 def _prompt_sources(results: list[RetrievedChunk]) -> list[PromptSource]:
@@ -201,6 +245,37 @@ def _text_batches(values: list[str], max_chars: int) -> list[str]:
     return result
 
 
+def _build_direct_answer_prompt(plan: QueryPlan, sources: list[PromptSource]) -> str:
+    return f"""Answer the ORIGINAL QUESTION using all supplied source chunks.
+
+ORIGINAL QUESTION:
+{plan.original_question}
+
+CONTEXTUAL INTERPRETATION (conversation is intent only, never evidence):
+{plan.contextual_question or plan.rewritten_question}
+
+QUESTION INTENT:
+{plan.intent}
+
+SOURCE CHUNKS:
+{_source_blocks(sources)}
+
+Answer only what the user asked. Use every source silently when deciding the answer, but do not reproduce unrelated or merely nearby evidence. For a single requested fact, return one direct sentence with citation. For a procedure or multi-part question, include the complete supported steps/conditions needed to answer it.
+"""
+
+
+def _source_blocks(sources: list[PromptSource]) -> str:
+    blocks: list[str] = []
+    for index, source in enumerate(sources, 1):
+        chunk = source.result.chunk
+        blocks.append(
+            f"[S{index}] File: {chunk.filename} | Page: {chunk.page_number} | "
+            f"Type: {chunk.content_type} | Retrieval: {source.result.method}\n"
+            f"{source.excerpt}"
+        )
+    return "\n\n---\n\n".join(blocks)
+
+
 def _build_batch_summary_prompt(
     plan: QueryPlan,
     batch: list[tuple[int, PromptSource]],
@@ -257,9 +332,10 @@ SOURCE EXCERPTS (HIERARCHICAL EVIDENCE DIGESTS):
 {digests}
 
 Required answer behavior:
-- Start with `## Information found in the documents`.
 - Answer the exact question, not merely the search terms.
-- Include every materially relevant fact preserved in the digests.
+- Match answer length to the question: one sentence for a single fact; compact bullets for several facts; longer structure only when required for a procedure, comparison or multi-part answer.
+- Do not dump the evidence digests or list unrelated retrieved material; the UI exposes the complete reviewed evidence separately.
+- Include every materially relevant fact preserved in the digests that is needed to answer or qualify the question.
 - Keep different documents, lines, rolling stock, systems, modes and procedures separate when
   their applicability differs; never blend incompatible procedures.
 - For procedures, preserve prerequisites, permissions, chronological steps, warnings,

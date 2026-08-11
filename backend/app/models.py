@@ -32,7 +32,11 @@ class SourceResult(BaseModel):
 
 class AnswerResponse(BaseModel):
     answer: str
+    # `sources` contains only chunks cited by the final answer.
     sources: list[SourceResult]
+    # `evidence` contains every raw evidence chunk reviewed by the answer/summarization
+    # pipeline. It is returned for UI transparency but remains collapsed by default.
+    evidence: list[SourceResult] = Field(default_factory=list)
     grounded: bool
     grounding_status: str = "insufficient_evidence"
     interpreted_question: str | None = None

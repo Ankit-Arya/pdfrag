@@ -587,12 +587,14 @@ async def chat(
     response.request_id = getattr(request.state, "request_id", None)
     response.question_created_at = user_message.created_at
     source_details = [source.model_dump() for source in response.sources]
+    evidence_details = [source.model_dump() for source in response.evidence]
     assistant_message = ChatMessage(
         chat_session_id=chat_session.id,
         role="assistant",
         content=response.answer,
         message_metadata={
             "sources": source_details,
+            "evidence": evidence_details,
             "grounded": response.grounded,
             "grounding_status": response.grounding_status,
             "interpreted_question": response.interpreted_question,

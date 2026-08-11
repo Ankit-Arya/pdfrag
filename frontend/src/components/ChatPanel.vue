@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { nextTick, onMounted, ref } from 'vue'
+import { nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import {
   downloadDocument,
   listDocuments,
@@ -34,6 +34,9 @@ const scrollArea = ref<HTMLElement | null>(null)
 const documents = ref<DocumentRecord[]>([])
 const libraryBusy = ref(false)
 const libraryError = ref('')
+const copiedMessageId = ref<string | null>(null)
+const expandedEvidenceIds = ref<Set<string>>(new Set())
+let copyResetTimer: number | null = null
 const messageDateTimeFormatter = new Intl.DateTimeFormat(undefined, {
   dateStyle: 'medium',
   timeStyle: 'short',
@@ -92,8 +95,56 @@ function handleKeydown(event: KeyboardEvent): void {
   }
 }
 
+async function copyAnswer(message: Message): Promise<void> {
+  if (message.role !== 'assistant') return
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(message.text)
+    } else {
+      copyWithLegacyFallback(message.text)
+    }
+  } catch {
+    copyWithLegacyFallback(message.text)
+  }
+
+  copiedMessageId.value = message.id
+  if (copyResetTimer !== null) window.clearTimeout(copyResetTimer)
+  copyResetTimer = window.setTimeout(() => {
+    if (copiedMessageId.value === message.id) copiedMessageId.value = null
+    copyResetTimer = null
+  }, 1800)
+}
+
+function copyWithLegacyFallback(value: string): void {
+  const textarea = window.document.createElement('textarea')
+  textarea.value = value
+  textarea.setAttribute('readonly', '')
+  textarea.style.position = 'fixed'
+  textarea.style.opacity = '0'
+  window.document.body.appendChild(textarea)
+  textarea.select()
+  window.document.execCommand('copy')
+  textarea.remove()
+}
+
+function handleEvidenceToggle(messageId: string, event: Event): void {
+  const details = event.currentTarget as HTMLDetailsElement
+  const updated = new Set(expandedEvidenceIds.value)
+  if (details.open) updated.add(messageId)
+  else updated.delete(messageId)
+  expandedEvidenceIds.value = updated
+}
+
+function evidenceIsExpanded(messageId: string): boolean {
+  return expandedEvidenceIds.value.has(messageId)
+}
+
 onMounted(() => {
   void loadDocumentLibrary()
+})
+
+onBeforeUnmount(() => {
+  if (copyResetTimer !== null) window.clearTimeout(copyResetTimer)
 })
 </script>
 
@@ -177,8 +228,8 @@ onMounted(() => {
         <template v-if="knowledge?.ready_documents">
           <h2>Knowledge is ready</h2>
           <p>
-            Start a new question or open a saved chat. Chat history is stored, but each
-            question should still include enough context to stand on its own.
+            Ask a direct fact, a detailed procedure, or a broad document-reference search.
+            The assistant uses chat context for intent while grounding facts in the PDFs.
           </p>
           <div class="suggestion-grid">
             <button @click="question = 'Summarize the main operating procedures in the documents.'">
@@ -231,6 +282,17 @@ onMounted(() => {
           />
           <div v-else class="message-text">{{ message.text }}</div>
 
+          <div v-if="message.role === 'assistant'" class="message-actions">
+            <button
+              type="button"
+              class="copy-answer-button"
+              :aria-label="copiedMessageId === message.id ? 'Answer copied' : 'Copy answer'"
+              @click="copyAnswer(message)"
+            >
+              {{ copiedMessageId === message.id ? 'Copied' : 'Copy answer' }}
+            </button>
+          </div>
+
           <div
             v-if="
               message.response
@@ -242,11 +304,48 @@ onMounted(() => {
             This answer is shown, but its citation format did not pass automatic validation.
           </div>
 
+          <details
+            v-if="
+              message.response?.retrieval_mode !== 'references'
+              && message.response?.evidence?.length
+            "
+            class="sources ai-evidence"
+            @toggle="handleEvidenceToggle(message.id, $event)"
+          >
+            <summary class="sources-summary">
+              <span>Evidence reviewed by AI</span>
+              <span class="sources-count">
+                {{ message.response.evidence.length }}
+                chunk{{ message.response.evidence.length === 1 ? '' : 's' }}
+              </span>
+            </summary>
+            <div v-if="evidenceIsExpanded(message.id)" class="source-list">
+              <details
+                v-for="source in message.response.evidence"
+                :key="`ai-${message.id}-${source.id}`"
+                class="source-card"
+              >
+                <summary>
+                  <span class="source-id">{{ source.id }}</span>
+                  <span class="source-title">{{ source.filename }}</span>
+                  <span class="source-page">p. {{ source.page }}</span>
+                </summary>
+                <div
+                  class="source-excerpt markdown-body"
+                  v-html="renderMarkdown(source.excerpt)"
+                />
+                <span class="score">
+                  {{ source.retrieval_method }} · score {{ source.score.toFixed(3) }}
+                </span>
+              </details>
+            </div>
+          </details>
+
           <details v-if="message.response?.sources.length" class="sources">
             <summary class="sources-summary">
               <span>Retrieved evidence</span>
               <span class="sources-count">
-                {{ message.response.sources.length }}
+                {{ message.response.sources.length }} cited
                 source{{ message.response.sources.length === 1 ? '' : 's' }}
               </span>
             </summary>
@@ -261,7 +360,10 @@ onMounted(() => {
                   <span class="source-title">{{ source.filename }}</span>
                   <span class="source-page">p. {{ source.page }}</span>
                 </summary>
-                <p>{{ source.excerpt }}</p>
+                <div
+                  class="source-excerpt markdown-body"
+                  v-html="renderMarkdown(source.excerpt)"
+                />
                 <span class="score">
                   {{ source.retrieval_method }} · score {{ source.score.toFixed(3) }}
                 </span>
@@ -289,7 +391,7 @@ onMounted(() => {
           :disabled="!knowledge?.ready_documents || busy"
           :placeholder="
             knowledge?.ready_documents
-              ? 'Ask a self-contained question about the shared PDFs…'
+              ? 'Ask the PDFs…'
               : 'Waiting for an administrator to process documents'
           "
           aria-label="Question"
@@ -329,6 +431,56 @@ onMounted(() => {
 
 .message.user .message-heading {
   justify-content: flex-end;
+}
+
+.message-actions {
+  margin-top: 7px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.copy-answer-button {
+  min-height: 27px;
+  padding: 0 8px;
+  border: 1px solid #d4dfda;
+  border-radius: 8px;
+  color: #61726c;
+  background: rgba(255, 255, 255, .76);
+  font-size: 9px;
+  font-weight: 800;
+}
+
+.copy-answer-button:hover {
+  border-color: #99b8ac;
+  color: #265b49;
+  background: #fff;
+}
+
+.ai-evidence {
+  margin-top: 12px;
+  background: rgba(244, 250, 247, .78);
+}
+
+.source-excerpt {
+  margin: 0;
+  padding: 0 13px 9px 48px;
+  color: #5e6966;
+  font-size: 10px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.source-excerpt :deep(p) {
+  margin: 0 0 7px;
+}
+
+.source-excerpt :deep(p:last-child) {
+  margin-bottom: 0;
+}
+
+.source-excerpt :deep(table) {
+  font-size: 9px;
 }
 
 .document-library-card {

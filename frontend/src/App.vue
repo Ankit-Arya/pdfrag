@@ -94,9 +94,13 @@ function messageResponse(
   const sources = Array.isArray(metadata.sources)
     ? (metadata.sources as SourceResult[])
     : []
+  const evidence = Array.isArray(metadata.evidence)
+    ? (metadata.evidence as SourceResult[])
+    : []
   return {
     answer: content,
     sources,
+    evidence,
     grounded: metadata.grounded === true,
     grounding_status:
       typeof metadata.grounding_status === 'string'
@@ -108,6 +112,21 @@ function messageResponse(
       typeof metadata.interpreted_question === 'string'
         ? metadata.interpreted_question
         : null,
+    contextual_question:
+      typeof metadata.contextual_question === 'string'
+        ? metadata.contextual_question
+        : null,
+    retrieval_mode:
+      typeof metadata.retrieval_mode === 'string'
+        ? metadata.retrieval_mode
+        : 'answer',
+    resolved_abbreviations: Array.isArray(metadata.resolved_abbreviations)
+      ? (metadata.resolved_abbreviations as string[])
+      : [],
+    candidate_chunks:
+      typeof metadata.candidate_chunks === 'number' ? metadata.candidate_chunks : 0,
+    evidence_chunks:
+      typeof metadata.evidence_chunks === 'number' ? metadata.evidence_chunks : evidence.length,
     search_queries: Array.isArray(metadata.search_queries)
       ? (metadata.search_queries as string[])
       : [],

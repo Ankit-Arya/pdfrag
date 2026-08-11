@@ -21,10 +21,11 @@ from app.rag.postgres_store import (
     scan_matching_chunks,
     search_chunks,
 )
-from app.rag.prompts import NO_ANSWER, build_citation_repair_prompt
+from app.rag.prompts import NO_ANSWER
 from app.rag.query import query_planner
 from app.rag.relevance import select_context_chunks
 from app.rag.synthesis import (
+    repair_direct_answer,
     repair_hierarchical_answer,
     synthesize_answer,
 )
@@ -216,34 +217,24 @@ class RagService:
                         "verified_after_repair" if grounded else "citation_validation_failed"
                     )
             else:
-                repair_prompt, repair_context = build_citation_repair_prompt(
-                    plan.original_question,
-                    plan.contextual_question or plan.rewritten_question,
-                    answer,
-                    expanded,
-                    settings.max_context_chars,
-                    response_mode="concise",
+                repaired_raw = repair_direct_answer(plan, answer, bundle.sources)
+                repaired_answer, repaired_grounded = validate_grounded_answer(
+                    repaired_raw,
+                    len(bundle.sources),
                 )
-                if repair_context:
-                    from app.rag.llm import llm_service
-
-                    repaired_raw = llm_service.answer(repair_prompt)
-                    repaired_answer, repaired_grounded = validate_grounded_answer(
-                        repaired_raw,
-                        len(repair_context),
+                if repaired_grounded or repaired_answer != NO_ANSWER:
+                    answer = repaired_answer
+                    grounded = repaired_grounded
+                    grounding_status = (
+                        "verified_after_repair" if grounded else "citation_validation_failed"
                     )
-                    if repaired_grounded or repaired_answer != NO_ANSWER:
-                        answer = repaired_answer
-                        grounded = repaired_grounded
-                        grounding_status = (
-                            "verified_after_repair" if grounded else "citation_validation_failed"
-                        )
-                        bundle.sources = repair_context
 
         sources = _source_results(answer, bundle.sources)
+        evidence = _evidence_results(bundle.sources)
         return AnswerResponse(
             answer=answer,
             sources=sources,
+            evidence=evidence,
             grounded=grounded,
             grounding_status=grounding_status,
             interpreted_question=plan.contextual_question or plan.rewritten_question,
@@ -278,6 +269,7 @@ class RagService:
         return AnswerResponse(
             answer=answer,
             sources=_source_results(answer, used_context),
+            evidence=_evidence_results(used_context),
             grounded=grounded,
             grounding_status="verified" if grounded else "citation_validation_failed",
             interpreted_question=plan.contextual_question or plan.rewritten_question,
@@ -299,6 +291,7 @@ class RagService:
         return AnswerResponse(
             answer=NO_ANSWER,
             sources=[],
+            evidence=[],
             grounded=False,
             grounding_status="insufficient_evidence",
             interpreted_question=plan.contextual_question or plan.rewritten_question,
@@ -362,6 +355,21 @@ def _source_results(answer: str, context: list[PromptSource]) -> list[SourceResu
         )
         for index, source in enumerate(context, 1)
         if index in used_source_numbers
+    ]
+
+
+def _evidence_results(context: list[PromptSource]) -> list[SourceResult]:
+    return [
+        SourceResult(
+            id=f"S{index}",
+            filename=source.result.chunk.filename,
+            page=source.result.chunk.page_number,
+            score=round(source.result.score, 4),
+            excerpt=source.excerpt,
+            content_type=source.result.chunk.content_type,
+            retrieval_method=source.result.method,
+        )
+        for index, source in enumerate(context, 1)
     ]
 
 

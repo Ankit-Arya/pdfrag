@@ -64,22 +64,43 @@ _REFERENCE_CUES = {
 }
 _ANSWER_CUES = {
     "allowed",
+    "amount",
+    "capacity",
     "condition",
     "conditions",
+    "date",
+    "distance",
+    "duration",
     "explain",
+    "frequency",
+    "height",
     "information",
     "info",
     "instruction",
     "instructions",
+    "length",
+    "limit",
+    "limits",
+    "maximum",
+    "minimum",
+    "number",
     "policy",
+    "pressure",
     "procedure",
     "prohibited",
     "requirement",
     "requirements",
     "rule",
     "rules",
+    "speed",
     "step",
     "steps",
+    "temperature",
+    "time",
+    "timing",
+    "value",
+    "voltage",
+    "weight",
 }
 _FOLLOWUP_STARTS = (
     "and ",
@@ -447,12 +468,25 @@ def _infer_search_mode(original: str, contextual: str) -> str:
     if original.rstrip().endswith("?") or lowered.startswith(_QUESTION_STARTS):
         return "answer"
     if terms & _ANSWER_CUES:
-        return "answer"
+        # A fact dimension needs a subject to become a synthesized answer. A lone
+        # keyword such as "speed" or "date" is still a broad reference lookup.
+        subject_terms = {
+            term
+            for term in terms
+            if term not in _ANSWER_CUES and term not in _FOCUS_STOPWORDS
+        }
+        if subject_terms:
+            return "answer"
     if terms & _REFERENCE_CUES:
         return "references"
-    # A bare word or short noun phrase is treated as corpus/reference discovery.
-    # This lets users type e.g. "alcohol" to see everywhere it occurs.
-    contextual_terms = [token for token in _TERM_PATTERN.findall(contextual) if token.casefold() not in _FOCUS_STOPWORDS]
+    # A bare concept or short noun phrase with no answer dimension is treated as
+    # corpus/reference discovery. Fact dimensions such as speed/date/limit are
+    # included in _ANSWER_CUES above, so "speed of pilot train on AEL" is an answer.
+    contextual_terms = [
+        token
+        for token in _TERM_PATTERN.findall(contextual)
+        if token.casefold() not in _FOCUS_STOPWORDS
+    ]
     return "references" if len(contextual_terms) <= 5 else "answer"
 
 
