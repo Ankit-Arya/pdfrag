@@ -101,6 +101,10 @@ function messageResponse(
     answer: content,
     sources,
     evidence,
+    formatted_sources:
+      typeof metadata.formatted_sources === 'string' ? metadata.formatted_sources : '',
+    formatted_evidence:
+      typeof metadata.formatted_evidence === 'string' ? metadata.formatted_evidence : '',
     grounded: metadata.grounded === true,
     grounding_status:
       typeof metadata.grounding_status === 'string'
@@ -122,6 +126,9 @@ function messageResponse(
         : 'answer',
     resolved_abbreviations: Array.isArray(metadata.resolved_abbreviations)
       ? (metadata.resolved_abbreviations as string[])
+      : [],
+    routing_hints: Array.isArray(metadata.routing_hints)
+      ? (metadata.routing_hints as string[])
       : [],
     candidate_chunks:
       typeof metadata.candidate_chunks === 'number' ? metadata.candidate_chunks : 0,

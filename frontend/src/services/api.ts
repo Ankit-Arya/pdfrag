@@ -66,6 +66,10 @@ export interface AnswerResponse {
   sources: SourceResult[]
   /** Every evidence chunk reviewed by the answer/summarization pipeline. */
   evidence: SourceResult[]
+  /** Readable, grouped Markdown for the cited evidence panel. */
+  formatted_sources?: string
+  /** Readable, grouped Markdown for all evidence reviewed by AI. */
+  formatted_evidence?: string
   grounded: boolean
   grounding_status:
     | 'verified'
@@ -77,6 +81,7 @@ export interface AnswerResponse {
   contextual_question?: string | null
   retrieval_mode?: 'answer' | 'references' | string
   resolved_abbreviations?: string[]
+  routing_hints?: string[]
   candidate_chunks?: number
   evidence_chunks?: number
   search_queries: string[]

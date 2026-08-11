@@ -56,3 +56,4 @@ class QueryPlan:
     contextual_question: str = ""
     search_mode: str = "answer"
     abbreviation_hints: list[str] = field(default_factory=list)
+    routing_hints: list[str] = field(default_factory=list)

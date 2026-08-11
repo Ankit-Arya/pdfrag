@@ -110,6 +110,29 @@ _FOLLOWUP_STARTS = (
     "what about ",
     "what if ",
 )
+_REQUEST_VERBS = {
+    "clarify",
+    "describe",
+    "explain",
+    "give",
+    "list",
+    "provide",
+    "show",
+    "summarize",
+    "tell",
+}
+_CONTEXT_DEPENDENT_WORDS = {
+    "above",
+    "applicable",
+    "detail",
+    "details",
+    "general",
+    "more",
+    "previous",
+    "procedure",
+    "same",
+    "then",
+}
 _FOCUS_STOPWORDS = {
     "a",
     "about",
@@ -138,6 +161,10 @@ _FOCUS_STOPWORDS = {
     "on",
     "or",
     "please",
+    "provide",
+    "applicable",
+    "general",
+    "then",
     "should",
     "that",
     "the",
@@ -198,11 +225,13 @@ class QueryPlanner:
         *,
         conversation_context: list[dict[str, str]] | None = None,
         abbreviation_hints: list[str] | None = None,
+        routing_hints: list[str] | None = None,
     ) -> QueryPlan:
         settings = get_settings()
         normalized = " ".join(question.split())
         history = conversation_context or []
         hints = abbreviation_hints or []
+        route_hints = routing_hints or []
         fallback_context = _fallback_contextual_question(normalized, history)
         fallback_intent = _infer_intent(fallback_context)
         fallback_mode = _infer_search_mode(normalized, fallback_context)
@@ -211,19 +240,21 @@ class QueryPlanner:
             fallback_context,
             fallback_intent,
             hints,
+            route_hints,
         )[: settings.query_rewrite_max_variants]
         fallback = QueryPlan(
             original_question=normalized,
             rewritten_question=fallback_context,
             contextual_question=fallback_context,
             search_queries=fallback_queries or [normalized],
-            keywords=_protected_tokens(normalized, hints),
+            keywords=_unique([*_protected_tokens(normalized, hints), *route_hints])[:32],
             intent=fallback_intent,
             response_mode="evidence" if fallback_mode == "references" else "concise",
             search_mode=fallback_mode,
             focus_terms=_extract_focus_terms(fallback_context),
-            context_terms=_extract_context_terms(fallback_context, hints),
+            context_terms=_unique([*_extract_context_terms(fallback_context, hints), *route_hints])[:32],
             abbreviation_hints=hints,
+            routing_hints=route_hints,
             used_ai_rewrite=False,
         )
 
@@ -232,6 +263,7 @@ class QueryPlanner:
             normalized.casefold(),
             fallback_context.casefold(),
             tuple(hint.casefold() for hint in hints),
+            tuple(hint.casefold() for hint in route_hints),
             bool(should_rewrite),
             settings.query_model,
         )
@@ -249,6 +281,7 @@ class QueryPlanner:
                     normalized,
                     history,
                     hints,
+                    route_hints,
                     settings.query_rewrite_max_variants,
                 ),
                 max_output_tokens=700,
@@ -258,6 +291,7 @@ class QueryPlanner:
                 normalized,
                 history,
                 hints,
+                route_hints,
                 payload,
                 settings.query_rewrite_max_variants,
                 fallback,
@@ -289,28 +323,43 @@ def _build_context_prompt(
     question: str,
     history: list[dict[str, str]],
     hints: list[str],
+    routing_hints: list[str],
     max_variants: int,
 ) -> str:
     history_lines: list[str] = []
+    context_hints: list[str] = []
     for turn in history:
         role = str(turn.get("role", "")).strip().upper()
         content = " ".join(str(turn.get("content", "")).split())
-        if role in {"USER", "ASSISTANT"} and content:
-            history_lines.append(f"{role}: {content}")
+        # Earlier assistant prose is deliberately excluded. It may be wrong or
+        # stale. Only prior USER wording plus validated intent/routing metadata
+        # can resolve a follow-up.
+        if role == "USER" and content:
+            history_lines.append(f"USER: {content}")
+        context_hint = " ".join(str(turn.get("context_hint", "")).split())
+        if context_hint:
+            context_hints.append(context_hint)
 
     return f"""CURRENT USER QUESTION:
 {question}
 
-RECENT CONVERSATION (intent context only, never factual evidence):
+RECENT USER TURN (intent context only, never factual evidence):
 {chr(10).join(history_lines) if history_lines else "None"}
+
+PREVIOUS VALIDATED SELF-CONTAINED QUESTION (intent only):
+{context_hints[-1] if context_hints else "None"}
+
+PDF-DERIVED DOCUMENT ROUTING HINTS FROM THE PREVIOUS TURN:
+{chr(10).join(f"- {hint}" for hint in routing_hints) if routing_hints else "None"}
 
 DOCUMENT-GROUNDED ABBREVIATION/USAGE HINTS:
 {chr(10).join(f"- {hint}" for hint in hints) if hints else "None"}
 
 Create at most {max_variants} retrieval queries. The contextual question must remain faithful
 to the current user request. If it is a follow-up, make it self-contained using earlier USER
-turns. Keep broad keyword/reference searches broad; do not turn a bare concept into a specific
-policy question unless the user asked for one.
+turns and, when useful, the PDF-derived routing hints. A routing hint may identify a document
+that must be searched again; it is not itself factual evidence. Keep a complete new topic
+isolated from previous turns.
 """
 
 
@@ -332,6 +381,7 @@ def _validate_plan(
     original: str,
     history: list[dict[str, str]],
     hints: list[str],
+    routing_hints: list[str],
     payload: dict[str, Any],
     max_variants: int,
     fallback: QueryPlan,
@@ -341,11 +391,25 @@ def _validate_plan(
         for turn in history
         if str(turn.get("role", "")).casefold() == "user"
     ]
+    resolved_context_hints = [
+        str(turn.get("context_hint", ""))
+        for turn in history
+        if str(turn.get("context_hint", "")).strip()
+    ]
     # Only pull earlier user topics into a question when the current turn actually
     # looks like a follow-up/underspecified request. A new bare lookup such as
     # "alcohol" must stay broad even if the previous chat was about Line 8.
-    context_history = user_history if _needs_conversation_resolution(original) else []
-    allowed_parts = [original, *context_history, *hints]
+    needs_history = needs_conversation_context(original)
+    context_history = user_history if needs_history else []
+    context_hint_history = resolved_context_hints[-1:] if needs_history else []
+    active_routing_hints = routing_hints if needs_history else []
+    allowed_parts = [
+        original,
+        *context_history,
+        *context_hint_history,
+        *hints,
+        *active_routing_hints,
+    ]
     allowed_text = " ".join(allowed_parts)
     allowed_terms = {token.casefold() for token in _TERM_PATTERN.findall(allowed_text)}
     for part in allowed_parts:
@@ -384,7 +448,9 @@ def _validate_plan(
         and _contains_protected_tokens(query, protected)
     ]
 
-    deterministic = _deterministic_queries(original, contextual, intent, hints)
+    deterministic = _deterministic_queries(
+        original, contextual, intent, hints, active_routing_hints
+    )
     queries = _unique([*deterministic, *model_queries])[:max_variants]
 
     raw_keywords = payload.get("keywords")
@@ -404,7 +470,7 @@ def _validate_plan(
 
     focus_terms = _unique([*_extract_focus_terms(contextual), *model_focus])[:48]
     context_terms = _unique(
-        [*_extract_context_terms(contextual, hints), *model_context]
+        [*_extract_context_terms(contextual, hints), *active_routing_hints, *model_context]
     )[:32]
 
     return QueryPlan(
@@ -412,13 +478,14 @@ def _validate_plan(
         rewritten_question=contextual,
         contextual_question=contextual,
         search_queries=queries or [original],
-        keywords=_unique([*protected, *model_keywords])[:32],
+        keywords=_unique([*protected, *active_routing_hints, *model_keywords])[:32],
         intent=intent,
         response_mode="evidence" if search_mode == "references" else "concise",
         search_mode=search_mode,
         focus_terms=focus_terms,
         context_terms=context_terms,
         abbreviation_hints=hints,
+        routing_hints=active_routing_hints,
         used_ai_rewrite=contextual != original or any(q not in deterministic for q in queries),
     )
 
@@ -427,8 +494,13 @@ def _fallback_contextual_question(
     question: str,
     history: list[dict[str, str]],
 ) -> str:
-    if not _needs_conversation_resolution(question):
+    if not needs_conversation_context(question):
         return question
+
+    for turn in reversed(history):
+        context_hint = " ".join(str(turn.get("context_hint", "")).split())
+        if context_hint and context_hint.casefold() != question.casefold():
+            return f"{context_hint}. {question}"
 
     for turn in reversed(history):
         if str(turn.get("role", "")).casefold() != "user":
@@ -441,26 +513,44 @@ def _fallback_contextual_question(
 
 
 
-def _needs_conversation_resolution(question: str) -> bool:
+def needs_conversation_context(question: str) -> bool:
+    """Return True only when the current turn lacks a self-contained subject.
+
+    Complete new topics must never inherit old line/train/location constraints.
+    Subject-less directives such as "provide the applicable procedure" are
+    follow-ups even though they do not start with a question word.
+    """
     lowered = question.casefold().strip()
     terms = [token.casefold() for token in _TERM_PATTERN.findall(question)]
     term_set = set(terms)
     if lowered.startswith(_FOLLOWUP_STARTS):
         return True
-    if {"it", "that", "this", "same", "those", "them", "they", "there"} & term_set:
+    if {"it", "that", "this", "same", "those", "them", "they", "there", "these"} & term_set:
         return True
-    # Short questions such as "what are the rules?" or "and the exceptions?"
-    # lack a usable subject and should inherit the recent USER topic. A bare noun
-    # like "alcohol" is a new reference lookup and must not inherit old context.
-    if lowered.startswith(_QUESTION_STARTS) and len(terms) <= 6:
-        content_terms = [
-            term for term in terms
-            if term not in _FOCUS_STOPWORDS
-            and term not in _ANSWER_CUES
-            and term not in {"tell", "explain", "regarding"}
-        ]
+
+    content_terms = [
+        term
+        for term in terms
+        if term not in _FOCUS_STOPWORDS
+        and term not in _ANSWER_CUES
+        and term not in _REQUEST_VERBS
+        and term not in _CONTEXT_DEPENDENT_WORDS
+        and term not in {"tell", "regarding"}
+    ]
+
+    # Short question forms such as "what are the rules?" have no subject.
+    if lowered.startswith(_QUESTION_STARTS) and len(terms) <= 8:
         return not content_terms
+
+    # Imperative follow-ups are common in chat: "provide the procedure",
+    # "show applicable details", "give more". Keep them attached to the most
+    # recent user topic when no concrete subject remains after removing request
+    # boilerplate.
+    if terms and terms[0] in _REQUEST_VERBS and len(terms) <= 9:
+        return not content_terms
+
     return False
+
 
 def _infer_search_mode(original: str, contextual: str) -> str:
     lowered = original.casefold().strip()
@@ -518,6 +608,7 @@ def _deterministic_queries(
     contextual: str,
     intent: str,
     hints: list[str],
+    routing_hints: list[str] | None = None,
 ) -> list[str]:
     variants = [original]
     if contextual.casefold() != original.casefold():
@@ -528,6 +619,10 @@ def _deterministic_queries(
         variants.extend(_structural_queries(value, intent))
 
     variants.extend(_abbreviation_queries(contextual, hints))
+    for routing_hint in routing_hints or []:
+        clean = _clean_string(routing_hint)
+        if clean:
+            variants.append(f"{contextual} {clean}")
     return _unique(variants)
 
 

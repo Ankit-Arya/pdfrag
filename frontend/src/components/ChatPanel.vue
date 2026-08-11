@@ -319,25 +319,29 @@ onBeforeUnmount(() => {
                 chunk{{ message.response.evidence.length === 1 ? '' : 's' }}
               </span>
             </summary>
-            <div v-if="evidenceIsExpanded(message.id)" class="source-list">
-              <details
-                v-for="source in message.response.evidence"
-                :key="`ai-${message.id}-${source.id}`"
-                class="source-card"
-              >
-                <summary>
-                  <span class="source-id">{{ source.id }}</span>
-                  <span class="source-title">{{ source.filename }}</span>
-                  <span class="source-page">p. {{ source.page }}</span>
-                </summary>
-                <div
-                  class="source-excerpt markdown-body"
-                  v-html="renderMarkdown(source.excerpt)"
-                />
-                <span class="score">
-                  {{ source.retrieval_method }} · score {{ source.score.toFixed(3) }}
-                </span>
-              </details>
+            <div v-if="evidenceIsExpanded(message.id)" class="formatted-evidence-wrap">
+              <div
+                v-if="message.response.formatted_evidence"
+                class="formatted-evidence markdown-body"
+                v-html="renderMarkdown(message.response.formatted_evidence)"
+              />
+              <div v-else class="source-list">
+                <details
+                  v-for="source in message.response.evidence"
+                  :key="`ai-${message.id}-${source.id}`"
+                  class="source-card"
+                >
+                  <summary>
+                    <span class="source-id">{{ source.id }}</span>
+                    <span class="source-title">{{ source.filename }}</span>
+                    <span class="source-page">p. {{ source.page }}</span>
+                  </summary>
+                  <div
+                    class="source-excerpt markdown-body"
+                    v-html="renderMarkdown(source.excerpt)"
+                  />
+                </details>
+              </div>
             </div>
           </details>
 
@@ -349,7 +353,12 @@ onBeforeUnmount(() => {
                 source{{ message.response.sources.length === 1 ? '' : 's' }}
               </span>
             </summary>
-            <div class="source-list">
+            <div
+              v-if="message.response.formatted_sources"
+              class="formatted-evidence markdown-body"
+              v-html="renderMarkdown(message.response.formatted_sources)"
+            />
+            <div v-else class="source-list">
               <details
                 v-for="source in message.response.sources"
                 :key="source.id"
@@ -364,9 +373,6 @@ onBeforeUnmount(() => {
                   class="source-excerpt markdown-body"
                   v-html="renderMarkdown(source.excerpt)"
                 />
-                <span class="score">
-                  {{ source.retrieval_method }} · score {{ source.score.toFixed(3) }}
-                </span>
               </details>
             </div>
           </details>
@@ -575,6 +581,42 @@ onBeforeUnmount(() => {
 .library-download-button:hover:not(:disabled) {
   border-color: #93b2a6;
   background: #f7faf9;
+}
+
+.formatted-evidence-wrap {
+  padding: 0 7px 7px;
+}
+
+.formatted-evidence {
+  padding: 12px 14px;
+  border-top: 1px solid #e7ecea;
+  color: #46534f;
+  font-size: 11px;
+  line-height: 1.65;
+}
+
+.formatted-evidence :deep(h3) {
+  margin: 14px 0 5px;
+  color: #263b34;
+  font-size: 12px;
+}
+
+.formatted-evidence :deep(h3:first-child) {
+  margin-top: 0;
+}
+
+.formatted-evidence :deep(h4) {
+  margin: 8px 0 4px;
+  color: #53655f;
+  font-size: 10px;
+}
+
+.formatted-evidence :deep(p),
+.formatted-evidence :deep(ul),
+.formatted-evidence :deep(ol),
+.formatted-evidence :deep(.table-scroll) {
+  margin-top: 6px;
+  margin-bottom: 8px;
 }
 
 @media (max-width: 820px) {

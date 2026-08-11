@@ -13,16 +13,19 @@ from app.models import AnswerResponse, SourceResult
 from app.rag.chunking import chunk_pages
 from app.rag.embeddings import EmbeddingUnavailableError, embedding_service
 from app.rag.evidence import build_evidence_answer
+from app.rag.evidence_format import format_prompt_sources_markdown
 from app.rag.guardrails import cited_source_numbers, validate_grounded_answer
 from app.rag.pdf import PdfProcessingError, extract_pdf_pages
 from app.rag.postgres_store import (
+    discover_document_references,
     fetch_neighbor_chunks,
+    fetch_referenced_document_chunks,
     find_abbreviation_hints,
     scan_matching_chunks,
     search_chunks,
 )
 from app.rag.prompts import NO_ANSWER
-from app.rag.query import query_planner
+from app.rag.query import needs_conversation_context, query_planner
 from app.rag.relevance import select_context_chunks
 from app.rag.synthesis import (
     repair_direct_answer,
@@ -119,13 +122,26 @@ class RagService:
     ) -> AnswerResponse:
         settings = get_settings()
         history = conversation_context or []
+
+        # A complete new question starts a clean retrieval topic. Previous turns
+        # (and their abbreviations such as AEL) are only visible when the current
+        # wording actually needs follow-up resolution. This prevents context bleed
+        # from an earlier pilot-train question into a new high-wind question.
+        use_history = needs_conversation_context(question)
+        intent_history = _focused_conversation_context(history) if use_history else []
+        routing_hints = _conversation_routing_hints(intent_history)
         abbreviation_probe = "\n".join(
             [
                 question,
                 *[
                     str(turn.get("content", ""))
-                    for turn in history
+                    for turn in intent_history
                     if str(turn.get("role", "")).casefold() == "user"
+                ],
+                *[
+                    str(turn.get("context_hint", ""))
+                    for turn in intent_history
+                    if str(turn.get("context_hint", "")).strip()
                 ],
             ]
         )
@@ -133,8 +149,9 @@ class RagService:
         plan = query_planner.plan(
             question,
             enabled=rewrite_question,
-            conversation_context=history,
+            conversation_context=intent_history,
             abbreviation_hints=abbreviation_hints,
+            routing_hints=routing_hints,
         )
 
         context_limit = (
@@ -172,6 +189,33 @@ class RagService:
             limit=settings.corpus_scan_max_chunks,
         ):
             _merge_candidate(merged, item)
+
+        # Index/catalog/cross-reference rows are routing evidence, not the end of
+        # retrieval. If a relevant row identifies SC-06 (or another procedure),
+        # resolve that ready PDF and inspect its chunks before relevance selection.
+        discovered_references = discover_document_references(
+            sorted(merged.values(), key=_result_sort_key),
+            plan.contextual_question or plan.original_question,
+            max_references=settings.reference_hop_max_documents,
+        )
+        active_references = _unique([*plan.routing_hints, *discovered_references])
+        if plan.search_mode == "answer" and active_references:
+            reference_queries = _unique(
+                [
+                    plan.contextual_question or plan.original_question,
+                    plan.original_question,
+                    *plan.search_queries,
+                    *active_references,
+                ]
+            )
+            for item in fetch_referenced_document_chunks(
+                db,
+                active_references,
+                reference_queries,
+                max_documents=settings.reference_hop_max_documents,
+                chunks_per_document=settings.reference_hop_chunks_per_document,
+            ):
+                _merge_candidate(merged, item)
 
         candidates = sorted(merged.values(), key=_result_sort_key)
         if not candidates:
@@ -229,18 +273,24 @@ class RagService:
                         "verified_after_repair" if grounded else "citation_validation_failed"
                     )
 
+        used_source_numbers = set(cited_source_numbers(answer, len(bundle.sources)))
         sources = _source_results(answer, bundle.sources)
         evidence = _evidence_results(bundle.sources)
         return AnswerResponse(
             answer=answer,
             sources=sources,
             evidence=evidence,
+            formatted_sources=format_prompt_sources_markdown(
+                bundle.sources, source_numbers=used_source_numbers
+            ),
+            formatted_evidence=format_prompt_sources_markdown(bundle.sources),
             grounded=grounded,
             grounding_status=grounding_status,
             interpreted_question=plan.contextual_question or plan.rewritten_question,
             contextual_question=plan.contextual_question or plan.rewritten_question,
             retrieval_mode=plan.search_mode,
             resolved_abbreviations=abbreviation_hints,
+            routing_hints=active_references,
             candidate_chunks=len(candidates),
             evidence_chunks=len(bundle.sources),
             search_queries=plan.search_queries,
@@ -266,16 +316,24 @@ class RagService:
                 candidate_chunks=candidate_chunks,
             )
         answer, grounded = validate_grounded_answer(raw, len(used_context))
+        used_source_numbers = set(cited_source_numbers(answer, len(used_context)))
         return AnswerResponse(
             answer=answer,
             sources=_source_results(answer, used_context),
             evidence=_evidence_results(used_context),
+            formatted_sources=format_prompt_sources_markdown(
+                used_context, source_numbers=used_source_numbers
+            ),
+            formatted_evidence=format_prompt_sources_markdown(used_context),
             grounded=grounded,
             grounding_status="verified" if grounded else "citation_validation_failed",
             interpreted_question=plan.contextual_question or plan.rewritten_question,
             contextual_question=plan.contextual_question or plan.rewritten_question,
             retrieval_mode="references",
             resolved_abbreviations=abbreviation_hints,
+            routing_hints=discover_document_references(
+                relevant, plan.contextual_question or plan.original_question
+            ),
             candidate_chunks=candidate_chunks,
             evidence_chunks=len(used_context),
             search_queries=plan.search_queries,
@@ -292,12 +350,15 @@ class RagService:
             answer=NO_ANSWER,
             sources=[],
             evidence=[],
+            formatted_sources="",
+            formatted_evidence="",
             grounded=False,
             grounding_status="insufficient_evidence",
             interpreted_question=plan.contextual_question or plan.rewritten_question,
             contextual_question=plan.contextual_question or plan.rewritten_question,
             retrieval_mode=plan.search_mode,
             resolved_abbreviations=abbreviation_hints,
+            routing_hints=plan.routing_hints,
             candidate_chunks=candidate_chunks,
             evidence_chunks=0,
             search_queries=plan.search_queries,
@@ -331,6 +392,35 @@ class RagService:
         max_chunks: int | None = None,
     ) -> list[RetrievedChunk]:
         return select_context_chunks(plan, candidates, max_chunks=max_chunks)
+
+
+def _focused_conversation_context(history: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Keep only the immediately preceding topic for follow-up resolution.
+
+    The last assistant turn carries a validated contextual_question and PDF-derived
+    routing hints in metadata. Using that plus the last user turn preserves a chain
+    of follow-ups without reintroducing unrelated older topics.
+    """
+    if not history:
+        return []
+    last_user_index = -1
+    for index in range(len(history) - 1, -1, -1):
+        if str(history[index].get("role", "")).casefold() == "user":
+            last_user_index = index
+            break
+    if last_user_index < 0:
+        return history[-1:]
+    return history[last_user_index:]
+
+
+def _conversation_routing_hints(history: list[dict[str, str]]) -> list[str]:
+    hints: list[str] = []
+    for turn in history:
+        raw = str(turn.get("routing_hint", "")).strip()
+        if not raw:
+            continue
+        hints.extend(part.strip() for part in raw.split("|") if part.strip())
+    return _unique(hints)
 
 
 def _merge_candidate(target: dict[str, RetrievedChunk], item: RetrievedChunk) -> None:

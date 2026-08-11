@@ -175,7 +175,22 @@ def _conversation_context(db: Session, chat_session_id: uuid.UUID) -> list[dict[
             break
         if len(text) > remaining:
             text = text[:remaining]
-        newest_first.append({"role": row.role, "content": text})
+        turn: dict[str, str] = {"role": row.role, "content": text}
+        if row.role == "assistant":
+            metadata = row.message_metadata or {}
+            contextual = metadata.get("contextual_question")
+            if isinstance(contextual, str) and contextual.strip():
+                turn["context_hint"] = " ".join(contextual.split())[: settings.chat_context_per_message_chars]
+            routing = metadata.get("routing_hints")
+            if isinstance(routing, list):
+                clean_routing = [
+                    " ".join(str(item).split())
+                    for item in routing
+                    if str(item).strip()
+                ]
+                if clean_routing:
+                    turn["routing_hint"] = " | ".join(clean_routing[:12])
+        newest_first.append(turn)
         used += len(text)
     return list(reversed(newest_first))
 
@@ -595,12 +610,15 @@ async def chat(
         message_metadata={
             "sources": source_details,
             "evidence": evidence_details,
+            "formatted_sources": response.formatted_sources,
+            "formatted_evidence": response.formatted_evidence,
             "grounded": response.grounded,
             "grounding_status": response.grounding_status,
             "interpreted_question": response.interpreted_question,
             "contextual_question": response.contextual_question,
             "retrieval_mode": response.retrieval_mode,
             "resolved_abbreviations": response.resolved_abbreviations,
+            "routing_hints": response.routing_hints,
             "candidate_chunks": response.candidate_chunks,
             "evidence_chunks": response.evidence_chunks,
             "search_queries": response.search_queries,
@@ -624,6 +642,7 @@ async def chat(
             "contextual_question": response.contextual_question,
             "retrieval_mode": response.retrieval_mode,
             "resolved_abbreviations": response.resolved_abbreviations,
+            "routing_hints": response.routing_hints,
             "candidate_chunks": response.candidate_chunks,
             "evidence_chunks": response.evidence_chunks,
             "search_queries": response.search_queries,

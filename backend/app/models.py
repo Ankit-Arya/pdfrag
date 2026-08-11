@@ -37,12 +37,18 @@ class AnswerResponse(BaseModel):
     # `evidence` contains every raw evidence chunk reviewed by the answer/summarization
     # pipeline. It is returned for UI transparency but remains collapsed by default.
     evidence: list[SourceResult] = Field(default_factory=list)
+    # Human-readable renderings for the two collapsed evidence panels. Raw SourceResult
+    # objects remain available for audit/metadata, but users no longer see synthetic
+    # [PDF CHUNK CONTEXT] envelopes.
+    formatted_sources: str = ""
+    formatted_evidence: str = ""
     grounded: bool
     grounding_status: str = "insufficient_evidence"
     interpreted_question: str | None = None
     contextual_question: str | None = None
     retrieval_mode: str = "answer"
     resolved_abbreviations: list[str] = Field(default_factory=list)
+    routing_hints: list[str] = Field(default_factory=list)
     candidate_chunks: int = 0
     evidence_chunks: int = 0
     search_queries: list[str] = Field(default_factory=list)

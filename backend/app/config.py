@@ -74,6 +74,13 @@ class Settings(BaseSettings):
     neighbor_window: int = Field(default=1, ge=0, le=3)
     evidence_top_k: int = Field(default=48, ge=4, le=500)
 
+    # Index/catalog rows can identify the exact procedure that should be searched
+    # next. Follow those PDF-derived references before answering rather than
+    # treating an index row as the final evidence.
+    reference_hop_enabled: bool = True
+    reference_hop_max_documents: int = Field(default=6, ge=1, le=20)
+    reference_hop_chunks_per_document: int = Field(default=400, ge=20, le=2000)
+
     # Conversation history is intent context only. It is never treated as factual
     # evidence and is never cited in a grounded answer.
     chat_context_messages: int = Field(default=10, ge=0, le=30)

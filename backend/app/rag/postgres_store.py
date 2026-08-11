@@ -12,6 +12,11 @@ from app.rag.types import RetrievedChunk, TextChunk
 
 _TERM_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_/-]{1,}")
 _ABBREVIATION_TOKEN_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9/-]{1,7}\b")
+_CONTEXT_BLOCK_RE = re.compile(r"\[PDF CHUNK CONTEXT\].*?\[/PDF CHUNK CONTEXT\]", re.IGNORECASE | re.DOTALL)
+_DOCUMENT_REFERENCE_RE = re.compile(
+    r"\b(SC|SOP|JPO|INST(?:RUCTION)?|MRGR)\s*[-_ ]?\s*(\d{1,4}[A-Z]?)\b",
+    re.IGNORECASE,
+)
 
 
 def search_chunks(
@@ -261,6 +266,193 @@ def scan_matching_chunks(
 
     results.sort(key=_result_sort_key)
     return _deduplicate_results(results, max_rows)
+
+
+def discover_document_references(
+    candidates: list[RetrievedChunk],
+    question_text: str,
+    *,
+    max_references: int = 8,
+) -> list[str]:
+    """Extract procedure/document codes from query-relevant lines only.
+
+    Index chunks often carry many unrelated document codes in their metadata or
+    neighboring rows. Strip the synthetic chunk context first and only accept a
+    code from a body line that overlaps the current question. This lets an index
+    row route retrieval to SC-06 without accidentally pulling SC-14 just because
+    both codes appeared in the same indexed chunk.
+    """
+    if max_references <= 0:
+        return []
+    query_terms = _terms(question_text)
+    if not query_terms:
+        return []
+    minimum_overlap = 1 if len(query_terms) <= 2 else 2
+    found: list[str] = []
+    seen: set[str] = set()
+
+    # Explicit document codes in the user's own wording are the strongest routing
+    # hints and do not need to be rediscovered from an index row.
+    for match in _DOCUMENT_REFERENCE_RE.finditer(question_text):
+        reference = _canonical_document_reference(match.group(1), match.group(2))
+        key = reference.casefold()
+        if key not in seen:
+            seen.add(key)
+            found.append(reference)
+            if len(found) >= max_references:
+                return found
+
+    for candidate in candidates[:250]:
+        body = _strip_chunk_context(candidate.chunk.text)
+        for raw_line in body.splitlines():
+            line = " ".join(raw_line.split())
+            if not line:
+                continue
+            matches = list(_DOCUMENT_REFERENCE_RE.finditer(line))
+            if not matches:
+                continue
+            line_terms = _terms(line)
+            if len(query_terms & line_terms) < minimum_overlap:
+                continue
+            for match in matches:
+                reference = _canonical_document_reference(match.group(1), match.group(2))
+                key = reference.casefold()
+                if key in seen:
+                    continue
+                seen.add(key)
+                found.append(reference)
+                if len(found) >= max_references:
+                    return found
+    return found
+
+
+def fetch_referenced_document_chunks(
+    db: Session,
+    references: list[str],
+    query_texts: list[str],
+    *,
+    max_documents: int | None = None,
+    chunks_per_document: int | None = None,
+) -> list[RetrievedChunk]:
+    """Resolve PDF-derived codes to ready documents and retrieve from them.
+
+    This is a second retrieval hop, not a citation shortcut: the index/catalog row
+    only identifies which PDF to inspect. Facts still come from the actual target
+    document chunks returned here and are re-ranked/synthesized normally.
+    """
+    settings = get_settings()
+    if not settings.reference_hop_enabled or not references:
+        return []
+    document_limit = max_documents or settings.reference_hop_max_documents
+    per_document_limit = chunks_per_document or settings.reference_hop_chunks_per_document
+    if document_limit <= 0 or per_document_limit <= 0:
+        return []
+
+    ready_documents = list(
+        db.execute(
+            text(
+                """
+                SELECT id, filename
+                FROM documents
+                WHERE status = 'ready'
+                ORDER BY lower(filename), id
+                """
+            )
+        ).mappings()
+    )
+    selected_documents: list[tuple[str, str, str]] = []
+    selected_ids: set[str] = set()
+    for reference in references:
+        normalized_reference = _normalize_document_reference(reference)
+        matches: list[tuple[int, str, str]] = []
+        for row in ready_documents:
+            filename = str(row["filename"])
+            normalized_filename = _normalize_document_reference(filename)
+            if normalized_reference and normalized_reference in normalized_filename:
+                # Prefer the actual procedure over an index/catalog file when both
+                # contain the same code in their filename.
+                index_penalty = 1 if re.search(r"\\b(?:index|catalog|master)\\b", filename, re.I) else 0
+                matches.append((index_penalty, str(row["id"]), filename))
+        ordered_matches = sorted(matches, key=lambda item: (item[0], item[2].casefold()))
+        non_index_matches = [item for item in ordered_matches if item[0] == 0]
+        for _, document_id, filename in (non_index_matches or ordered_matches):
+            if document_id in selected_ids:
+                continue
+            selected_ids.add(document_id)
+            selected_documents.append((document_id, filename, reference))
+            if len(selected_documents) >= document_limit:
+                break
+        if len(selected_documents) >= document_limit:
+            break
+
+    if not selected_documents:
+        return []
+
+    query_terms = _terms(" ".join(query_texts))
+    any_query = _keyword_or_query_from_terms(query_terms)
+    sql = text(
+        """
+        WITH q AS (SELECT to_tsquery('simple', :any_query) AS tsq_any)
+        SELECT c.id, c.document_id, c.chunk_index, c.page_number, c.content_type,
+               c.text, d.filename,
+               ts_rank_cd(to_tsvector('simple', c.text), q.tsq_any) AS keyword_score,
+               CASE WHEN to_tsvector('simple', c.text) @@ q.tsq_any THEN 1 ELSE 0 END AS matched
+        FROM document_chunks c
+        JOIN documents d ON d.id = c.document_id
+        CROSS JOIN q
+        WHERE d.status = 'ready'
+          AND c.document_id::text = :document_id
+        ORDER BY matched DESC, keyword_score DESC, c.chunk_index, c.id
+        LIMIT :chunk_limit
+        """
+    )
+
+    results: list[RetrievedChunk] = []
+    for document_id, _filename, _reference in selected_documents:
+        rows = db.execute(
+            sql,
+            {
+                "any_query": any_query,
+                "document_id": document_id,
+                "chunk_limit": per_document_limit,
+            },
+        ).mappings()
+        for row in rows:
+            body_terms = _terms(_strip_chunk_context(str(row["text"]))[:16000])
+            coverage = (
+                len(query_terms & body_terms) / max(len(query_terms), 1)
+                if query_terms
+                else 0.0
+            )
+            keyword_score = min(float(row["keyword_score"] or 0.0) * 5.0, 1.0)
+            score = min(0.98, 0.62 + coverage * 0.28 + keyword_score * 0.08)
+            results.append(
+                _row_to_result(
+                    row,
+                    score=score,
+                    method="reference-hop",
+                    vector_score=0.0,
+                    keyword_score=keyword_score,
+                )
+            )
+
+    results.sort(key=_result_sort_key)
+    return _deduplicate_results(results, document_limit * per_document_limit)
+
+
+def _canonical_document_reference(prefix: str, number: str) -> str:
+    clean_prefix = re.sub(r"[^A-Za-z]", "", prefix).upper()
+    if clean_prefix.startswith("INSTRUCTION"):
+        clean_prefix = "INST"
+    return f"{clean_prefix}-{number.upper()}"
+
+
+def _normalize_document_reference(value: str) -> str:
+    return "".join(re.findall(r"[a-z0-9]+", value.casefold()))
+
+
+def _strip_chunk_context(value: str) -> str:
+    return _CONTEXT_BLOCK_RE.sub("", value).strip()
 
 
 def find_abbreviation_hints(
