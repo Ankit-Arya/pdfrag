@@ -3,6 +3,8 @@ FROM python:3.12-slim AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_COMPILE=1 \
     SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
     REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \
     CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
@@ -27,15 +29,24 @@ WORKDIR /app
 
 COPY requirements.txt .
 
-# Install the CPU wheel first so sentence-transformers does not pull the much
-# larger CUDA/NVIDIA dependency set. The cache mount survives layer rebuilds,
-# while this layer itself remains reusable whenever requirements.txt is unchanged.
+# Install the CPU-only PyTorch wheel separately. Do not upgrade pip here: the
+# Python base image already ships a compatible pip, and keeping the installer
+# unchanged removes one variable from large-wheel installation failures.
+# --no-cache-dir also avoids reusing a potentially bad BuildKit/pip wheel cache.
+# --no-compile reduces temporary CPU/memory/disk pressure while unpacking torch.
 ARG TORCH_VERSION=2.7.1
 ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
-RUN --mount=type=cache,id=pdfrag-pip,target=/root/.cache/pip \
-    pip install --upgrade pip \
-    && pip install "torch==${TORCH_VERSION}" --index-url "${TORCH_INDEX_URL}" \
-    && pip install -r requirements.txt
+RUN python -m pip install \
+        --no-cache-dir \
+        --no-compile \
+        "torch==${TORCH_VERSION}" \
+        --index-url "${TORCH_INDEX_URL}" \
+    && python -c "import torch; print('PyTorch OK:', torch.__version__)"
+
+# Keep a cache for the smaller normal application dependencies. sentence-transformers
+# sees the already-installed CPU torch wheel and does not need to replace it.
+RUN --mount=type=cache,id=pdfrag-pip-app,target=/root/.cache/pip \
+    python -m pip install --no-compile -r requirements.txt
 
 RUN tesseract --version \
     && tesseract --list-langs | grep -qx eng \
