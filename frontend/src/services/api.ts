@@ -31,6 +31,12 @@ export interface DocumentRecord {
   created_at: string
 }
 
+export interface DocumentBatchResponse {
+  queued_document_ids: string[]
+  already_processing: number
+  missing: number
+}
+
 export interface KnowledgeStatus {
   ready_documents: number
   total_chunks: number
@@ -303,6 +309,16 @@ export async function processDocument(documentId: string): Promise<DocumentRecor
     `/api/admin/documents/${encodeURIComponent(documentId)}/process`,
     { method: 'POST' },
   )
+}
+
+export async function processDocuments(
+  documentIds: string[],
+): Promise<DocumentBatchResponse> {
+  return apiRequest<DocumentBatchResponse>('/api/admin/documents/process-batch', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ document_ids: documentIds }),
+  })
 }
 
 export async function deleteDocument(documentId: string): Promise<void> {

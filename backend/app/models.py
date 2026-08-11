@@ -70,6 +70,21 @@ class DocumentOut(BaseModel):
     created_at: datetime
 
 
+class DocumentBatchRequest(BaseModel):
+    document_ids: list[uuid.UUID] = Field(min_length=1, max_length=500)
+
+    @field_validator("document_ids")
+    @classmethod
+    def deduplicate_document_ids(cls, value: list[uuid.UUID]) -> list[uuid.UUID]:
+        return list(dict.fromkeys(value))
+
+
+class DocumentBatchResponse(BaseModel):
+    queued_document_ids: list[uuid.UUID] = Field(default_factory=list)
+    already_processing: int = 0
+    missing: int = 0
+
+
 class KnowledgeStatus(BaseModel):
     ready_documents: int
     total_chunks: int

@@ -92,7 +92,9 @@ class Document(Base):
         String(100), default="application/pdf"
     )
     size_bytes: Mapped[int] = mapped_column(Integer)
-    content: Mapped[bytes] = mapped_column(LargeBinary)
+    # PDF bytes can be tens of MB. Most document/status queries never need the
+    # payload, so defer it until processing or download explicitly accesses it.
+    content: Mapped[bytes] = mapped_column(LargeBinary, deferred=True)
     status: Mapped[DocumentStatus] = mapped_column(
         Enum(DocumentStatus), default=DocumentStatus.uploaded, index=True
     )

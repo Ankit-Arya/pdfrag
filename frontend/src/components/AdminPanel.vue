@@ -13,6 +13,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   upload: [files: File[]]
   process: [documentId: string]
+  processBatch: [documentIds: string[]]
   deleteDocument: [documentId: string]
   createUser: [email: string, password: string, role: 'admin' | 'user']
   setUserActive: [userId: string, active: boolean]
@@ -30,6 +31,12 @@ const role = ref<'admin' | 'user'>('user')
 
 const totalUploadSize = computed(() =>
   selectedFiles.value.reduce((total, file) => total + file.size, 0),
+)
+
+const reprocessableDocumentIds = computed(() =>
+  props.documents
+    .filter((document) => document.status !== 'processing')
+    .map((document) => document.id),
 )
 
 function formatBytes(bytes: number): string {
@@ -246,6 +253,13 @@ function submitUser(): void {
               <span class="eyebrow">Persistent documents</span>
               <h2>{{ documents.length }} uploaded PDF{{ documents.length === 1 ? '' : 's' }}</h2>
             </div>
+            <button
+              class="ghost-action compact"
+              :disabled="busy || !reprocessableDocumentIds.length"
+              @click="emit('processBatch', reprocessableDocumentIds)"
+            >
+              Reprocess all
+            </button>
           </div>
           <p v-if="!documents.length" class="empty-table">No documents have been uploaded.</p>
           <div v-else class="data-list">

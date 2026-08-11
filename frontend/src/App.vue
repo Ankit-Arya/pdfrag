@@ -22,7 +22,7 @@ import {
   listUsers,
   login,
   logout,
-  processDocument,
+  processDocuments,
   revokeAuthSession,
   setUserActive,
   uploadDocument,
@@ -63,6 +63,9 @@ const messages = ref<Message[]>([])
 const question = ref('')
 const error = ref('')
 let controller: AbortController | null = null
+
+const DOCUMENT_POLL_INTERVAL_MS = 1500
+const DOCUMENT_POLL_TIMEOUT_MS = 30 * 60 * 1000
 
 
 function id(): string {
@@ -131,6 +134,53 @@ function resetLocalSession(): void {
   messages.value = []
   question.value = ''
   view.value = 'chat'
+}
+
+function errorMessage(cause: unknown, fallback: string): string {
+  return cause instanceof Error ? cause.message : fallback
+}
+
+function sleep(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, milliseconds))
+}
+
+async function waitForDocumentProcessing(documentIds: string[]): Promise<DocumentRecord[]> {
+  const trackedIds = new Set(documentIds)
+  const started = Date.now()
+
+  while (true) {
+    const latest = await listDocuments()
+    documents.value = latest
+    const tracked = latest.filter((document) => trackedIds.has(document.id))
+    const stillProcessing = tracked.some((document) => document.status === 'processing')
+
+    if (!stillProcessing) {
+      knowledge.value = await getKnowledgeStatus()
+      return tracked
+    }
+
+    if (Date.now() - started >= DOCUMENT_POLL_TIMEOUT_MS) {
+      throw new Error(
+        'Document processing is still running in the background. You can refresh this page later.',
+      )
+    }
+    await sleep(DOCUMENT_POLL_INTERVAL_MS)
+  }
+}
+
+async function queueDocumentBatch(documentIds: string[]): Promise<DocumentRecord[]> {
+  const uniqueIds = [...new Set(documentIds)]
+  if (!uniqueIds.length) return []
+  await processDocuments(uniqueIds)
+  return waitForDocumentProcessing(uniqueIds)
+}
+
+function failedBatchMessage(records: DocumentRecord[]): string | null {
+  const failed = records.filter((document) => document.status === 'failed')
+  if (!failed.length) return null
+  const names = failed.slice(0, 4).map((document) => document.filename).join(', ')
+  const suffix = failed.length > 4 ? ` and ${failed.length - 4} more` : ''
+  return `${failed.length} document(s) failed processing: ${names}${suffix}`
 }
 
 async function loadCommonData(): Promise<void> {
@@ -300,12 +350,33 @@ function cancel(): void {
 async function uploadFiles(files: File[]): Promise<void> {
   operationBusy.value = true
   error.value = ''
+  const uploaded: DocumentRecord[] = []
+  const failures: string[] = []
+
   try {
-    for (const file of files) await uploadDocument(file, true)
-    await Promise.all([loadAdminData(), loadCommonData()])
-  } catch (cause) {
+    // Stage every file first. A processing failure can no longer prevent later
+    // PDFs from being safely stored and queued.
+    for (const file of files) {
+      try {
+        const document = await uploadDocument(file, false)
+        uploaded.push(document)
+      } catch (cause) {
+        failures.push(`${file.name}: ${errorMessage(cause, 'upload failed')}`)
+      }
+    }
+
+    if (uploaded.length) {
+      try {
+        const processed = await queueDocumentBatch(uploaded.map((document) => document.id))
+        const batchFailure = failedBatchMessage(processed)
+        if (batchFailure) failures.push(batchFailure)
+      } catch (cause) {
+        failures.push(errorMessage(cause, 'Document processing failed.'))
+      }
+    }
+
     await Promise.allSettled([loadAdminData(), loadCommonData()])
-    showError(cause, 'Document upload failed.')
+    if (failures.length) error.value = failures.join(' | ')
   } finally {
     operationBusy.value = false
   }
@@ -315,10 +386,33 @@ async function reprocess(documentId: string): Promise<void> {
   operationBusy.value = true
   error.value = ''
   try {
-    await processDocument(documentId)
-    await Promise.all([loadAdminData(), loadCommonData()])
+    const processed = await queueDocumentBatch([documentId])
+    await Promise.allSettled([loadAdminData(), loadCommonData()])
+    const batchFailure = failedBatchMessage(processed)
+    if (batchFailure) error.value = batchFailure
   } catch (cause) {
+    await Promise.allSettled([loadAdminData(), loadCommonData()])
     showError(cause, 'Document processing failed.')
+  } finally {
+    operationBusy.value = false
+  }
+}
+
+async function reprocessBatch(documentIds: string[]): Promise<void> {
+  const uniqueIds = [...new Set(documentIds)]
+  if (!uniqueIds.length) return
+  if (!window.confirm(`Reprocess ${uniqueIds.length} document(s)?`)) return
+
+  operationBusy.value = true
+  error.value = ''
+  try {
+    const processed = await queueDocumentBatch(uniqueIds)
+    await Promise.allSettled([loadAdminData(), loadCommonData()])
+    const batchFailure = failedBatchMessage(processed)
+    if (batchFailure) error.value = batchFailure
+  } catch (cause) {
+    await Promise.allSettled([loadAdminData(), loadCommonData()])
+    showError(cause, 'Document batch processing failed.')
   } finally {
     operationBusy.value = false
   }
@@ -456,6 +550,7 @@ onMounted(() => {
       :current-user-id="user.id"
       @upload="uploadFiles"
       @process="reprocess"
+      @process-batch="reprocessBatch"
       @delete-document="removeDocument"
       @create-user="addUser"
       @set-user-active="toggleUser"

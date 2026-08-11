@@ -12,6 +12,7 @@ from app.api import router
 from app.auth.router import bootstrap_admin, router as auth_router
 from app.config import get_settings
 from app.db import SessionLocal, initialize_database
+from app.document_processing import recover_interrupted_processing
 from app.rag.embeddings import embedding_service
 
 settings = get_settings()
@@ -27,6 +28,8 @@ async def lifespan(_: FastAPI):
     initialize_database()
     with SessionLocal() as db:
         bootstrap_admin(db)
+
+    recover_interrupted_processing()
 
     logger.info("Loading embedding model: %s", settings.embedding_model)
     embedding_ready = embedding_service.warmup()

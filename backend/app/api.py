@@ -5,6 +5,7 @@ from urllib.parse import quote
 
 from fastapi import (
     APIRouter,
+    BackgroundTasks,
     Depends,
     File,
     HTTPException,
@@ -15,7 +16,7 @@ from fastapi import (
 )
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.audit import add_audit_event
@@ -32,6 +33,7 @@ from app.db_models import (
     User,
     UserRole,
 )
+from app.document_processing import process_document_ids
 from app.models import (
     AdminUserCreate,
     AdminUserOut,
@@ -41,6 +43,8 @@ from app.models import (
     ChatDetail,
     ChatMessageOut,
     ChatSessionOut,
+    DocumentBatchRequest,
+    DocumentBatchResponse,
     DocumentOut,
     HealthResponse,
     KnowledgeStatus,
@@ -143,6 +147,52 @@ def _record_chat_failure(
     db.commit()
 
 
+def _queue_documents(
+    db: Session,
+    background_tasks: BackgroundTasks,
+    document_ids: list[uuid.UUID],
+) -> DocumentBatchResponse:
+    unique_ids = list(dict.fromkeys(document_ids))
+    if not unique_ids:
+        return DocumentBatchResponse(
+            queued_document_ids=[],
+            already_processing=0,
+            missing=0,
+        )
+
+    known_ids = set(
+        db.scalars(select(Document.id).where(Document.id.in_(unique_ids))).all()
+    )
+    missing = sum(1 for document_id in unique_ids if document_id not in known_ids)
+
+    # Claim rows atomically. Concurrent queue requests cannot schedule the same
+    # document twice because PostgreSQL re-checks the status predicate after any
+    # row-lock wait before UPDATE ... RETURNING succeeds.
+    claimed = set(
+        db.scalars(
+            update(Document)
+            .where(
+                Document.id.in_(known_ids),
+                Document.status != DocumentStatus.processing,
+            )
+            .values(status=DocumentStatus.processing, error=None)
+            .returning(Document.id)
+        ).all()
+    )
+    db.commit()
+
+    queued_ids = [document_id for document_id in unique_ids if document_id in claimed]
+    already_processing = len(known_ids) - len(claimed)
+    if queued_ids:
+        background_tasks.add_task(process_document_ids, queued_ids)
+
+    return DocumentBatchResponse(
+        queued_document_ids=queued_ids,
+        already_processing=already_processing,
+        missing=missing,
+    )
+
+
 @router.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
     settings = get_settings()
@@ -203,6 +253,7 @@ def download_document(
 
 @router.post("/admin/documents", response_model=DocumentOut, status_code=201)
 async def upload_document(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     process: bool = True,
     db: Session = Depends(get_db),
@@ -229,14 +280,9 @@ async def upload_document(
     db.refresh(document)
 
     if process:
-        try:
-            await run_in_threadpool(rag_service.process_document, db, document)
-        except EmbeddingUnavailableError as exc:
-            raise HTTPException(503, str(exc)) from exc
-        except Exception as exc:
-            raise HTTPException(422, str(exc)) from exc
+        _queue_documents(db, background_tasks, [document.id])
+        db.refresh(document)
 
-    db.refresh(document)
     return _document_out(document)
 
 
@@ -249,19 +295,35 @@ def documents(
     return [_document_out(document) for document in rows]
 
 
-@router.post("/admin/documents/{document_id}/process", response_model=DocumentOut)
-async def process_document(
+@router.post(
+    "/admin/documents/process-batch",
+    response_model=DocumentBatchResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def process_documents_batch(
+    payload: DocumentBatchRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    _: User = Depends(admin_user),
+) -> DocumentBatchResponse:
+    return _queue_documents(db, background_tasks, payload.document_ids)
+
+
+@router.post(
+    "/admin/documents/{document_id}/process",
+    response_model=DocumentOut,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def process_document(
     document_id: uuid.UUID,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     _: User = Depends(admin_user),
 ) -> DocumentOut:
     document = db.get(Document, document_id)
     if not document:
         raise HTTPException(404, "Document not found")
-    try:
-        await run_in_threadpool(rag_service.process_document, db, document)
-    except EmbeddingUnavailableError as exc:
-        raise HTTPException(503, str(exc)) from exc
+    _queue_documents(db, background_tasks, [document_id])
     db.refresh(document)
     return _document_out(document)
 

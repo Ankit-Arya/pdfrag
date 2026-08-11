@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from datetime import UTC, datetime
 
 from sqlalchemy import delete
@@ -10,11 +11,11 @@ from app.config import get_settings
 from app.db_models import Document, DocumentChunk, DocumentStatus
 from app.models import AnswerResponse, SourceResult
 from app.rag.chunking import chunk_pages
-from app.rag.embeddings import embedding_service
+from app.rag.embeddings import EmbeddingUnavailableError, embedding_service
 from app.rag.evidence import build_evidence_answer
 from app.rag.guardrails import cited_source_numbers, validate_grounded_answer
 from app.rag.llm import llm_service
-from app.rag.pdf import extract_pdf_pages
+from app.rag.pdf import PdfProcessingError, extract_pdf_pages
 from app.rag.postgres_store import fetch_neighbor_chunks, search_chunks
 from app.rag.prompts import NO_ANSWER, build_citation_repair_prompt, build_user_prompt
 from app.rag.query import query_planner
@@ -25,7 +26,17 @@ logger = logging.getLogger(__name__)
 
 
 class RagService:
+    def __init__(self) -> None:
+        # PDF parsing, OCR and transformer inference are the memory-heavy path.
+        # Keep ingestion serialized in this single-worker deployment so multiple
+        # admins/batches cannot multiply peak memory usage.
+        self._processing_lock = threading.Lock()
+
     def process_document(self, db: Session, document: Document) -> Document:
+        with self._processing_lock:
+            return self._process_document_locked(db, document)
+
+    def _process_document_locked(self, db: Session, document: Document) -> Document:
         settings = get_settings()
         document.status = DocumentStatus.processing
         document.error = None
@@ -46,19 +57,30 @@ class RagService:
                     "Increase the limit or split the PDF."
                 )
 
-            vectors = embedding_service.encode([chunk.text for chunk in chunks])
+            # Keep replacement atomic, but avoid retaining embeddings and thousands
+            # of Python float lists for the whole document at once. Flush small
+            # batches into PostgreSQL while the transaction remains open.
             db.execute(delete(DocumentChunk).where(DocumentChunk.document_id == document.id))
-            for index, (chunk, vector) in enumerate(zip(chunks, vectors, strict=True)):
-                db.add(
+            embedding_batch_size = 64
+            for start in range(0, len(chunks), embedding_batch_size):
+                batch_chunks = chunks[start : start + embedding_batch_size]
+                vectors = embedding_service.encode([chunk.text for chunk in batch_chunks])
+                rows = [
                     DocumentChunk(
                         document_id=document.id,
-                        chunk_index=index,
+                        chunk_index=start + offset,
                         page_number=chunk.page_number,
                         content_type=chunk.content_type,
                         text=chunk.text,
                         embedding=vector.tolist(),
                     )
-                )
+                    for offset, (chunk, vector) in enumerate(
+                        zip(batch_chunks, vectors, strict=True)
+                    )
+                ]
+                db.add_all(rows)
+                db.flush()
+                del rows, vectors
 
             document.page_count = result.total_pages
             document.chunk_count = len(chunks)
@@ -68,12 +90,15 @@ class RagService:
             db.commit()
             db.refresh(document)
             return document
-        except Exception:
+        except Exception as exc:
             db.rollback()
             refreshed = db.get(Document, document.id)
             if refreshed:
                 refreshed.status = DocumentStatus.failed
-                refreshed.error = "Document processing failed. Check server logs for details."
+                if isinstance(exc, (PdfProcessingError, EmbeddingUnavailableError, ValueError)):
+                    refreshed.error = str(exc)[:4000]
+                else:
+                    refreshed.error = "Document processing failed. Check server logs for details."
                 db.commit()
             logger.exception("Document processing failed for %s", document.filename)
             raise

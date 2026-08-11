@@ -61,7 +61,7 @@ class Settings(BaseSettings):
     ocr_min_native_consensus: float = Field(default=0.42, ge=0, le=1)
     ocr_rotated_text_threshold: float = Field(default=0.08, ge=0, le=1)
     ocr_corruption_threshold: float = Field(default=0.12, ge=0, le=1)
-    ocr_verify_all_pages: bool = True
+    ocr_verify_all_pages: bool = False
     ocr_verify_dpi: int = Field(default=180, ge=120, le=300)
     ocr_verify_min_novel_terms: int = Field(default=10, ge=3, le=100)
     ocr_verify_novelty_threshold: float = Field(default=0.20, ge=0.05, le=0.8)
