@@ -69,16 +69,29 @@ _INTENT_CUES = {
     "procedure": {
         "action",
         "after",
+        "announce",
+        "assist",
         "authorization",
         "before",
         "check",
+        "confirm",
         "ensure",
+        "hand",
+        "hold",
+        "inform",
         "instruction",
         "isolate",
         "permission",
         "procedure",
+        "regulate",
+        "remove",
+        "report",
         "reset",
+        "restore",
+        "resume",
         "step",
+        "stop",
+        "suspend",
         "verify",
         "warning",
     },
@@ -135,6 +148,8 @@ def select_context_chunks(
     plan: QueryPlan,
     candidates: list[RetrievedChunk],
     max_chunks: int | None = None,
+    *,
+    preferred_document_ids: set[str] | None = None,
 ) -> list[RetrievedChunk]:
     """Keep all materially relevant evidence instead of treating top-K as truth."""
     if not candidates:
@@ -142,8 +157,9 @@ def select_context_chunks(
 
     focus_terms = _focus_terms(plan)
     anchor_groups = _anchor_groups(plan)
+    preferred_ids = preferred_document_ids or set()
     scored = [
-        _score_candidate(plan, candidate, focus_terms, anchor_groups)
+        _score_candidate(plan, candidate, focus_terms, anchor_groups, preferred_ids)
         for candidate in candidates
     ]
     scored.sort(key=_scored_sort_key)
@@ -169,7 +185,13 @@ def select_context_chunks(
         cutoff = max(0.10, best * 0.32)
         eligible = []
         for item in scored:
-            has_focus = item.coverage >= 0.25 or item.section_match >= 0.82 or not focus_terms
+            preferred = _is_preferred(item.result.chunk, preferred_ids)
+            has_focus = (
+                item.coverage >= 0.25
+                or item.section_match >= 0.82
+                or not focus_terms
+                or (preferred and plan.intent == "procedure" and item.intent_evidence >= 0.05)
+            )
             required_anchor_coverage = (
                 1.0 / len(anchor_groups)
                 if anchor_groups and plan.intent == "comparison"
@@ -177,7 +199,7 @@ def select_context_chunks(
             )
             has_anchor = item.anchor_coverage >= required_anchor_coverage or not anchor_groups
             has_intent = item.intent_evidence >= 0.08
-            constraint_ok = item.section_match >= 0.82 or (
+            constraint_ok = preferred or item.section_match >= 0.82 or (
                 has_anchor if anchor_groups else (has_focus or has_intent)
             )
             if item.relevance >= cutoff and has_focus and constraint_ok:
@@ -191,7 +213,12 @@ def select_context_chunks(
             return []
 
     limit = _selection_limit(plan, max_chunks)
-    selected = _strong_then_diverse_selection(eligible, limit)
+    selected = _preferred_then_diverse_selection(
+        eligible,
+        limit,
+        preferred_ids,
+        plan.intent,
+    )
 
     # Pull same-section / adjacent continuations into remaining capacity. A
     # continuation may omit the acronym but contain the next procedural steps.
@@ -223,6 +250,7 @@ def _score_candidate(
     result: RetrievedChunk,
     focus_terms: set[str],
     anchor_groups: list[set[str]],
+    preferred_document_ids: set[str],
 ) -> _ScoredChunk:
     chunk = result.chunk
     text_terms = _tokens(chunk.text)
@@ -240,7 +268,8 @@ def _score_candidate(
     )
 
     cues = _INTENT_CUES.get(plan.intent, set())
-    intent_evidence = _coverage(cues, text_terms)
+    intent_matches = len(cues & text_terms)
+    intent_evidence = min(1.0, intent_matches / 3.0) if cues else 0.0
     if plan.intent == "fact_lookup":
         intent_evidence = min(1.0, coverage)
 
@@ -253,6 +282,10 @@ def _score_candidate(
         + anchor_coverage * 0.10
         + structural_match * 0.24
     )
+    if _is_preferred(chunk, preferred_document_ids):
+        relevance += 0.16
+    if _is_low_information_excerpt(chunk.text):
+        relevance *= 0.12
 
     if focus_terms and coverage < 0.12:
         relevance *= 0.55
@@ -301,6 +334,64 @@ def _selection_limit(plan: QueryPlan, requested: int | None) -> int:
     if requested is None:
         return configured
     return min(configured, max(1, requested))
+
+
+
+def _preferred_then_diverse_selection(
+    eligible: list[_ScoredChunk],
+    limit: int,
+    preferred_document_ids: set[str],
+    intent: str,
+) -> list[_ScoredChunk]:
+    if not preferred_document_ids or intent != "procedure":
+        return _strong_then_diverse_selection(eligible, limit)
+
+    settings = get_settings()
+    preferred = [item for item in eligible if _is_preferred(item.result.chunk, preferred_document_ids)]
+    other = [item for item in eligible if not _is_preferred(item.result.chunk, preferred_document_ids)]
+    selected = preferred[:limit]
+    selected_ids = {item.result.chunk.chunk_id for item in selected}
+    remaining = max(0, limit - len(selected))
+    supplement_limit = min(remaining, settings.primary_document_supplement_limit)
+    if supplement_limit:
+        strong_other = [
+            item for item in other
+            if item.coverage >= 0.45 or item.anchor_coverage > 0 or item.section_match >= 0.82
+        ]
+        for item in strong_other[:supplement_limit]:
+            if item.result.chunk.chunk_id not in selected_ids:
+                selected.append(item)
+                selected_ids.add(item.result.chunk.chunk_id)
+    selected.sort(key=_scored_sort_key)
+    return selected[:limit]
+
+
+def _is_preferred(chunk: TextChunk, preferred_document_ids: set[str]) -> bool:
+    return bool(chunk.document_id and chunk.document_id in preferred_document_ids)
+
+
+def _is_low_information_excerpt(value: str) -> bool:
+    body = re.sub(
+        r"\[PDF CHUNK CONTEXT\].*?\[/PDF CHUNK CONTEXT\]",
+        "",
+        value,
+        flags=re.IGNORECASE | re.DOTALL,
+    ).strip()
+    if not body:
+        return True
+    alnum = re.sub(r"[^A-Za-z0-9]+", "", body)
+    if len(alnum) < 18:
+        return True
+    lines = [line.strip() for line in body.splitlines() if line.strip()]
+    if len(lines) >= 2 and "|" in lines[0] and re.search(r"-{3,}", lines[1]):
+        cells = [
+            cell.strip(" *_`|")
+            for line in lines[2:]
+            for cell in line.split("|")
+        ]
+        if cells and not any(re.search(r"[A-Za-z0-9]", cell) for cell in cells):
+            return True
+    return False
 
 
 def _strong_then_diverse_selection(

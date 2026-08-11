@@ -126,6 +126,22 @@ _FACT_DIMENSION_CUES = {
     "weight",
 }
 
+_PROCEDURE_PHRASE_STARTS = (
+    "what to do",
+    "what should i do",
+    "what should we do",
+    "what shall i do",
+    "what action",
+    "what actions",
+    "actions to take",
+    "action to take",
+    "steps to take",
+    "how to ",
+    "how do ",
+    "how should ",
+    "how can ",
+)
+
 _FOLLOWUP_STARTS = (
     "and ",
     "also ",
@@ -480,8 +496,13 @@ def _validate_plan(
         query
         for query in model_queries
         if query
-        and _context_is_safe(query, allowed_terms, original, allow_search_words=True)
-        and _contains_protected_tokens(query, protected)
+        and _search_query_is_safe(
+            query,
+            allowed_terms,
+            original,
+            protected,
+            max_new_terms=5,
+        )
     ]
 
     deterministic = _deterministic_queries(
@@ -617,8 +638,16 @@ def _infer_search_mode(original: str, contextual: str) -> str:
 
 
 def _infer_intent(value: str) -> str:
-    lowered = value.casefold()
+    lowered = value.casefold().strip()
     terms = {token.casefold() for token in _TERM_PATTERN.findall(value)}
+    if lowered.startswith(_PROCEDURE_PHRASE_STARTS):
+        return "procedure"
+    if (
+        lowered.startswith("what ")
+        and {"do", "action", "actions", "steps"} & terms
+        and ("if" in terms or "when" in terms)
+    ):
+        return "procedure"
     if {"compare", "comparison", "difference", "differences", "versus", "vs"} & terms:
         return "comparison"
     if {"troubleshoot", "troubleshooting", "fault", "failure", "error", "alarm"} & terms:
@@ -799,6 +828,41 @@ def _context_is_safe(
             "steps",
         }
     return all(term in allowed_terms or term in _FOCUS_STOPWORDS for term in terms)
+
+
+def _search_query_is_safe(
+    value: str,
+    allowed_terms: set[str],
+    original: str,
+    protected: list[str],
+    *,
+    max_new_terms: int,
+) -> bool:
+    """Allow a few semantic synonym terms in retrieval-only queries.
+
+    Contextual questions remain strict and cannot invent facts/identifiers. Search
+    queries may add ordinary words such as ``train`` to ``pilot speed`` or ``person``
+    to ``someone``. New numeric/internal identifiers are still forbidden and every
+    protected code from the user's text must remain present.
+    """
+    if not value or len(value) > max(900, len(original) * 7):
+        return False
+    if not _contains_protected_tokens(value, protected):
+        return False
+
+    new_plain: set[str] = set()
+    for token in _TERM_PATTERN.findall(value):
+        lowered = token.casefold()
+        if lowered in allowed_terms or lowered in _FOCUS_STOPWORDS:
+            continue
+        if any(char.isdigit() for char in token):
+            return False
+        if token.upper() == token and len(token) >= 2:
+            return False
+        if not token.isalpha() or len(token) < 3:
+            return False
+        new_plain.add(lowered)
+    return len(new_plain) <= max_new_terms
 
 
 def _terms_subset(value: str, allowed_terms: set[str]) -> bool:

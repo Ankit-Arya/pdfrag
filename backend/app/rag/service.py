@@ -13,23 +13,29 @@ from app.models import AnswerResponse, SourceResult
 from app.rag.chunking import chunk_pages
 from app.rag.embeddings import EmbeddingUnavailableError, embedding_service
 from app.rag.evidence import build_evidence_answer
-from app.rag.evidence_format import clean_display_excerpt, format_prompt_sources_markdown
+from app.rag.evidence_format import clean_display_excerpt, display_metadata, format_prompt_sources_markdown
 from app.rag.guardrails import cited_source_numbers, validate_grounded_answer
 from app.rag.pdf import PdfProcessingError, extract_pdf_pages
 from app.rag.postgres_store import (
     discover_document_references,
     fetch_neighbor_chunks,
+    fetch_primary_document_chunks,
     fetch_referenced_document_chunks,
     find_abbreviation_hints,
+    find_primary_documents,
     scan_matching_chunks,
     search_chunks,
+    search_stemmed_chunks,
 )
 from app.rag.prompts import NO_ANSWER
 from app.rag.query import needs_conversation_context, query_planner
 from app.rag.relevance import select_context_chunks
 from app.rag.synthesis import (
+    looks_like_negative_answer,
+    procedure_answer_needs_repair,
     repair_direct_answer,
     repair_hierarchical_answer,
+    repair_procedure_answer,
     rescue_fact_answer,
     synthesize_answer,
 )
@@ -155,6 +161,14 @@ class RagService:
             routing_hints=routing_hints,
         )
 
+        primary_routes = find_primary_documents(
+            db,
+            plan.contextual_question or plan.original_question,
+            max_documents=settings.primary_document_max_documents,
+        )
+        primary_document_ids = {route.document_id for route in primary_routes}
+        primary_document_names = [route.filename for route in primary_routes]
+
         context_limit = (
             settings.reference_evidence_chunk_limit
             if plan.search_mode == "references"
@@ -173,6 +187,8 @@ class RagService:
         for query, vector in zip(plan.search_queries, vectors, strict=True):
             for item in search_chunks(db, vector.tolist(), query, semantic_limit):
                 _merge_candidate(merged, item)
+            for item in search_stemmed_chunks(db, query, semantic_limit):
+                _merge_candidate(merged, item)
 
         corpus_queries = _unique(
             [
@@ -190,6 +206,15 @@ class RagService:
             limit=settings.corpus_scan_max_chunks,
         ):
             _merge_candidate(merged, item)
+
+        if plan.search_mode == "answer" and primary_routes:
+            for item in fetch_primary_document_chunks(
+                db,
+                primary_routes,
+                corpus_queries,
+                chunks_per_document=settings.primary_document_chunks_per_document,
+            ):
+                _merge_candidate(merged, item)
 
         # Index/catalog/cross-reference rows are routing evidence, not the end of
         # retrieval. If a relevant row identifies SC-06 (or another procedure),
@@ -222,7 +247,9 @@ class RagService:
         if not candidates:
             return self._empty_answer(plan, abbreviation_hints, candidate_chunks=0)
 
-        relevant = self._select_context_chunks(plan, candidates, context_limit)
+        relevant = self._select_context_chunks(
+            plan, candidates, context_limit, preferred_document_ids=primary_document_ids
+        )
         if not relevant:
             return self._empty_answer(
                 plan,
@@ -238,8 +265,19 @@ class RagService:
                 candidate_chunks=len(candidates),
             )
 
-        expanded = self._expand_context(db, plan, relevant, context_limit)
-        bundle = synthesize_answer(plan, expanded)
+        expanded = self._expand_context(
+            db,
+            plan,
+            relevant,
+            context_limit,
+            preferred_document_ids=primary_document_ids,
+        )
+        bundle = synthesize_answer(
+            plan,
+            expanded,
+            primary_document_ids=primary_document_ids,
+            primary_document_names=primary_document_names,
+        )
         answer, grounded = validate_grounded_answer(bundle.raw_answer, len(bundle.sources))
         grounding_status = "verified" if grounded else "citation_validation_failed"
 
@@ -247,7 +285,7 @@ class RagService:
         # "not found" merely because the broad evidence set is large. The normal
         # pass already reviewed every selected chunk; this targeted retry exposes
         # the strongest original excerpts while preserving the same S-number map.
-        if answer == NO_ANSWER and plan.intent in {"fact_lookup", "definition"}:
+        if (answer == NO_ANSWER or looks_like_negative_answer(answer)) and plan.intent in {"fact_lookup", "definition"}:
             rescued_raw = rescue_fact_answer(plan, bundle.sources)
             rescued_answer, rescued_grounded = validate_grounded_answer(
                 rescued_raw, len(bundle.sources)
@@ -290,6 +328,28 @@ class RagService:
                         "verified_after_repair" if grounded else "citation_validation_failed"
                     )
 
+        if (
+            plan.intent == "procedure"
+            and primary_document_ids
+            and answer != NO_ANSWER
+            and procedure_answer_needs_repair(answer, bundle.sources, primary_document_ids)
+        ):
+            procedure_raw = repair_procedure_answer(
+                plan,
+                answer,
+                bundle.sources,
+                primary_document_ids,
+            )
+            procedure_answer, procedure_grounded = validate_grounded_answer(
+                procedure_raw, len(bundle.sources)
+            )
+            if procedure_answer != NO_ANSWER:
+                answer = procedure_answer
+                grounded = procedure_grounded
+                grounding_status = (
+                    "verified_after_repair" if grounded else "citation_validation_failed"
+                )
+
         used_source_numbers = set(cited_source_numbers(answer, len(bundle.sources)))
         sources = _source_results(answer, bundle.sources)
         evidence = _evidence_results(bundle.sources)
@@ -308,6 +368,7 @@ class RagService:
             retrieval_mode=plan.search_mode,
             resolved_abbreviations=abbreviation_hints,
             routing_hints=active_references,
+            primary_documents=primary_document_names,
             candidate_chunks=len(candidates),
             evidence_chunks=len(bundle.sources),
             search_queries=plan.search_queries,
@@ -387,6 +448,8 @@ class RagService:
         plan: QueryPlan,
         relevant: list[RetrievedChunk],
         requested_limit: int,
+        *,
+        preferred_document_ids: set[str] | None = None,
     ) -> list[RetrievedChunk]:
         settings = get_settings()
         seeds = relevant[: min(len(relevant), settings.neighbor_seed_limit)]
@@ -399,6 +462,7 @@ class RagService:
             plan,
             list(merged.values()),
             requested_limit,
+            preferred_document_ids=preferred_document_ids,
         )
         return selected or relevant
 
@@ -407,8 +471,15 @@ class RagService:
         plan: QueryPlan,
         candidates: list[RetrievedChunk],
         max_chunks: int | None = None,
+        *,
+        preferred_document_ids: set[str] | None = None,
     ) -> list[RetrievedChunk]:
-        return select_context_chunks(plan, candidates, max_chunks=max_chunks)
+        return select_context_chunks(
+            plan,
+            candidates,
+            max_chunks=max_chunks,
+            preferred_document_ids=preferred_document_ids,
+        )
 
 
 def _focused_conversation_context(history: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -459,6 +530,8 @@ def _source_results(answer: str, context: list[PromptSource]) -> list[SourceResu
             excerpt=clean_display_excerpt(source.excerpt),
             content_type=source.result.chunk.content_type,
             retrieval_method=source.result.method,
+            pages=display_metadata(source.excerpt)[0],
+            section=display_metadata(source.excerpt)[1],
         )
         for index, source in enumerate(context, 1)
         if index in used_source_numbers
@@ -475,6 +548,8 @@ def _evidence_results(context: list[PromptSource]) -> list[SourceResult]:
             excerpt=clean_display_excerpt(source.excerpt),
             content_type=source.result.chunk.content_type,
             retrieval_method=source.result.method,
+            pages=display_metadata(source.excerpt)[0],
+            section=display_metadata(source.excerpt)[1],
         )
         for index, source in enumerate(context, 1)
     ]

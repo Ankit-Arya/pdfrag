@@ -12,6 +12,13 @@ _CONTEXT_BLOCK_RE = re.compile(
 _PAGES_RE = re.compile(r"^Pages:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
 _SECTION_RE = re.compile(r"^Section path:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
 
+
+def display_metadata(value: str) -> tuple[str, str]:
+    header, _body = _split_context(value)
+    pages = _metadata_value(_PAGES_RE, header)
+    section = _metadata_value(_SECTION_RE, header)
+    return pages, section
+
 def clean_display_excerpt(value: str) -> str:
     """Return the human-readable PDF excerpt without synthetic retrieval metadata.
 
@@ -23,6 +30,8 @@ def clean_display_excerpt(value: str) -> str:
     clean = (body or value).strip()
     # Be defensive about malformed/duplicated envelopes from older indexed chunks.
     clean = _CONTEXT_BLOCK_RE.sub("", clean).strip()
+    if _is_blank_markdown_table(clean):
+        return "Table extraction contains no readable cells on this excerpt; verify the cited PDF page."
     return clean
 
 
@@ -92,6 +101,21 @@ def _split_context(value: str) -> tuple[str, str]:
 def _metadata_value(pattern: re.Pattern[str], header: str) -> str:
     match = pattern.search(header)
     return match.group(1).strip() if match else ""
+
+
+
+def _is_blank_markdown_table(value: str) -> bool:
+    lines = [line.strip() for line in value.splitlines() if line.strip()]
+    if len(lines) < 2 or "|" not in lines[0]:
+        return False
+    if not re.match(r"^\|?(?:\s*:?-{3,}:?\s*\|)+", lines[1]):
+        return False
+    cells = [
+        cell.strip(" *_`|")
+        for line in [lines[0], *lines[2:]]
+        for cell in line.split("|")
+    ]
+    return not any(re.search(r"[A-Za-z0-9]", cell) for cell in cells)
 
 
 def _looks_like_markdown_table(value: str) -> bool:

@@ -58,6 +58,8 @@ export interface SourceResult {
   excerpt: string
   content_type: string
   retrieval_method: string
+  pages?: string
+  section?: string
 }
 
 export interface AnswerResponse {
@@ -82,6 +84,7 @@ export interface AnswerResponse {
   retrieval_mode?: 'answer' | 'references' | string
   resolved_abbreviations?: string[]
   routing_hints?: string[]
+  primary_documents?: string[]
   candidate_chunks?: number
   evidence_chunks?: number
   search_queries: string[]

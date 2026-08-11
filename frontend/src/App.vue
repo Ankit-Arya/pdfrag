@@ -130,6 +130,9 @@ function messageResponse(
     routing_hints: Array.isArray(metadata.routing_hints)
       ? (metadata.routing_hints as string[])
       : [],
+    primary_documents: Array.isArray(metadata.primary_documents)
+      ? (metadata.primary_documents as string[])
+      : [],
     candidate_chunks:
       typeof metadata.candidate_chunks === 'number' ? metadata.candidate_chunks : 0,
     evidence_chunks:

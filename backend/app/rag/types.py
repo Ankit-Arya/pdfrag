@@ -37,6 +37,14 @@ class RetrievedChunk:
 
 
 @dataclass(frozen=True, slots=True)
+class PrimaryDocumentMatch:
+    document_id: str
+    filename: str
+    score: float
+    reason: str = "title-subject"
+
+
+@dataclass(frozen=True, slots=True)
 class PromptSource:
     result: RetrievedChunk
     excerpt: str

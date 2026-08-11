@@ -2,19 +2,20 @@ from __future__ import annotations
 
 import re
 
+from rapidfuzz import fuzz
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.rag.normalization import canonical_phrase, search_terms
 from app.rag.structure import section_match_score, section_path_from_text
-from app.rag.types import RetrievedChunk, TextChunk
+from app.rag.types import PrimaryDocumentMatch, RetrievedChunk, TextChunk
 
 _TERM_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_/-]{1,}")
 _ABBREVIATION_TOKEN_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9/-]{1,7}\b")
 _CONTEXT_BLOCK_RE = re.compile(r"\[PDF CHUNK CONTEXT\].*?\[/PDF CHUNK CONTEXT\]", re.IGNORECASE | re.DOTALL)
 _DOCUMENT_REFERENCE_RE = re.compile(
-    r"\b(SC|SOP|JPO|INST(?:RUCTION)?|MRGR)\s*[-_ ]?\s*(\d{1,4}[A-Z]?)\b",
+    r"\b(SC|SM|SOP|JPO|INST(?:RUCTION)?|MRGR)\s*[-_ ]?\s*(\d{1,4}[A-Z]?)\b",
     re.IGNORECASE,
 )
 
@@ -196,6 +197,229 @@ def search_chunks(
     return _document_diverse_results(results, settings.max_retrieval_candidates)
 
 
+
+def search_stemmed_chunks(
+    db: Session,
+    query_text: str,
+    limit: int,
+) -> list[RetrievedChunk]:
+    """Complement exact/simple FTS with PostgreSQL English stemming.
+
+    The exact path remains authoritative for acronyms/codes. This path is only a
+    recall supplement for ordinary English morphology (obstruct/obstruction,
+    demonstrate/demonstration, etc.) and is re-ranked by the normal relevance layer.
+    """
+    settings = get_settings()
+    if not settings.stemmed_search_enabled:
+        return []
+    query_terms = _terms(query_text)
+    if not query_terms:
+        return []
+    max_rows = min(max(40, limit), settings.stemmed_search_max_chunks)
+    sql = text(
+        """
+        WITH q AS (SELECT to_tsquery('english', :any_query) AS tsq_any)
+        SELECT c.id, c.document_id, c.chunk_index, c.page_number, c.content_type,
+               c.text, d.filename,
+               ts_rank_cd(to_tsvector('english', c.text), q.tsq_any) AS keyword_score
+        FROM document_chunks c
+        JOIN documents d ON d.id = c.document_id
+        CROSS JOIN q
+        WHERE d.status = 'ready'
+          AND to_tsvector('english', c.text) @@ q.tsq_any
+        ORDER BY keyword_score DESC, lower(d.filename), c.page_number, c.chunk_index, c.id
+        LIMIT :max_rows
+        """
+    )
+    rows = db.execute(
+        sql,
+        {"any_query": _keyword_or_query_from_terms(query_terms), "max_rows": max_rows},
+    ).mappings()
+    results: list[RetrievedChunk] = []
+    for row in rows:
+        keyword_score = min(float(row["keyword_score"] or 0.0) * 5.0, 1.0)
+        lexical_score = _lexical_overlap(query_terms, str(row["text"]))
+        score = min(0.93, 0.36 + keyword_score * 0.38 + lexical_score * 0.20)
+        results.append(
+            _row_to_result(
+                row,
+                score=score,
+                method="english-fts",
+                vector_score=0.0,
+                keyword_score=keyword_score,
+            )
+        )
+    results.sort(key=_result_sort_key)
+    return _deduplicate_results(results, max_rows)
+
+
+def find_primary_documents(
+    db: Session,
+    question_text: str,
+    *,
+    max_documents: int | None = None,
+) -> list[PrimaryDocumentMatch]:
+    """Find dedicated SOP/instruction documents whose subject matches the question.
+
+    Filename/title matching is combined with the first two indexed chunks so generic
+    filenames can still route correctly. This is deliberately a *routing* signal;
+    answer facts continue to come from retrieved PDF chunks.
+    """
+    settings = get_settings()
+    if not settings.primary_document_routing_enabled:
+        return []
+    limit = max_documents or settings.primary_document_max_documents
+    query = _route_phrase(question_text)
+    query_terms = _route_terms(question_text)
+    if len(query_terms) < 2 or not query:
+        return []
+
+    rows = db.execute(
+        text(
+            """
+            SELECT d.id, d.filename,
+                   COALESCE((
+                     SELECT string_agg(x.text, E'\n' ORDER BY x.chunk_index)
+                     FROM (
+                       SELECT c.text, c.chunk_index
+                       FROM document_chunks c
+                       WHERE c.document_id = d.id
+                       ORDER BY c.chunk_index
+                       LIMIT 2
+                     ) x
+                   ), '') AS opening_text
+            FROM documents d
+            WHERE d.status = 'ready'
+            ORDER BY lower(d.filename), d.id
+            """
+        )
+    ).mappings()
+
+    matches: list[PrimaryDocumentMatch] = []
+    for row in rows:
+        filename = str(row["filename"])
+        if re.search(r"(?:index|catalog|master[ _-]*list)", filename, re.I):
+            continue
+        opening = _strip_chunk_context(str(row["opening_text"] or ""))[:2400]
+        filename_phrase = _route_phrase(filename)
+        opening_phrase = _route_phrase(opening)
+        filename_terms = _route_terms(filename)
+        opening_terms = _route_terms(opening)
+
+        file_shared = len(query_terms & filename_terms)
+        open_shared = len(query_terms & opening_terms)
+        file_coverage = file_shared / max(len(query_terms), 1)
+        open_coverage = open_shared / max(len(query_terms), 1)
+        file_fuzzy = max(
+            fuzz.WRatio(query, filename_phrase),
+            fuzz.token_set_ratio(query, filename_phrase),
+        ) / 100.0
+        opening_fuzzy = (
+            max(
+                fuzz.WRatio(query, opening_phrase),
+                fuzz.partial_ratio(query, opening_phrase),
+            ) / 100.0
+            if opening_phrase
+            else 0.0
+        )
+        filename_score = file_fuzzy * 0.68 + file_coverage * 0.32
+        opening_score = opening_fuzzy * 0.58 + open_coverage * 0.42
+        score = max(filename_score, opening_score)
+
+        # Dedicated-document routing should be precise. Require at least 60% of
+        # the question's meaningful subject terms to occur in the filename/opening
+        # text after light morphology normalization. This prevents every document
+        # containing generic phrases such as "train movement" from becoming primary.
+        shared = max(file_shared, open_shared)
+        coverage = max(file_coverage, open_coverage)
+        if score < settings.primary_document_match_threshold:
+            continue
+        if shared < 2 or coverage < 0.60:
+            continue
+        matches.append(
+            PrimaryDocumentMatch(
+                document_id=str(row["id"]),
+                filename=filename,
+                score=round(score, 6),
+                reason="filename" if filename_score >= opening_score else "opening-subject",
+            )
+        )
+
+    matches.sort(key=lambda item: (-item.score, item.filename.casefold(), item.document_id))
+    return matches[:limit]
+
+
+def fetch_primary_document_chunks(
+    db: Session,
+    routes: list[PrimaryDocumentMatch],
+    query_texts: list[str],
+    *,
+    chunks_per_document: int | None = None,
+) -> list[RetrievedChunk]:
+    """Read relevant sections from strongly matched dedicated documents."""
+    if not routes:
+        return []
+    settings = get_settings()
+    chunk_limit = chunks_per_document or settings.primary_document_chunks_per_document
+    query_terms = _terms(" ".join(query_texts))
+    any_query = _keyword_or_query_from_terms(query_terms)
+    sql = text(
+        """
+        WITH q AS (
+          SELECT to_tsquery('simple', :any_query) AS simple_any,
+                 to_tsquery('english', :any_query) AS english_any
+        )
+        SELECT c.id, c.document_id, c.chunk_index, c.page_number, c.content_type,
+               c.text, d.filename,
+               GREATEST(
+                 ts_rank_cd(to_tsvector('simple', c.text), q.simple_any),
+                 ts_rank_cd(to_tsvector('english', c.text), q.english_any) * 0.9
+               ) AS keyword_score,
+               CASE WHEN
+                 to_tsvector('simple', c.text) @@ q.simple_any
+                 OR to_tsvector('english', c.text) @@ q.english_any
+               THEN 1 ELSE 0 END AS matched
+        FROM document_chunks c
+        JOIN documents d ON d.id = c.document_id
+        CROSS JOIN q
+        WHERE d.status = 'ready' AND c.document_id::text = :document_id
+        ORDER BY matched DESC, keyword_score DESC, c.chunk_index, c.id
+        LIMIT :chunk_limit
+        """
+    )
+    results: list[RetrievedChunk] = []
+    for route in routes:
+        rows = db.execute(
+            sql,
+            {
+                "any_query": any_query,
+                "document_id": route.document_id,
+                "chunk_limit": chunk_limit,
+            },
+        ).mappings()
+        for row in rows:
+            body_terms = _terms(_strip_chunk_context(str(row["text"]))[:16000])
+            coverage = len(query_terms & body_terms) / max(len(query_terms), 1) if query_terms else 0.0
+            keyword_score = min(float(row["keyword_score"] or 0.0) * 5.0, 1.0)
+            matched = bool(row["matched"])
+            score = min(
+                0.99,
+                0.50 + route.score * 0.22 + (0.14 if matched else 0.0)
+                + coverage * 0.10 + keyword_score * 0.06,
+            )
+            results.append(
+                _row_to_result(
+                    row,
+                    score=score,
+                    method=f"primary-document:{route.reason}",
+                    vector_score=0.0,
+                    keyword_score=keyword_score,
+                )
+            )
+    results.sort(key=_result_sort_key)
+    return _deduplicate_results(results, len(routes) * chunk_limit)
+
+
 def scan_matching_chunks(
     db: Session,
     query_texts: list[str],
@@ -274,57 +498,66 @@ def discover_document_references(
     *,
     max_references: int = 8,
 ) -> list[str]:
-    """Extract procedure/document codes from query-relevant lines only.
+    """Rank procedure/document codes from query-relevant index lines.
 
-    Index chunks often carry many unrelated document codes in their metadata or
-    neighboring rows. Strip the synthetic chunk context first and only accept a
-    code from a body line that overlaps the current question. This lets an index
-    row route retrieval to SC-06 without accidentally pulling SC-14 just because
-    both codes appeared in the same indexed chunk.
+    Exact two-term overlap was too brittle: ``pilot speed AEL`` could not follow an
+    index row saying ``SC-04 ... Movement of Pilot Train``. We now combine overlap,
+    fuzzy line similarity and the parent candidate score, then follow a small ranked
+    set. Wrong extra references are harmless because target-document chunks still
+    pass the normal relevance filter before synthesis.
     """
     if max_references <= 0:
         return []
-    query_terms = _terms(question_text)
+    query_terms = _route_terms(question_text)
     if not query_terms:
         return []
-    minimum_overlap = 1 if len(query_terms) <= 2 else 2
-    found: list[str] = []
-    seen: set[str] = set()
+    reference_generic = {
+        "speed", "limit", "date", "time", "value", "amount", "number",
+        "rule", "require", "procedur", "step", "action", "information",
+    }
+    subject_terms = {term for term in query_terms if term not in reference_generic}
+    if not subject_terms:
+        subject_terms = query_terms
+    required_subject_coverage = 0.60 if len(subject_terms) >= 3 else 0.50
 
-    # Explicit document codes in the user's own wording are the strongest routing
-    # hints and do not need to be rediscovered from an index row.
+    scored: dict[str, float] = {}
+    # Explicit codes in the user's own question always win.
     for match in _DOCUMENT_REFERENCE_RE.finditer(question_text):
         reference = _canonical_document_reference(match.group(1), match.group(2))
-        key = reference.casefold()
-        if key not in seen:
-            seen.add(key)
-            found.append(reference)
-            if len(found) >= max_references:
-                return found
+        scored[reference] = 10.0
 
-    for candidate in candidates[:250]:
+    for candidate in candidates[:350]:
         body = _strip_chunk_context(candidate.chunk.text)
         for raw_line in body.splitlines():
             line = " ".join(raw_line.split())
             if not line:
                 continue
-            matches = list(_DOCUMENT_REFERENCE_RE.finditer(line))
-            if not matches:
+            code_matches = list(_DOCUMENT_REFERENCE_RE.finditer(line))
+            if not code_matches:
                 continue
-            line_terms = _terms(line)
-            if len(query_terms & line_terms) < minimum_overlap:
+            line_terms = _route_terms(line)
+            overlap = len(query_terms & line_terms)
+            subject_overlap = len(subject_terms & line_terms)
+            subject_coverage = subject_overlap / max(len(subject_terms), 1)
+            fuzzy_score = fuzz.WRatio(_route_phrase(question_text), _route_phrase(line)) / 100.0
+            if subject_overlap == 0:
                 continue
-            for match in matches:
-                reference = _canonical_document_reference(match.group(1), match.group(2))
-                key = reference.casefold()
-                if key in seen:
+            if subject_coverage < required_subject_coverage:
+                if len(subject_terms) > 2 or fuzzy_score < 0.72:
                     continue
-                seen.add(key)
-                found.append(reference)
-                if len(found) >= max_references:
-                    return found
-    return found
+            overlap_score = overlap / max(min(len(query_terms), 4), 1)
+            line_score = (
+                subject_coverage * 0.50
+                + overlap_score * 0.16
+                + fuzzy_score * 0.18
+                + min(candidate.score, 1.0) * 0.16
+            )
+            for match in code_matches:
+                reference = _canonical_document_reference(match.group(1), match.group(2))
+                scored[reference] = max(scored.get(reference, 0.0), line_score)
 
+    ordered = sorted(scored.items(), key=lambda item: (-item[1], item[0].casefold()))
+    return [reference for reference, _score in ordered[:max_references]]
 
 def fetch_referenced_document_chunks(
     db: Session,
@@ -672,6 +905,53 @@ def _keyword_or_query(value: str) -> str:
 def _keyword_or_query_from_terms(terms: set[str]) -> str:
     safe_terms = sorted(term for term in terms if re.fullmatch(r"[a-z0-9]+", term))
     return " | ".join(term if len(term) <= 3 or term.isdigit() else f"{term}:*" for term in safe_terms) or "pdfrag_no_match"
+
+
+
+_ROUTE_NOISE = {
+    "the", "and", "for", "with", "from", "this", "that", "what", "when",
+    "where", "which", "how", "are", "is", "in", "on", "of", "to", "a",
+    "an", "or", "by", "as", "be", "do", "does", "can", "could", "should",
+    "please", "tell", "give", "provide", "show", "explain", "find", "if",
+    "document", "documents", "docs", "information", "info",
+}
+
+
+
+def _route_terms(value: str) -> set[str]:
+    return {
+        _route_stem(term)
+        for term in _terms(value)
+        if term not in _ROUTE_NOISE and len(term) > 1
+    }
+
+
+def _route_stem(term: str) -> str:
+    token = term.casefold()
+    if len(token) > 7 and token.endswith("ation"):
+        return token[:-5]
+    if len(token) > 6 and token.endswith("tion"):
+        return token[:-3]
+    if len(token) > 6 and token.endswith("ment"):
+        return token[:-4]
+    if len(token) > 5 and token.endswith("ing"):
+        token = token[:-3]
+    elif len(token) > 4 and token.endswith("ed") and not token.endswith("eed"):
+        token = token[:-2]
+    elif len(token) > 4 and token.endswith("ies"):
+        token = token[:-3] + "y"
+    elif len(token) > 3 and token.endswith("s") and not token.endswith(("ss", "us", "is")):
+        token = token[:-1]
+    return token.rstrip("e") if len(token) > 4 and token.endswith("e") else token
+
+
+def _route_phrase(value: str) -> str:
+    tokens = [
+        token.casefold()
+        for token in re.findall(r"[A-Za-z0-9]+", value)
+        if token.casefold() not in _ROUTE_NOISE
+    ]
+    return " ".join(tokens[:80])
 
 
 def _document_diverse_results(

@@ -28,6 +28,8 @@ class SourceResult(BaseModel):
     excerpt: str
     content_type: str = "text"
     retrieval_method: str = "vector"
+    pages: str = ""
+    section: str = ""
 
 
 class AnswerResponse(BaseModel):
@@ -49,6 +51,7 @@ class AnswerResponse(BaseModel):
     retrieval_mode: str = "answer"
     resolved_abbreviations: list[str] = Field(default_factory=list)
     routing_hints: list[str] = Field(default_factory=list)
+    primary_documents: list[str] = Field(default_factory=list)
     candidate_chunks: int = 0
     evidence_chunks: int = 0
     search_queries: list[str] = Field(default_factory=list)

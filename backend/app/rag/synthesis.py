@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 
 from app.config import get_settings
 from app.rag.llm import llm_service
@@ -14,13 +15,15 @@ Use only the supplied PDF evidence. Conversation context may clarify intent but 
 Answer the user's exact question at the shortest length that is complete and safe:
 - A simple fact, figure, date, name, speed, limit or yes/no lookup should normally be one direct sentence.
 - A request for several facts should use a compact list.
-- A procedure, comparison, summary or safety-critical operational question may be longer when the evidence requires it.
+- A procedure/safety question must give the actionable solution, not a vague summary. Preserve the operational order, responsible roles, prerequisites, notifications, restrictions, special modes, restoration criteria and important alternatives actually supported by the procedure.
+- When the evidence identifies a dedicated primary SOP/instruction for the exact scenario, use that document as the backbone of the answer. Other PDFs may supplement it only when they add a directly applicable requirement; never replace the dedicated procedure with generic nearby safety guidance.
+- Procedure formatting: start with a short applicability/scope sentence when material, then use a clear numbered sequence. If the source itself separates materially different obstruction/scenario types, use compact bold scenario labels beneath the main sequence. Do not dump raw evidence.
 - Never dump or restate all source excerpts merely because they were retrieved; the UI exposes those separately.
-- Do not add an introductory heading such as "Information found in the documents" unless it genuinely improves a multi-part answer.
 - Preserve applicability: line, rolling stock, mode, equipment, procedure, location, conditions, warnings and exceptions.
 - Never merge incompatible contexts. If the user's context is ambiguous and the evidence contains materially different answers, state the alternatives succinctly instead of inventing one.
 - Cite each factual sentence/bullet with the supplied [S#] labels.
 - Use no source label that is not supplied.
+- Do not claim that the documents do not specify/define/provide something unless the supplied evidence genuinely fails to support the answer.
 - If no supported answer exists, reply exactly with the configured no-answer sentence.
 """
 
@@ -46,31 +49,42 @@ class SynthesisBundle:
     sources: list[PromptSource]
     used_hierarchy: bool = False
     digests: str = ""
+    primary_document_ids: frozenset[str] = frozenset()
+    primary_document_names: tuple[str, ...] = ()
 
 
 def synthesize_answer(
     plan: QueryPlan,
     results: list[RetrievedChunk],
+    *,
+    primary_document_ids: set[str] | None = None,
+    primary_document_names: list[str] | None = None,
 ) -> SynthesisBundle:
     settings = get_settings()
     estimated_chars = sum(len(item.chunk.text) + len(item.chunk.filename) + 180 for item in results)
 
-    sources = _prompt_sources(plan, results)
+    primary_ids = primary_document_ids or set()
+    primary_names = primary_document_names or []
+    sources = _prompt_sources(plan, results, primary_ids)
     if estimated_chars <= int(settings.max_context_chars * 0.85):
-        prompt = _build_direct_answer_prompt(plan, sources)
+        prompt = _build_direct_answer_prompt(plan, sources, primary_names)
         return SynthesisBundle(
             raw_answer=_answer(prompt),
             sources=sources,
             used_hierarchy=False,
+            primary_document_ids=frozenset(primary_ids),
+            primary_document_names=tuple(primary_names),
         )
 
-    digests = _summarize_all_sources(plan, sources)
-    final_prompt = _build_digest_answer_prompt(plan, sources, digests)
+    digests = _summarize_all_sources(plan, sources, primary_ids)
+    final_prompt = _build_digest_answer_prompt(plan, sources, digests, primary_names, primary_ids)
     return SynthesisBundle(
         raw_answer=_answer(final_prompt),
         sources=sources,
         used_hierarchy=True,
         digests=digests,
+        primary_document_ids=frozenset(primary_ids),
+        primary_document_names=tuple(primary_names),
     )
 
 
@@ -132,6 +146,74 @@ If no supported answer exists, reply exactly:
     return _answer(prompt)
 
 
+
+def procedure_answer_needs_repair(
+    answer: str,
+    sources: list[PromptSource],
+    primary_document_ids: set[str],
+) -> bool:
+    if not answer or not primary_document_ids:
+        return False
+    citation_numbers = {
+        int(value)
+        for value in re.findall(r"\[S(\d+)\]", answer)
+        if value.isdigit()
+    }
+    cites_primary = any(
+        1 <= number <= len(sources)
+        and sources[number - 1].result.chunk.document_id in primary_document_ids
+        for number in citation_numbers
+    )
+    has_numbered_steps = bool(re.search(r"(?m)^\s*\d+[.)]\s+", answer))
+    return not cites_primary or not has_numbered_steps
+
+
+def repair_procedure_answer(
+    plan: QueryPlan,
+    previous_answer: str,
+    sources: list[PromptSource],
+    primary_document_ids: set[str],
+    *,
+    max_primary_sources: int = 48,
+) -> str:
+    """Repair a vague/misformatted procedure from the dedicated SOP evidence."""
+    if not primary_document_ids:
+        return previous_answer
+    ranked = [
+        (index, source)
+        for index, source in enumerate(sources, 1)
+        if source.result.chunk.document_id in primary_document_ids
+    ][:max_primary_sources]
+    if not ranked:
+        return previous_answer
+    blocks: list[str] = []
+    for index, source in ranked:
+        chunk = source.result.chunk
+        blocks.append(
+            f"[S{index}] File: {chunk.filename} | Page: {chunk.page_number} | "
+            f"Type: {chunk.content_type}\n{source.excerpt}"
+        )
+    prompt = f"""Rewrite the previous draft as the actionable procedure requested by the user.
+Use ONLY the PRIMARY PROCEDURE evidence below. Do not replace it with generic rules from other
+PDFs. Start with a short applicability/scope sentence only if supported, then give a numbered
+operational sequence. Preserve responsible roles, notifications, restrictions, special modes,
+assistance/escalation, restoration criteria, and materially different scenario branches. Keep
+it concise but complete. Cite every factual step using the existing [S#] labels; do not renumber.
+
+ORIGINAL QUESTION:
+{plan.original_question}
+
+PREVIOUS DRAFT:
+{previous_answer}
+
+PRIMARY PROCEDURE EVIDENCE:
+{chr(10).join(blocks)}
+
+If the primary evidence does not support an answer, reply exactly: {NO_ANSWER}
+"""
+    return _answer(prompt)
+
+
 def rescue_fact_answer(
     plan: QueryPlan,
     sources: list[PromptSource],
@@ -174,6 +256,17 @@ If these excerpts still do not support the answer, reply exactly: {NO_ANSWER}
     return _answer(prompt)
 
 
+_NEGATIVE_ANSWER_RE = re.compile(
+    r"\b(?:documents?|pdfs?)\b.{0,80}\b(?:do not|does not|don't|doesn't|cannot|can't)\b.{0,80}\b(?:specify|define|provide|contain|state|mention|include)\b|"
+    r"\b(?:not specified|not defined|not provided|not stated|not found|no information)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def looks_like_negative_answer(value: str) -> bool:
+    return bool(_NEGATIVE_ANSWER_RE.search(value or ""))
+
+
 def _answer(prompt: str) -> str:
     settings = get_settings()
     return llm_service.generate(
@@ -184,13 +277,28 @@ def _answer(prompt: str) -> str:
     )
 
 
-def _prompt_sources(plan: QueryPlan, results: list[RetrievedChunk]) -> list[PromptSource]:
+def _prompt_sources(
+    plan: QueryPlan,
+    results: list[RetrievedChunk],
+    primary_document_ids: set[str],
+) -> list[PromptSource]:
     # Relevance selection already returns strongest-first evidence. Preserve that
     # order for simple facts/definitions so the direct answer is not buried deep
     # in a long document-sorted prompt. For procedures and broader synthesis,
     # document/page order still helps preserve sequence and applicability.
     if plan.intent in {"fact_lookup", "definition"}:
         ordered = list(results)
+    elif primary_document_ids:
+        ordered = sorted(
+            results,
+            key=lambda item: (
+                0 if item.chunk.document_id in primary_document_ids else 1,
+                item.chunk.filename.casefold(),
+                item.chunk.page_number,
+                item.chunk.chunk_index if item.chunk.chunk_index is not None else -1,
+                item.chunk.chunk_id,
+            ),
+        )
     else:
         ordered = sorted(
             results,
@@ -204,12 +312,16 @@ def _prompt_sources(plan: QueryPlan, results: list[RetrievedChunk]) -> list[Prom
     return [PromptSource(result=item, excerpt=item.chunk.text.strip()) for item in ordered]
 
 
-def _summarize_all_sources(plan: QueryPlan, sources: list[PromptSource]) -> str:
+def _summarize_all_sources(
+    plan: QueryPlan,
+    sources: list[PromptSource],
+    primary_document_ids: set[str],
+) -> str:
     settings = get_settings()
     batches = _source_batches(sources, settings.summary_batch_chars)
     digests: list[str] = []
     for batch in batches:
-        prompt = _build_batch_summary_prompt(plan, batch)
+        prompt = _build_batch_summary_prompt(plan, batch, primary_document_ids)
         digest = llm_service.summarize(
             _SUMMARY_SYSTEM_PROMPT,
             prompt,
@@ -294,7 +406,11 @@ def _text_batches(values: list[str], max_chars: int) -> list[str]:
     return result
 
 
-def _build_direct_answer_prompt(plan: QueryPlan, sources: list[PromptSource]) -> str:
+def _build_direct_answer_prompt(
+    plan: QueryPlan,
+    sources: list[PromptSource],
+    primary_document_names: list[str],
+) -> str:
     return f"""Answer the ORIGINAL QUESTION using all supplied source chunks.
 
 ORIGINAL QUESTION:
@@ -306,10 +422,13 @@ CONTEXTUAL INTERPRETATION (conversation is intent only, never evidence):
 QUESTION INTENT:
 {plan.intent}
 
+PRIMARY PROCEDURE DOCUMENTS (routing priority only; facts still require source citations):
+{chr(10).join(primary_document_names) if primary_document_names else "None"}
+
 SOURCE CHUNKS:
 {_source_blocks(sources)}
 
-Answer only what the user asked. Use every source silently when deciding the answer, but do not reproduce unrelated or merely nearby evidence. For a single requested fact, return one direct sentence with citation. For a procedure or multi-part question, include the complete supported steps/conditions needed to answer it.
+Answer only what the user asked. Use every source silently when deciding the answer, but do not reproduce unrelated or merely nearby evidence. For a single requested fact, return one direct sentence with citation. For a procedure, produce an actionable, properly structured solution: a short scope/applicability line if needed, then numbered operational steps in source order. If a dedicated primary procedure document is listed, make it the backbone and use other documents only for directly applicable supplementary requirements.
 """
 
 
@@ -328,13 +447,15 @@ def _source_blocks(sources: list[PromptSource]) -> str:
 def _build_batch_summary_prompt(
     plan: QueryPlan,
     batch: list[tuple[int, PromptSource]],
+    primary_document_ids: set[str],
 ) -> str:
     blocks: list[str] = []
     for index, source in batch:
         chunk = source.result.chunk
+        priority = " | PRIMARY PROCEDURE" if chunk.document_id in primary_document_ids else ""
         blocks.append(
             f"[S{index}] File: {chunk.filename} | Page: {chunk.page_number} | "
-            f"Type: {chunk.content_type} | Retrieval: {source.result.method}\n"
+            f"Type: {chunk.content_type} | Retrieval: {source.result.method}{priority}\n"
             f"{source.excerpt}"
         )
     return f"""QUESTION TO SUPPORT:
@@ -360,6 +481,8 @@ def _build_digest_answer_prompt(
     plan: QueryPlan,
     sources: list[PromptSource],
     digests: str,
+    primary_document_names: list[str],
+    primary_document_ids: set[str],
 ) -> str:
     return f"""Produce the final answer to the ORIGINAL QUESTION using only the supplied evidence
 digests. The digests were produced by exhaustively processing a larger set of relevant PDF
@@ -374,11 +497,14 @@ CONTEXTUAL INTERPRETATION (conversation context is intent only, never factual ev
 QUESTION INTENT:
 {plan.intent}
 
+PRIMARY PROCEDURE DOCUMENTS:
+{chr(10).join(primary_document_names) if primary_document_names else "None"}
+
 SOURCE MAP:
 {_source_map(sources)}
 
 HIGH-PRIORITY DIRECT EVIDENCE:
-{_priority_source_blocks(plan, sources)}
+{_priority_source_blocks(plan, sources, primary_document_ids=primary_document_ids)}
 
 SOURCE EXCERPTS (HIERARCHICAL EVIDENCE DIGESTS):
 {digests}
@@ -391,7 +517,9 @@ Required answer behavior:
 - Keep different documents, lines, rolling stock, systems, modes and procedures separate when
   their applicability differs; never blend incompatible procedures.
 - For procedures, preserve prerequisites, permissions, chronological steps, warnings,
-  exceptions, checks, records and responsible roles.
+  exceptions, checks, records and responsible roles. Format the answer as an actionable
+  numbered procedure. When primary procedure documents are listed, derive the core sequence
+  from them and use other PDFs only for directly applicable supplements.
 - Cite every factual bullet using the exact [S#] labels from the digests/source map.
 - Do not use conversation history, the model's general knowledge, or uncited assumptions as facts.
 - If no supported answer exists, reply exactly: {NO_ANSWER}
@@ -402,14 +530,19 @@ def _priority_source_blocks(
     plan: QueryPlan,
     sources: list[PromptSource],
     *,
-    max_sources: int = 16,
-    max_chars: int = 30000,
+    primary_document_ids: set[str] | None = None,
+    max_sources: int = 20,
+    max_chars: int = 36000,
 ) -> str:
-    if plan.intent not in {"fact_lookup", "definition"}:
+    primary_ids = primary_document_ids or set()
+    if plan.intent not in {"fact_lookup", "definition"} and not primary_ids:
         return "Not required for this question type."
     blocks: list[str] = []
     used = 0
-    for index, source in enumerate(sources[:max_sources], 1):
+    ranked = list(enumerate(sources, 1))
+    if primary_ids:
+        ranked.sort(key=lambda pair: (0 if pair[1].result.chunk.document_id in primary_ids else 1, pair[0]))
+    for index, source in ranked[:max_sources]:
         chunk = source.result.chunk
         block = (
             f"[S{index}] File: {chunk.filename} | Page: {chunk.page_number} | "

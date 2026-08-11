@@ -62,6 +62,22 @@ class Settings(BaseSettings):
     fuzzy_match_cutoff: float = 0.78
     max_query_terms: int = 48
 
+    # A second lexical path uses PostgreSQL's built-in English stemming in addition
+    # to the exact/simple FTS path. This catches word-family changes such as
+    # obstruct/obstruction/obstructing without weakening acronym/code matching.
+    stemmed_search_enabled: bool = True
+    stemmed_search_max_chunks: int = Field(default=3000, ge=100, le=20000)
+
+    # Route a question to a clearly matching dedicated SOP/instruction before
+    # broad synthesis. Matching uses filename + opening subject text, fuzzy token
+    # similarity and literal coverage. The primary document stays dominant while
+    # a small number of genuinely relevant supplementary chunks may still be used.
+    primary_document_routing_enabled: bool = True
+    primary_document_match_threshold: float = Field(default=0.58, ge=0.35, le=0.95)
+    primary_document_max_documents: int = Field(default=3, ge=1, le=8)
+    primary_document_chunks_per_document: int = Field(default=600, ge=20, le=2500)
+    primary_document_supplement_limit: int = Field(default=96, ge=0, le=500)
+
     # Hybrid retrieval still provides semantic candidates, but answer correctness
     # no longer depends on a tiny top-K. A corpus-wide lexical scan examines every
     # ready chunk and then returns matching rows up to a high safety ceiling.

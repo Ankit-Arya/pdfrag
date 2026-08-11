@@ -6,6 +6,7 @@ import {
   type AnswerResponse,
   type DocumentRecord,
   type KnowledgeStatus,
+  type SourceResult,
 } from '../services/api'
 import { renderMarkdown } from '../utils/markdown'
 
@@ -139,10 +140,54 @@ function evidenceIsExpanded(messageId: string): boolean {
   return expandedEvidenceIds.value.has(messageId)
 }
 
+interface EvidenceGroup {
+  key: string
+  filename: string
+  pages: string
+  section: string
+  sources: SourceResult[]
+}
+
 function displayEvidenceExcerpt(value: string): string {
-  return value
+  const clean = value
     .replace(/\[PDF CHUNK CONTEXT\][\s\S]*?\[\/PDF CHUNK CONTEXT\]\s*/gi, '')
     .trim()
+  if (!clean) return 'No readable excerpt was extracted. Verify the cited PDF page.'
+  const lines = clean.split(/\r?\n/).filter((line) => line.trim())
+  if (
+    lines.length >= 2
+    && lines[0].includes('|')
+    && /-{3,}/.test(lines[1])
+  ) {
+    const cells = [lines[0], ...lines.slice(2)]
+      .flatMap((line) => line.split('|'))
+      .map((cell) => cell.replace(/[ *_`|]/g, '').trim())
+    if (!cells.some((cell) => /[A-Za-z0-9]/.test(cell))) {
+      return 'Table extraction contains no readable cells on this excerpt; verify the cited PDF page.'
+    }
+  }
+  return clean
+}
+
+function groupEvidence(sources: SourceResult[] | undefined): EvidenceGroup[] {
+  const groups = new Map<string, EvidenceGroup>()
+  for (const source of sources ?? []) {
+    const pages = source.pages?.trim() || String(source.page)
+    const section = source.section?.trim() || ''
+    const key = `${source.filename}::${pages}::${section}`
+    const existing = groups.get(key)
+    if (existing) existing.sources.push(source)
+    else {
+      groups.set(key, {
+        key,
+        filename: source.filename,
+        pages,
+        section,
+        sources: [source],
+      })
+    }
+  }
+  return Array.from(groups.values())
 }
 
 onMounted(() => {
@@ -325,22 +370,29 @@ onBeforeUnmount(() => {
                 excerpt{{ message.response.evidence.length === 1 ? '' : 's' }}
               </span>
             </summary>
-            <div v-if="evidenceIsExpanded(message.id)" class="source-list evidence-source-list">
-              <details
-                v-for="source in message.response.evidence"
-                :key="`ai-${message.id}-${source.id}`"
-                class="source-card"
+            <div v-if="evidenceIsExpanded(message.id)" class="evidence-groups">
+              <section
+                v-for="group in groupEvidence(message.response.evidence)"
+                :key="`ai-${message.id}-${group.key}`"
+                class="evidence-document-group"
               >
-                <summary>
-                  <span class="source-id">{{ source.id }}</span>
-                  <span class="source-title">{{ source.filename }}</span>
-                  <span class="source-page">p. {{ source.page }}</span>
-                </summary>
+                <div class="evidence-document-heading">
+                  <strong>{{ group.filename }}</strong>
+                  <span>p. {{ group.pages }}</span>
+                </div>
+                <div v-if="group.section" class="evidence-section-title">{{ group.section }}</div>
                 <div
-                  class="source-excerpt markdown-body"
-                  v-html="renderMarkdown(displayEvidenceExcerpt(source.excerpt))"
-                />
-              </details>
+                  v-for="source in group.sources"
+                  :key="`ai-source-${message.id}-${source.id}`"
+                  class="evidence-excerpt-row"
+                >
+                  <span class="source-id">{{ source.id }}</span>
+                  <div
+                    class="source-excerpt markdown-body"
+                    v-html="renderMarkdown(displayEvidenceExcerpt(source.excerpt))"
+                  />
+                </div>
+              </section>
             </div>
           </details>
 
@@ -352,22 +404,29 @@ onBeforeUnmount(() => {
                 source{{ message.response.sources.length === 1 ? '' : 's' }}
               </span>
             </summary>
-            <div class="source-list evidence-source-list">
-              <details
-                v-for="source in message.response.sources"
-                :key="source.id"
-                class="source-card"
+            <div class="evidence-groups cited-evidence-groups">
+              <section
+                v-for="group in groupEvidence(message.response.sources)"
+                :key="`cited-${message.id}-${group.key}`"
+                class="evidence-document-group"
               >
-                <summary>
-                  <span class="source-id">{{ source.id }}</span>
-                  <span class="source-title">{{ source.filename }}</span>
-                  <span class="source-page">p. {{ source.page }}</span>
-                </summary>
+                <div class="evidence-document-heading">
+                  <strong>{{ group.filename }}</strong>
+                  <span>p. {{ group.pages }}</span>
+                </div>
+                <div v-if="group.section" class="evidence-section-title">{{ group.section }}</div>
                 <div
-                  class="source-excerpt markdown-body"
-                  v-html="renderMarkdown(displayEvidenceExcerpt(source.excerpt))"
-                />
-              </details>
+                  v-for="source in group.sources"
+                  :key="`cited-source-${message.id}-${source.id}`"
+                  class="evidence-excerpt-row"
+                >
+                  <span class="source-id">{{ source.id }}</span>
+                  <div
+                    class="source-excerpt markdown-body"
+                    v-html="renderMarkdown(displayEvidenceExcerpt(source.excerpt))"
+                  />
+                </div>
+              </section>
             </div>
           </details>
         </div>
@@ -628,4 +687,66 @@ onBeforeUnmount(() => {
     justify-self: start;
   }
 }
+
+.evidence-groups {
+  display: grid;
+  gap: 10px;
+  margin-top: 9px;
+}
+
+.evidence-document-group {
+  border: 1px solid #dce5e1;
+  border-radius: 10px;
+  background: #fbfdfc;
+  overflow: hidden;
+}
+
+.evidence-document-heading {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 11px;
+  background: #f3f7f5;
+  border-bottom: 1px solid #e3ebe7;
+  font-size: 11px;
+}
+
+.evidence-document-heading strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.evidence-document-heading span {
+  flex: none;
+  color: #6e7c76;
+}
+
+.evidence-section-title {
+  padding: 8px 11px 0;
+  font-size: 10px;
+  font-weight: 700;
+  color: #5e6d67;
+}
+
+.evidence-excerpt-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 8px;
+  padding: 9px 11px;
+  border-top: 1px solid #edf2ef;
+}
+
+.evidence-section-title + .evidence-excerpt-row {
+  border-top: 0;
+}
+
+.evidence-excerpt-row .source-id {
+  align-self: start;
+  margin-top: 2px;
+}
+
+.evidence-excerpt-row .source-excerpt {
+  min-width: 0;
+}
+
 </style>
