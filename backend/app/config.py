@@ -20,10 +20,19 @@ class Settings(BaseSettings):
     bootstrap_admin_password: str = "ChangeMe123!"
 
     openai_api_key: str = ""
-    llm_model: str = "gpt-4.1-mini"
+    # Use a stronger, pinned answer model for consistent operational-document QA.
+    # QUERY_MODEL can remain smaller/cheaper because it only resolves intent and
+    # produces retrieval variants; facts still have to come from document chunks.
+    llm_model: str = "gpt-5.6-sol"
+    query_model: str = "gpt-5.6-terra"
+    summary_model: str = "gpt-5.6-terra"
     llm_base_url: str = ""
-    llm_timeout_seconds: float = Field(default=45, ge=5, le=300)
-    max_output_tokens: int = Field(default=1800, ge=100, le=8000)
+    llm_timeout_seconds: float = Field(default=90, ge=5, le=300)
+    llm_reasoning_effort: Literal["none", "low", "medium", "high", "xhigh", "max"] = "high"
+    query_reasoning_effort: Literal["none", "low", "medium", "high", "xhigh", "max"] = "low"
+    summary_reasoning_effort: Literal["none", "low", "medium", "high", "xhigh", "max"] = "medium"
+    max_output_tokens: int = Field(default=6000, ge=100, le=20000)
+    summary_max_output_tokens: int = Field(default=5000, ge=400, le=12000)
 
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     embedding_dimensions: int = 384
@@ -39,19 +48,42 @@ class Settings(BaseSettings):
     # chunk text.
     chunk_size_chars: int = Field(default=900, ge=400, le=4000)
     chunk_overlap_chars: int = Field(default=220, ge=0, le=1000)
-    top_k: int = Field(default=12, ge=1, le=20)
+    top_k: int = Field(default=12, ge=1, le=200)
     min_similarity: float = Field(default=0.05, ge=0, le=1)
-    max_context_chars: int = Field(default=30000, ge=2000, le=100000)
+    # This is the direct-prompt ceiling. Larger evidence sets are summarized in
+    # batches first, while preserving original source labels for final citations.
+    max_context_chars: int = Field(default=300000, ge=10000, le=800000)
+    summary_batch_chars: int = Field(default=120000, ge=10000, le=300000)
     max_chunks_per_page: int = 6
 
     query_rewrite_enabled: bool = True
-    query_rewrite_max_variants: int = 4
+    query_rewrite_max_variants: int = Field(default=6, ge=1, le=12)
     fuzzy_keyword_enabled: bool = True
     fuzzy_match_cutoff: float = 0.78
     max_query_terms: int = 48
-    retrieval_chunks_per_document: int = Field(default=4, ge=1, le=12)
-    max_retrieval_candidates: int = Field(default=1000, ge=50, le=10000)
-    evidence_top_k: int = Field(default=16, ge=4, le=30)
+
+    # Hybrid retrieval still provides semantic candidates, but answer correctness
+    # no longer depends on a tiny top-K. A corpus-wide lexical scan examines every
+    # ready chunk and then returns matching rows up to a high safety ceiling.
+    retrieval_chunks_per_document: int = Field(default=6, ge=1, le=24)
+    max_retrieval_candidates: int = Field(default=3000, ge=50, le=20000)
+    corpus_scan_max_chunks: int = Field(default=10000, ge=100, le=50000)
+    answer_evidence_chunk_limit: int = Field(default=1200, ge=20, le=3000)
+    reference_evidence_chunk_limit: int = Field(default=5000, ge=50, le=10000)
+    neighbor_seed_limit: int = Field(default=300, ge=10, le=1000)
+    neighbor_window: int = Field(default=1, ge=0, le=3)
+    evidence_top_k: int = Field(default=48, ge=4, le=500)
+
+    # Conversation history is intent context only. It is never treated as factual
+    # evidence and is never cited in a grounded answer.
+    chat_context_messages: int = Field(default=10, ge=0, le=30)
+    chat_context_chars: int = Field(default=9000, ge=0, le=30000)
+    chat_context_per_message_chars: int = Field(default=1600, ge=200, le=6000)
+
+    # Short internal tokens (SC, PSD, OCC, UTO, etc.) are looked up in ready PDF
+    # chunks before the planner is allowed to expand them.
+    abbreviation_scan_terms: int = Field(default=8, ge=0, le=20)
+    abbreviation_scan_chunks_per_term: int = Field(default=12, ge=1, le=50)
 
     ocr_mode: Literal["never", "auto", "always"] = "auto"
     ocr_dpi: int = Field(default=300, ge=150, le=450)
@@ -84,6 +116,8 @@ class Settings(BaseSettings):
     def validate_related(self) -> "Settings":
         if self.chunk_overlap_chars >= self.chunk_size_chars:
             raise ValueError("CHUNK_OVERLAP_CHARS must be smaller than CHUNK_SIZE_CHARS")
+        if self.summary_batch_chars > self.max_context_chars:
+            raise ValueError("SUMMARY_BATCH_CHARS must not exceed MAX_CONTEXT_CHARS")
         return self
 
     @property

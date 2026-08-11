@@ -8,7 +8,7 @@ from pydantic import BaseModel, EmailStr, Field, field_validator
 class QuestionRequest(BaseModel):
     question: str = Field(min_length=2, max_length=4000)
     chat_session_id: uuid.UUID | None = None
-    top_k: int | None = Field(default=None, ge=1, le=20)
+    top_k: int | None = Field(default=None, ge=1, le=200)
     rewrite_question: bool | None = None
 
     @field_validator("question")
@@ -36,6 +36,11 @@ class AnswerResponse(BaseModel):
     grounded: bool
     grounding_status: str = "insufficient_evidence"
     interpreted_question: str | None = None
+    contextual_question: str | None = None
+    retrieval_mode: str = "answer"
+    resolved_abbreviations: list[str] = Field(default_factory=list)
+    candidate_chunks: int = 0
+    evidence_chunks: int = 0
     search_queries: list[str] = Field(default_factory=list)
     request_id: str | None = None
     chat_session_id: uuid.UUID | None = None
@@ -51,6 +56,8 @@ class HealthResponse(BaseModel):
     embedding_fallback: bool = False
     embedding_error: str | None = None
     llm_model: str
+    query_model: str = ""
+    summary_model: str = ""
     ocr_mode: str
     ocr_available: bool
     table_extraction: bool

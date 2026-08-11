@@ -147,6 +147,39 @@ def _record_chat_failure(
     db.commit()
 
 
+def _conversation_context(db: Session, chat_session_id: uuid.UUID) -> list[dict[str, str]]:
+    """Return recent chat turns for intent resolution, prioritizing newest turns."""
+    settings = get_settings()
+    if settings.chat_context_messages <= 0 or settings.chat_context_chars <= 0:
+        return []
+
+    rows = list(
+        db.scalars(
+            select(ChatMessage)
+            .where(ChatMessage.chat_session_id == chat_session_id)
+            .order_by(ChatMessage.created_at.desc())
+            .limit(settings.chat_context_messages)
+        )
+    )
+    newest_first: list[dict[str, str]] = []
+    used = 0
+    for row in rows:
+        if row.role not in {"user", "assistant"}:
+            continue
+        text = " ".join(row.content.split())
+        if not text:
+            continue
+        text = text[: settings.chat_context_per_message_chars]
+        remaining = settings.chat_context_chars - used
+        if remaining <= 0:
+            break
+        if len(text) > remaining:
+            text = text[:remaining]
+        newest_first.append({"role": row.role, "content": text})
+        used += len(text)
+    return list(reversed(newest_first))
+
+
 def _queue_documents(
     db: Session,
     background_tasks: BackgroundTasks,
@@ -165,9 +198,6 @@ def _queue_documents(
     )
     missing = sum(1 for document_id in unique_ids if document_id not in known_ids)
 
-    # Claim rows atomically. Concurrent queue requests cannot schedule the same
-    # document twice because PostgreSQL re-checks the status predicate after any
-    # row-lock wait before UPDATE ... RETURNING succeeds.
     claimed = set(
         db.scalars(
             update(Document)
@@ -204,6 +234,8 @@ def health() -> HealthResponse:
         embedding_fallback=embedding_service.using_fallback,
         embedding_error=embedding_service.last_error,
         llm_model=settings.llm_model,
+        query_model=settings.query_model,
+        summary_model=settings.summary_model,
         ocr_mode=settings.ocr_mode,
         ocr_available=ocr_available(),
         table_extraction=settings.extract_tables,
@@ -495,6 +527,11 @@ async def chat(
         db.commit()
         db.refresh(chat_session)
 
+    # Capture history BEFORE writing the current question. It is provided only to
+    # the query planner to resolve follow-ups and context; facts are re-retrieved
+    # from PDFs for every turn.
+    conversation_context = _conversation_context(db, chat_session.id)
+
     user_message = ChatMessage(
         chat_session_id=chat_session.id,
         role="user",
@@ -512,6 +549,7 @@ async def chat(
             payload.question,
             payload.top_k,
             payload.rewrite_question,
+            conversation_context,
         )
     except EmbeddingUnavailableError as exc:
         _record_chat_failure(
@@ -558,6 +596,11 @@ async def chat(
             "grounded": response.grounded,
             "grounding_status": response.grounding_status,
             "interpreted_question": response.interpreted_question,
+            "contextual_question": response.contextual_question,
+            "retrieval_mode": response.retrieval_mode,
+            "resolved_abbreviations": response.resolved_abbreviations,
+            "candidate_chunks": response.candidate_chunks,
+            "evidence_chunks": response.evidence_chunks,
             "search_queries": response.search_queries,
             "request_id": response.request_id,
         },
@@ -576,6 +619,11 @@ async def chat(
             "grounded": response.grounded,
             "grounding_status": response.grounding_status,
             "interpreted_question": response.interpreted_question,
+            "contextual_question": response.contextual_question,
+            "retrieval_mode": response.retrieval_mode,
+            "resolved_abbreviations": response.resolved_abbreviations,
+            "candidate_chunks": response.candidate_chunks,
+            "evidence_chunks": response.evidence_chunks,
             "search_queries": response.search_queries,
             "sources": source_details,
         },

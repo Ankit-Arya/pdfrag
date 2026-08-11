@@ -14,13 +14,21 @@ from app.rag.chunking import chunk_pages
 from app.rag.embeddings import EmbeddingUnavailableError, embedding_service
 from app.rag.evidence import build_evidence_answer
 from app.rag.guardrails import cited_source_numbers, validate_grounded_answer
-from app.rag.llm import llm_service
 from app.rag.pdf import PdfProcessingError, extract_pdf_pages
-from app.rag.postgres_store import fetch_neighbor_chunks, search_chunks
-from app.rag.prompts import NO_ANSWER, build_citation_repair_prompt, build_user_prompt
+from app.rag.postgres_store import (
+    fetch_neighbor_chunks,
+    find_abbreviation_hints,
+    scan_matching_chunks,
+    search_chunks,
+)
+from app.rag.prompts import NO_ANSWER, build_citation_repair_prompt
 from app.rag.query import query_planner
 from app.rag.relevance import select_context_chunks
-from app.rag.types import QueryPlan, RetrievedChunk
+from app.rag.synthesis import (
+    repair_hierarchical_answer,
+    synthesize_answer,
+)
+from app.rag.types import PromptSource, QueryPlan, RetrievedChunk
 
 logger = logging.getLogger(__name__)
 
@@ -57,9 +65,6 @@ class RagService:
                     "Increase the limit or split the PDF."
                 )
 
-            # Keep replacement atomic, but avoid retaining embeddings and thousands
-            # of Python float lists for the whole document at once. Flush small
-            # batches into PostgreSQL while the transaction remains open.
             db.execute(delete(DocumentChunk).where(DocumentChunk.document_id == document.id))
             embedding_batch_size = 64
             for start in range(0, len(chunks), embedding_batch_size):
@@ -109,102 +114,100 @@ class RagService:
         question: str,
         top_k: int | None = None,
         rewrite_question: bool | None = None,
+        conversation_context: list[dict[str, str]] | None = None,
     ) -> AnswerResponse:
         settings = get_settings()
-        plan = query_planner.plan(question, enabled=rewrite_question)
-        vectors = embedding_service.encode(plan.search_queries)
-
-        requested_limit = top_k or settings.top_k
-        context_limit = (
-            max(requested_limit, settings.evidence_top_k)
-            if plan.response_mode == "evidence"
-            else requested_limit
+        history = conversation_context or []
+        abbreviation_probe = "\n".join(
+            [
+                question,
+                *[
+                    str(turn.get("content", ""))
+                    for turn in history
+                    if str(turn.get("role", "")).casefold() == "user"
+                ],
+            ]
         )
-        retrieval_limit = max(context_limit * 8, 48)
+        abbreviation_hints = find_abbreviation_hints(db, abbreviation_probe)
+        plan = query_planner.plan(
+            question,
+            enabled=rewrite_question,
+            conversation_context=history,
+            abbreviation_hints=abbreviation_hints,
+        )
+
+        context_limit = (
+            settings.reference_evidence_chunk_limit
+            if plan.search_mode == "references"
+            else (top_k or settings.answer_evidence_chunk_limit)
+        )
+        # Semantic retrieval remains useful for paraphrases, but is no longer the
+        # only gate. Keep its per-query working set bounded because the corpus-wide
+        # lexical scan below separately evaluates every ready chunk.
+        semantic_limit = min(
+            max(context_limit * 2, 128),
+            settings.max_retrieval_candidates,
+        )
         merged: dict[str, RetrievedChunk] = {}
 
+        vectors = embedding_service.encode(plan.search_queries)
         for query, vector in zip(plan.search_queries, vectors, strict=True):
-            for item in search_chunks(db, vector.tolist(), query, retrieval_limit):
-                old = merged.get(item.chunk.chunk_id)
-                if old is None or item.score > old.score:
-                    merged[item.chunk.chunk_id] = item
+            for item in search_chunks(db, vector.tolist(), query, semantic_limit):
+                _merge_candidate(merged, item)
 
-        candidates = sorted(merged.values(), key=lambda item: item.score, reverse=True)
+        corpus_queries = _unique(
+            [
+                plan.contextual_question or plan.original_question,
+                plan.original_question,
+                *plan.search_queries[:3],
+            ]
+        )
+        corpus_focus = _unique([*plan.focus_terms, *plan.context_terms, *plan.keywords])
+        for item in scan_matching_chunks(
+            db,
+            corpus_queries,
+            focus_terms=corpus_focus,
+            reference_mode=plan.search_mode == "references",
+            limit=settings.corpus_scan_max_chunks,
+        ):
+            _merge_candidate(merged, item)
+
+        candidates = sorted(merged.values(), key=_result_sort_key)
         if not candidates:
-            return AnswerResponse(
-                answer=NO_ANSWER,
-                sources=[],
-                grounded=False,
-                grounding_status="insufficient_evidence",
-                interpreted_question=plan.rewritten_question,
-                search_queries=plan.search_queries,
-            )
+            return self._empty_answer(plan, abbreviation_hints, candidate_chunks=0)
 
         relevant = self._select_context_chunks(plan, candidates, context_limit)
         if not relevant:
-            return AnswerResponse(
-                answer=NO_ANSWER,
-                sources=[],
-                grounded=False,
-                grounding_status="insufficient_evidence",
-                interpreted_question=plan.rewritten_question,
-                search_queries=plan.search_queries,
+            return self._empty_answer(
+                plan,
+                abbreviation_hints,
+                candidate_chunks=len(candidates),
             )
 
-        # A heading, its controlling paragraph and a related table can be stored
-        # in adjacent chunks. Expand for every response mode, then run the same
-        # relevance selector again so evidence lookups recover that local context
-        # without forwarding unrelated neighboring material.
+        if plan.search_mode == "references":
+            return self._reference_answer(
+                plan,
+                relevant,
+                abbreviation_hints,
+                candidate_chunks=len(candidates),
+            )
+
         expanded = self._expand_context(db, plan, relevant, context_limit)
-        prompt, context = build_user_prompt(
-            plan.original_question,
-            plan.rewritten_question,
-            expanded,
-            settings.max_context_chars,
-            question_intent=plan.intent,
-            response_mode=plan.response_mode,
-        )
-        if not context:
-            return AnswerResponse(
-                answer=NO_ANSWER,
-                sources=[],
-                grounded=False,
-                grounding_status="insufficient_evidence",
-                interpreted_question=plan.rewritten_question,
-                search_queries=plan.search_queries,
-            )
-
-        if plan.response_mode == "evidence":
-            raw, used_context = build_evidence_answer(plan.original_question, context)
-            context = used_context
-            if not raw or not context:
-                return AnswerResponse(
-                    answer=NO_ANSWER,
-                    sources=[],
-                    grounded=False,
-                    grounding_status="insufficient_evidence",
-                    interpreted_question=plan.rewritten_question,
-                    search_queries=plan.search_queries,
-                )
-        else:
-            raw = llm_service.answer(prompt)
-        answer, grounded = validate_grounded_answer(raw, len(context))
+        bundle = synthesize_answer(plan, expanded)
+        answer, grounded = validate_grounded_answer(bundle.raw_answer, len(bundle.sources))
         grounding_status = "verified" if grounded else "citation_validation_failed"
 
-        if plan.response_mode != "evidence" and not grounded and answer != NO_ANSWER:
-            repair_prompt, repair_context = build_citation_repair_prompt(
-                plan.original_question,
-                plan.rewritten_question,
-                answer,
-                expanded,
-                settings.max_context_chars,
-                response_mode=plan.response_mode,
-            )
-            if repair_context:
-                repaired_raw = llm_service.answer(repair_prompt)
+        if not grounded and answer != NO_ANSWER:
+            if bundle.used_hierarchy:
+                repaired_raw = repair_hierarchical_answer(
+                    plan,
+                    answer,
+                    bundle.sources,
+                    bundle.digests,
+                )
                 repaired_answer, repaired_grounded = validate_grounded_answer(
                     repaired_raw,
-                    len(repair_context),
+                    len(bundle.sources),
                 )
                 if repaired_grounded or repaired_answer != NO_ANSWER:
                     answer = repaired_answer
@@ -212,28 +215,98 @@ class RagService:
                     grounding_status = (
                         "verified_after_repair" if grounded else "citation_validation_failed"
                     )
-                    context = repair_context
+            else:
+                repair_prompt, repair_context = build_citation_repair_prompt(
+                    plan.original_question,
+                    plan.contextual_question or plan.rewritten_question,
+                    answer,
+                    expanded,
+                    settings.max_context_chars,
+                    response_mode="concise",
+                )
+                if repair_context:
+                    from app.rag.llm import llm_service
 
-        used_source_numbers = set(cited_source_numbers(answer, len(context)))
-        sources = [
-            SourceResult(
-                id=f"S{index}",
-                filename=source.result.chunk.filename,
-                page=source.result.chunk.page_number,
-                score=round(source.result.score, 4),
-                excerpt=source.excerpt,
-                content_type=source.result.chunk.content_type,
-                retrieval_method=source.result.method,
-            )
-            for index, source in enumerate(context, 1)
-            if index in used_source_numbers
-        ]
+                    repaired_raw = llm_service.answer(repair_prompt)
+                    repaired_answer, repaired_grounded = validate_grounded_answer(
+                        repaired_raw,
+                        len(repair_context),
+                    )
+                    if repaired_grounded or repaired_answer != NO_ANSWER:
+                        answer = repaired_answer
+                        grounded = repaired_grounded
+                        grounding_status = (
+                            "verified_after_repair" if grounded else "citation_validation_failed"
+                        )
+                        bundle.sources = repair_context
+
+        sources = _source_results(answer, bundle.sources)
         return AnswerResponse(
             answer=answer,
             sources=sources,
             grounded=grounded,
             grounding_status=grounding_status,
-            interpreted_question=plan.rewritten_question,
+            interpreted_question=plan.contextual_question or plan.rewritten_question,
+            contextual_question=plan.contextual_question or plan.rewritten_question,
+            retrieval_mode=plan.search_mode,
+            resolved_abbreviations=abbreviation_hints,
+            candidate_chunks=len(candidates),
+            evidence_chunks=len(bundle.sources),
+            search_queries=plan.search_queries,
+        )
+
+    def _reference_answer(
+        self,
+        plan: QueryPlan,
+        relevant: list[RetrievedChunk],
+        abbreviation_hints: list[str],
+        *,
+        candidate_chunks: int,
+    ) -> AnswerResponse:
+        prompt_sources = [PromptSource(result=item, excerpt=item.chunk.text) for item in relevant]
+        raw, used_context = build_evidence_answer(
+            plan.contextual_question or plan.original_question,
+            prompt_sources,
+        )
+        if not raw or not used_context:
+            return self._empty_answer(
+                plan,
+                abbreviation_hints,
+                candidate_chunks=candidate_chunks,
+            )
+        answer, grounded = validate_grounded_answer(raw, len(used_context))
+        return AnswerResponse(
+            answer=answer,
+            sources=_source_results(answer, used_context),
+            grounded=grounded,
+            grounding_status="verified" if grounded else "citation_validation_failed",
+            interpreted_question=plan.contextual_question or plan.rewritten_question,
+            contextual_question=plan.contextual_question or plan.rewritten_question,
+            retrieval_mode="references",
+            resolved_abbreviations=abbreviation_hints,
+            candidate_chunks=candidate_chunks,
+            evidence_chunks=len(used_context),
+            search_queries=plan.search_queries,
+        )
+
+    def _empty_answer(
+        self,
+        plan: QueryPlan,
+        abbreviation_hints: list[str],
+        *,
+        candidate_chunks: int,
+    ) -> AnswerResponse:
+        return AnswerResponse(
+            answer=NO_ANSWER,
+            sources=[],
+            grounded=False,
+            grounding_status="insufficient_evidence",
+            interpreted_question=plan.contextual_question or plan.rewritten_question,
+            contextual_question=plan.contextual_question or plan.rewritten_question,
+            retrieval_mode=plan.search_mode,
+            resolved_abbreviations=abbreviation_hints,
+            candidate_chunks=candidate_chunks,
+            evidence_chunks=0,
             search_queries=plan.search_queries,
         )
 
@@ -244,13 +317,12 @@ class RagService:
         relevant: list[RetrievedChunk],
         requested_limit: int,
     ) -> list[RetrievedChunk]:
-        seeds = relevant[: min(len(relevant), requested_limit, 12)]
-        neighbors = fetch_neighbor_chunks(db, seeds, window=1)
+        settings = get_settings()
+        seeds = relevant[: min(len(relevant), settings.neighbor_seed_limit)]
+        neighbors = fetch_neighbor_chunks(db, seeds, window=settings.neighbor_window)
         merged: dict[str, RetrievedChunk] = {}
-        for item in [*seeds, *neighbors]:
-            old = merged.get(item.chunk.chunk_id)
-            if old is None or item.score > old.score:
-                merged[item.chunk.chunk_id] = item
+        for item in [*relevant, *neighbors]:
+            _merge_candidate(merged, item)
 
         selected = self._select_context_chunks(
             plan,
@@ -266,6 +338,54 @@ class RagService:
         max_chunks: int | None = None,
     ) -> list[RetrievedChunk]:
         return select_context_chunks(plan, candidates, max_chunks=max_chunks)
+
+
+def _merge_candidate(target: dict[str, RetrievedChunk], item: RetrievedChunk) -> None:
+    old = target.get(item.chunk.chunk_id)
+    if old is None or item.score > old.score:
+        target[item.chunk.chunk_id] = item
+    elif old is not None and item.score == old.score and item.method < old.method:
+        target[item.chunk.chunk_id] = item
+
+
+def _source_results(answer: str, context: list[PromptSource]) -> list[SourceResult]:
+    used_source_numbers = set(cited_source_numbers(answer, len(context)))
+    return [
+        SourceResult(
+            id=f"S{index}",
+            filename=source.result.chunk.filename,
+            page=source.result.chunk.page_number,
+            score=round(source.result.score, 4),
+            excerpt=source.excerpt,
+            content_type=source.result.chunk.content_type,
+            retrieval_method=source.result.method,
+        )
+        for index, source in enumerate(context, 1)
+        if index in used_source_numbers
+    ]
+
+
+def _result_sort_key(item: RetrievedChunk) -> tuple[float, str, int, int, str]:
+    chunk = item.chunk
+    return (
+        -float(item.score),
+        chunk.filename.casefold(),
+        chunk.page_number,
+        chunk.chunk_index if chunk.chunk_index is not None else -1,
+        chunk.chunk_id,
+    )
+
+
+def _unique(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        clean = " ".join(str(value).split())
+        key = clean.casefold()
+        if clean and key not in seen:
+            seen.add(key)
+            result.append(clean)
+    return result
 
 
 rag_service = RagService()

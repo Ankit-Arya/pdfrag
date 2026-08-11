@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, replace
 
+from app.config import get_settings
 from app.rag.normalization import search_terms
 from app.rag.structure import (
     major_section_match_score,
@@ -22,6 +23,7 @@ _CONTEXT_LINE_RE = re.compile(
 _STOPWORDS = {
     "a",
     "about",
+    "all",
     "an",
     "and",
     "are",
@@ -67,11 +69,13 @@ _INTENT_CUES = {
     "procedure": {
         "action",
         "after",
+        "authorization",
         "before",
         "check",
         "ensure",
         "instruction",
         "isolate",
+        "permission",
         "procedure",
         "reset",
         "step",
@@ -100,9 +104,12 @@ _INTENT_CUES = {
     "requirement": {
         "mandatory",
         "must",
+        "permission",
         "prerequisite",
+        "prohibited",
         "requirement",
         "required",
+        "rule",
         "shall",
     },
     "definition": {"definition", "means", "refers", "term"},
@@ -129,77 +136,78 @@ def select_context_chunks(
     candidates: list[RetrievedChunk],
     max_chunks: int | None = None,
 ) -> list[RetrievedChunk]:
-    """Select answerable evidence instead of forwarding broad retrieval output.
-
-    Vector similarity remains one signal, but a chunk must also match the
-    question's focus, exact constraints, expected answer shape, or the context
-    of a stronger anchor. This prevents generic manual headings and unrelated
-    procedures from winning merely because their embeddings are similar.
-    """
+    """Keep all materially relevant evidence instead of treating top-K as truth."""
     if not candidates:
         return []
 
     focus_terms = _focus_terms(plan)
     anchor_groups = _anchor_groups(plan)
     scored = [
-        _score_candidate(plan, candidate, focus_terms, anchor_groups) for candidate in candidates
+        _score_candidate(plan, candidate, focus_terms, anchor_groups)
+        for candidate in candidates
     ]
-    scored.sort(key=lambda item: item.relevance, reverse=True)
+    scored.sort(key=_scored_sort_key)
 
-    # A bare chapter-title request should resolve the chapter itself. Once a
-    # major section-path match exists, incidental mentions in definitions or
-    # accident descriptions are not alternative answers to that title query.
     major_matches = [item for item in scored if item.major_section_match >= 0.9]
-    if plan.response_mode == "evidence" and major_matches:
+    if plan.search_mode == "references" and major_matches:
         scored = major_matches
 
     best = scored[0].relevance
-    if best < 0.12:
+    if best < 0.08:
         return []
 
-    cutoff = max(0.16, best * 0.48)
-    eligible: list[_ScoredChunk] = []
-
-    for item in scored:
-        has_focus = item.coverage >= 0.50 or item.section_match >= 0.88 or not focus_terms
-        required_anchor_coverage = (
-            1.0 / len(anchor_groups) if anchor_groups and plan.intent == "comparison" else 1.0
-        )
-        has_anchor = item.anchor_coverage >= required_anchor_coverage or not anchor_groups
-        has_intent = item.intent_evidence >= 0.12
-        constraint_ok = item.section_match >= 0.88 or (
-            has_anchor if anchor_groups else (has_focus or has_intent)
-        )
-        if item.relevance >= cutoff and has_focus and constraint_ok:
-            eligible.append(item)
+    if plan.search_mode == "references":
+        eligible = [
+            item
+            for item in scored
+            if item.coverage > 0
+            or item.section_match >= 0.70
+            or item.result.keyword_score > 0
+            or "corpus-fts" in item.result.method
+        ]
+    else:
+        cutoff = max(0.10, best * 0.32)
+        eligible = []
+        for item in scored:
+            has_focus = item.coverage >= 0.25 or item.section_match >= 0.82 or not focus_terms
+            required_anchor_coverage = (
+                1.0 / len(anchor_groups)
+                if anchor_groups and plan.intent == "comparison"
+                else 1.0
+            )
+            has_anchor = item.anchor_coverage >= required_anchor_coverage or not anchor_groups
+            has_intent = item.intent_evidence >= 0.08
+            constraint_ok = item.section_match >= 0.82 or (
+                has_anchor if anchor_groups else (has_focus or has_intent)
+            )
+            if item.relevance >= cutoff and has_focus and constraint_ok:
+                eligible.append(item)
 
     if not eligible:
         top = scored[0]
-        if top.coverage >= 0.25 or top.anchor_coverage > 0:
-            eligible.append(top)
+        if top.coverage >= 0.20 or top.anchor_coverage > 0 or top.section_match >= 0.75:
+            eligible = [top]
         else:
             return []
 
-    eligible_document_count = len({_document_key(item.result.chunk) for item in eligible})
-    limit = _selection_limit(plan, max_chunks, eligible_document_count)
-    selected = _document_diverse_selection(eligible, limit)
+    limit = _selection_limit(plan, max_chunks)
+    selected = _strong_then_diverse_selection(eligible, limit)
 
-    # A continuation can omit the acronym or full subject while still containing
-    # essential steps. Keep it only when it is close to a selected anchor and has
-    # either topical or intent-specific evidence.
+    # Pull same-section / adjacent continuations into remaining capacity. A
+    # continuation may omit the acronym but contain the next procedural steps.
     selected_ids = {item.result.chunk.chunk_id for item in selected}
     for item in scored:
         if len(selected) >= limit:
             break
         if item.result.chunk.chunk_id in selected_ids:
             continue
-        if item.coverage < 0.22 and item.intent_evidence < 0.12:
+        if item.coverage < 0.15 and item.intent_evidence < 0.08:
             continue
         if any(_supports_anchor(item, anchor) for anchor in selected):
             selected.append(item)
             selected_ids.add(item.result.chunk.chunk_id)
 
-    selected.sort(key=lambda item: item.relevance, reverse=True)
+    selected.sort(key=_scored_sort_key)
     return [
         replace(
             item.result,
@@ -224,9 +232,10 @@ def _score_candidate(
     coverage = _coverage(focus_terms, text_terms)
     heading_coverage = _coverage(focus_terms, heading_terms)
     anchor_coverage = _group_coverage(anchor_groups, exact_text_terms)
-    structural_match = section_match_score(plan.original_question, section_path)
+    question_for_structure = plan.contextual_question or plan.original_question
+    structural_match = section_match_score(question_for_structure, section_path)
     major_structural_match = major_section_match_score(
-        plan.original_question,
+        question_for_structure,
         section_path,
     )
 
@@ -237,18 +246,18 @@ def _score_candidate(
 
     retrieval = max(0.0, min(1.0, float(result.score)))
     relevance = (
-        retrieval * 0.40
-        + coverage * 0.32
-        + heading_coverage * 0.13
-        + intent_evidence * 0.10
-        + anchor_coverage * 0.05
-        + structural_match * 0.28
+        retrieval * 0.36
+        + coverage * 0.34
+        + heading_coverage * 0.12
+        + intent_evidence * 0.08
+        + anchor_coverage * 0.10
+        + structural_match * 0.24
     )
 
-    if focus_terms and coverage < 0.18:
-        relevance *= 0.42
-    if anchor_groups and anchor_coverage < 1.0:
-        relevance *= 0.62
+    if focus_terms and coverage < 0.12:
+        relevance *= 0.55
+    if anchor_groups and anchor_coverage == 0 and structural_match < 0.82:
+        relevance *= 0.72
     if _is_generic_heading(chunk.text) and coverage < 0.5:
         relevance *= 0.55
 
@@ -276,57 +285,63 @@ def _supports_anchor(candidate: _ScoredChunk, anchor: _ScoredChunk) -> bool:
         and left.document_id == right.document_id
         and left.chunk_index is not None
         and right.chunk_index is not None
-        and abs(left.chunk_index - right.chunk_index) <= 1
+        and abs(left.chunk_index - right.chunk_index) <= 2
     ):
         return True
     return abs(left.page_number - right.page_number) <= 1
 
 
-def _selection_limit(
-    plan: QueryPlan,
-    requested: int | None,
-    relevant_document_count: int,
-) -> int:
-    if plan.response_mode == "evidence":
-        return min(max(requested or 16, 12), 30)
-
-    question_terms = _tokens(plan.original_question)
-    complex_question = (
-        plan.intent in {"comparison", "summary", "troubleshooting"}
-        or len(question_terms) > 10
-        or bool({"and", "versus", "vs"} & question_terms)
+def _selection_limit(plan: QueryPlan, requested: int | None) -> int:
+    settings = get_settings()
+    configured = (
+        settings.reference_evidence_chunk_limit
+        if plan.search_mode == "references"
+        else settings.answer_evidence_chunk_limit
     )
-    adaptive = 8 if complex_question else 4
-    adaptive = max(adaptive, min(relevant_document_count, 12))
-    if requested is not None:
-        adaptive = min(adaptive, max(1, requested))
-    return adaptive
+    if requested is None:
+        return configured
+    return min(configured, max(1, requested))
 
 
-def _document_diverse_selection(
+def _strong_then_diverse_selection(
     eligible: list[_ScoredChunk],
     limit: int,
 ) -> list[_ScoredChunk]:
+    if limit <= 0:
+        return []
+
     selected: list[_ScoredChunk] = []
     selected_ids: set[str] = set()
     seen_documents: set[str] = set()
 
+    # Keep the strongest procedure/context together first, then broaden document
+    # coverage. This avoids displacing a multi-chunk answer merely to show more PDFs.
+    strength_slots = min(len(eligible), max(1, int(limit * 0.60)))
+    for item in eligible[:strength_slots]:
+        selected.append(item)
+        selected_ids.add(item.result.chunk.chunk_id)
+        seen_documents.add(_document_key(item.result.chunk))
+
     for item in eligible:
+        if len(selected) >= limit:
+            break
+        if item.result.chunk.chunk_id in selected_ids:
+            continue
         document_key = _document_key(item.result.chunk)
         if document_key in seen_documents:
             continue
         selected.append(item)
         selected_ids.add(item.result.chunk.chunk_id)
         seen_documents.add(document_key)
-        if len(selected) >= limit:
-            return selected
 
     for item in eligible:
+        if len(selected) >= limit:
+            break
         if item.result.chunk.chunk_id in selected_ids:
             continue
         selected.append(item)
-        if len(selected) >= limit:
-            break
+        selected_ids.add(item.result.chunk.chunk_id)
+
     return selected
 
 
@@ -336,16 +351,17 @@ def _document_key(chunk: TextChunk) -> str:
 
 def _focus_terms(plan: QueryPlan) -> set[str]:
     supplied = " ".join([*plan.focus_terms, *plan.context_terms])
-    terms = _tokens(supplied) if supplied.strip() else _tokens(plan.original_question)
-    return {term for term in terms if term not in _STOPWORDS}
+    base = supplied if supplied.strip() else (plan.contextual_question or plan.original_question)
+    return {term for term in _tokens(base) if term not in _STOPWORDS}
 
 
 def _anchor_groups(plan: QueryPlan) -> list[set[str]]:
+    question = plan.contextual_question or plan.original_question
     values = [*plan.context_terms]
-    values.extend(_QUOTED_RE.findall(plan.original_question))
+    values.extend(_QUOTED_RE.findall(question))
     values.extend(
         token
-        for token in _TOKEN_RE.findall(plan.original_question)
+        for token in _TOKEN_RE.findall(question)
         if any(char.isdigit() for char in token)
         or (len(token) >= 2 and token.upper() == token and any(char.isalpha() for char in token))
     )
@@ -405,3 +421,14 @@ def _append_method(method: str, value: str) -> str:
     if value not in parts:
         parts.append(value)
     return "+".join(parts)
+
+
+def _scored_sort_key(item: _ScoredChunk) -> tuple[float, str, int, int, str]:
+    chunk = item.result.chunk
+    return (
+        -item.relevance,
+        chunk.filename.casefold(),
+        chunk.page_number,
+        chunk.chunk_index if chunk.chunk_index is not None else -1,
+        chunk.chunk_id,
+    )

@@ -73,12 +73,18 @@ class LlmService:
         user_prompt: str,
         *,
         max_output_tokens: int | None = None,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
     ) -> str:
         last_error: BaseException | None = None
         for attempt in range(3):
             try:
                 return self._generate_once(
-                    system_prompt, user_prompt, max_output_tokens=max_output_tokens
+                    system_prompt,
+                    user_prompt,
+                    max_output_tokens=max_output_tokens,
+                    model=model,
+                    reasoning_effort=reasoning_effort,
                 )
             except _TRANSIENT_LLM_ERRORS as exc:
                 last_error = exc
@@ -95,12 +101,16 @@ class LlmService:
         user_prompt: str,
         *,
         max_output_tokens: int | None = None,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
     ) -> str:
         settings = get_settings()
         token_limit = max_output_tokens or settings.max_output_tokens
+        selected_model = model or settings.llm_model
+
         if settings.llm_base_url:
             response = self.client.chat.completions.create(
-                model=settings.llm_model,
+                model=selected_model,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
@@ -111,16 +121,57 @@ class LlmService:
             content = response.choices[0].message.content
             return (content or "").strip()
 
-        response = self.client.responses.create(
-            model=settings.llm_model,
-            instructions=system_prompt,
-            input=user_prompt,
-            max_output_tokens=token_limit,
-        )
+        request: dict[str, Any] = {
+            "model": selected_model,
+            "instructions": system_prompt,
+            "input": user_prompt,
+            "max_output_tokens": token_limit,
+        }
+        if reasoning_effort and _supports_reasoning(selected_model):
+            request["reasoning"] = {"effort": reasoning_effort}
+
+        response = self.client.responses.create(**request)
         return response.output_text.strip()
 
     def answer(self, user_prompt: str) -> str:
-        return self.generate(SYSTEM_PROMPT, user_prompt)
+        settings = get_settings()
+        return self.generate(
+            SYSTEM_PROMPT,
+            user_prompt,
+            model=settings.llm_model,
+            reasoning_effort=settings.llm_reasoning_effort,
+        )
+
+    def plan(self, system_prompt: str, user_prompt: str, *, max_output_tokens: int = 700) -> str:
+        settings = get_settings()
+        return self.generate(
+            system_prompt,
+            user_prompt,
+            max_output_tokens=max_output_tokens,
+            model=settings.query_model,
+            reasoning_effort=settings.query_reasoning_effort,
+        )
+
+    def summarize(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        max_output_tokens: int | None = None,
+    ) -> str:
+        settings = get_settings()
+        return self.generate(
+            system_prompt,
+            user_prompt,
+            max_output_tokens=max_output_tokens or settings.summary_max_output_tokens,
+            model=settings.summary_model,
+            reasoning_effort=settings.summary_reasoning_effort,
+        )
+
+
+def _supports_reasoning(model: str) -> bool:
+    lowered = model.casefold()
+    return lowered.startswith(("gpt-5", "o1", "o3", "o4"))
 
 
 llm_service = LlmService()
