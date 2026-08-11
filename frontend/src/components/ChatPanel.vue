@@ -139,6 +139,12 @@ function evidenceIsExpanded(messageId: string): boolean {
   return expandedEvidenceIds.value.has(messageId)
 }
 
+function displayEvidenceExcerpt(value: string): string {
+  return value
+    .replace(/\[PDF CHUNK CONTEXT\][\s\S]*?\[\/PDF CHUNK CONTEXT\]\s*/gi, '')
+    .trim()
+}
+
 onMounted(() => {
   void loadDocumentLibrary()
 })
@@ -316,32 +322,25 @@ onBeforeUnmount(() => {
               <span>Evidence reviewed by AI</span>
               <span class="sources-count">
                 {{ message.response.evidence.length }}
-                chunk{{ message.response.evidence.length === 1 ? '' : 's' }}
+                excerpt{{ message.response.evidence.length === 1 ? '' : 's' }}
               </span>
             </summary>
-            <div v-if="evidenceIsExpanded(message.id)" class="formatted-evidence-wrap">
-              <div
-                v-if="message.response.formatted_evidence"
-                class="formatted-evidence markdown-body"
-                v-html="renderMarkdown(message.response.formatted_evidence)"
-              />
-              <div v-else class="source-list">
-                <details
-                  v-for="source in message.response.evidence"
-                  :key="`ai-${message.id}-${source.id}`"
-                  class="source-card"
-                >
-                  <summary>
-                    <span class="source-id">{{ source.id }}</span>
-                    <span class="source-title">{{ source.filename }}</span>
-                    <span class="source-page">p. {{ source.page }}</span>
-                  </summary>
-                  <div
-                    class="source-excerpt markdown-body"
-                    v-html="renderMarkdown(source.excerpt)"
-                  />
-                </details>
-              </div>
+            <div v-if="evidenceIsExpanded(message.id)" class="source-list evidence-source-list">
+              <details
+                v-for="source in message.response.evidence"
+                :key="`ai-${message.id}-${source.id}`"
+                class="source-card"
+              >
+                <summary>
+                  <span class="source-id">{{ source.id }}</span>
+                  <span class="source-title">{{ source.filename }}</span>
+                  <span class="source-page">p. {{ source.page }}</span>
+                </summary>
+                <div
+                  class="source-excerpt markdown-body"
+                  v-html="renderMarkdown(displayEvidenceExcerpt(source.excerpt))"
+                />
+              </details>
             </div>
           </details>
 
@@ -353,12 +352,7 @@ onBeforeUnmount(() => {
                 source{{ message.response.sources.length === 1 ? '' : 's' }}
               </span>
             </summary>
-            <div
-              v-if="message.response.formatted_sources"
-              class="formatted-evidence markdown-body"
-              v-html="renderMarkdown(message.response.formatted_sources)"
-            />
-            <div v-else class="source-list">
+            <div class="source-list evidence-source-list">
               <details
                 v-for="source in message.response.sources"
                 :key="source.id"
@@ -371,7 +365,7 @@ onBeforeUnmount(() => {
                 </summary>
                 <div
                   class="source-excerpt markdown-body"
-                  v-html="renderMarkdown(source.excerpt)"
+                  v-html="renderMarkdown(displayEvidenceExcerpt(source.excerpt))"
                 />
               </details>
             </div>

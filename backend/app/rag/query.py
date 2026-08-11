@@ -102,6 +102,30 @@ _ANSWER_CUES = {
     "voltage",
     "weight",
 }
+_FACT_DIMENSION_CUES = {
+    "amount",
+    "capacity",
+    "date",
+    "distance",
+    "duration",
+    "frequency",
+    "height",
+    "length",
+    "limit",
+    "limits",
+    "maximum",
+    "minimum",
+    "number",
+    "pressure",
+    "speed",
+    "temperature",
+    "time",
+    "timing",
+    "value",
+    "voltage",
+    "weight",
+}
+
 _FOLLOWUP_STARTS = (
     "and ",
     "also ",
@@ -229,9 +253,21 @@ class QueryPlanner:
     ) -> QueryPlan:
         settings = get_settings()
         normalized = " ".join(question.split())
-        history = conversation_context or []
+        # Enforce topic isolation inside the planner itself, not only at the API
+        # caller. A self-contained question must produce the same retrieval plan
+        # whether it is asked in a fresh chat or after an unrelated topic.
+        needs_history = needs_conversation_context(normalized)
+        history = (conversation_context or []) if needs_history else []
+        route_hints = (routing_hints or []) if needs_history else []
         hints = abbreviation_hints or []
-        route_hints = routing_hints or []
+        if not needs_history:
+            current_terms = {token.casefold() for token in _TERM_PATTERN.findall(normalized)}
+            hints = [
+                hint
+                for hint in hints
+                if (match := _HINT_TOKEN_PATTERN.match(hint))
+                and match.group(1).casefold() in current_terms
+            ]
         fallback_context = _fallback_contextual_question(normalized, history)
         fallback_intent = _infer_intent(fallback_context)
         fallback_mode = _infer_search_mode(normalized, fallback_context)
@@ -594,7 +630,14 @@ def _infer_intent(value: str) -> str:
         return "procedure"
     if {"required", "requirement", "requirements", "must", "shall", "prerequisite", "rules", "rule"} & terms:
         return "requirement"
-    if lowered.startswith("what is ") or lowered.startswith("what does ") or "define" in terms:
+    # "What is ..." is not automatically a definition. Questions such as
+    # "what is pilot speed in AEL" or "what is the maximum pressure" are
+    # measurable fact lookups and should be ranked/synthesized as such.
+    if terms & _FACT_DIMENSION_CUES:
+        return "fact_lookup"
+    if lowered.startswith("what does ") or "define" in terms:
+        return "definition"
+    if lowered.startswith("what is "):
         return "definition"
     if {"summarize", "summary", "overview"} & terms:
         return "summary"

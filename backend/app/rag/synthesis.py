@@ -55,7 +55,7 @@ def synthesize_answer(
     settings = get_settings()
     estimated_chars = sum(len(item.chunk.text) + len(item.chunk.filename) + 180 for item in results)
 
-    sources = _prompt_sources(results)
+    sources = _prompt_sources(plan, results)
     if estimated_chars <= int(settings.max_context_chars * 0.85):
         prompt = _build_direct_answer_prompt(plan, sources)
         return SynthesisBundle(
@@ -132,6 +132,48 @@ If no supported answer exists, reply exactly:
     return _answer(prompt)
 
 
+def rescue_fact_answer(
+    plan: QueryPlan,
+    sources: list[PromptSource],
+    *,
+    max_sources: int = 24,
+) -> str:
+    """Retry an unexpected no-answer using the strongest original source labels.
+
+    The normal synthesis still reviews every selected chunk. This rescue is only
+    invoked when that pass says no answer for a direct fact/definition despite
+    having evidence. It keeps the same S-numbering, so citations remain valid
+    against the complete reviewed-evidence list.
+    """
+    if plan.intent not in {"fact_lookup", "definition"} or not sources:
+        return NO_ANSWER
+    selected = list(enumerate(sources[:max_sources], 1))
+    blocks: list[str] = []
+    for index, source in selected:
+        chunk = source.result.chunk
+        blocks.append(
+            f"[S{index}] File: {chunk.filename} | Page: {chunk.page_number} | "
+            f"Type: {chunk.content_type}\n{source.excerpt}"
+        )
+    prompt = f"""The broad evidence pass unexpectedly returned no answer for a direct lookup.
+Re-check only the strongest evidence below and answer the ORIGINAL QUESTION if it is supported.
+Do not infer from filenames or conversation history. For a single fact, return one sentence.
+Use only the existing [S#] labels.
+
+ORIGINAL QUESTION:
+{plan.original_question}
+
+CONTEXTUAL INTERPRETATION (intent only):
+{plan.contextual_question or plan.rewritten_question}
+
+STRONGEST SOURCE EXCERPTS:
+{chr(10).join(blocks)}
+
+If these excerpts still do not support the answer, reply exactly: {NO_ANSWER}
+"""
+    return _answer(prompt)
+
+
 def _answer(prompt: str) -> str:
     settings = get_settings()
     return llm_service.generate(
@@ -142,16 +184,23 @@ def _answer(prompt: str) -> str:
     )
 
 
-def _prompt_sources(results: list[RetrievedChunk]) -> list[PromptSource]:
-    ordered = sorted(
-        results,
-        key=lambda item: (
-            item.chunk.filename.casefold(),
-            item.chunk.page_number,
-            item.chunk.chunk_index if item.chunk.chunk_index is not None else -1,
-            item.chunk.chunk_id,
-        ),
-    )
+def _prompt_sources(plan: QueryPlan, results: list[RetrievedChunk]) -> list[PromptSource]:
+    # Relevance selection already returns strongest-first evidence. Preserve that
+    # order for simple facts/definitions so the direct answer is not buried deep
+    # in a long document-sorted prompt. For procedures and broader synthesis,
+    # document/page order still helps preserve sequence and applicability.
+    if plan.intent in {"fact_lookup", "definition"}:
+        ordered = list(results)
+    else:
+        ordered = sorted(
+            results,
+            key=lambda item: (
+                item.chunk.filename.casefold(),
+                item.chunk.page_number,
+                item.chunk.chunk_index if item.chunk.chunk_index is not None else -1,
+                item.chunk.chunk_id,
+            ),
+        )
     return [PromptSource(result=item, excerpt=item.chunk.text.strip()) for item in ordered]
 
 
@@ -328,6 +377,9 @@ QUESTION INTENT:
 SOURCE MAP:
 {_source_map(sources)}
 
+HIGH-PRIORITY DIRECT EVIDENCE:
+{_priority_source_blocks(plan, sources)}
+
 SOURCE EXCERPTS (HIERARCHICAL EVIDENCE DIGESTS):
 {digests}
 
@@ -344,6 +396,30 @@ Required answer behavior:
 - Do not use conversation history, the model's general knowledge, or uncited assumptions as facts.
 - If no supported answer exists, reply exactly: {NO_ANSWER}
 """
+
+
+def _priority_source_blocks(
+    plan: QueryPlan,
+    sources: list[PromptSource],
+    *,
+    max_sources: int = 16,
+    max_chars: int = 30000,
+) -> str:
+    if plan.intent not in {"fact_lookup", "definition"}:
+        return "Not required for this question type."
+    blocks: list[str] = []
+    used = 0
+    for index, source in enumerate(sources[:max_sources], 1):
+        chunk = source.result.chunk
+        block = (
+            f"[S{index}] File: {chunk.filename} | Page: {chunk.page_number} | "
+            f"Type: {chunk.content_type}\n{source.excerpt}"
+        )
+        if blocks and used + len(block) > max_chars:
+            break
+        blocks.append(block)
+        used += len(block)
+    return "\n\n---\n\n".join(blocks) if blocks else "None"
 
 
 def _source_map(sources: list[PromptSource]) -> str:

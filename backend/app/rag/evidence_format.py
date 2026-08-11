@@ -12,6 +12,20 @@ _CONTEXT_BLOCK_RE = re.compile(
 _PAGES_RE = re.compile(r"^Pages:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
 _SECTION_RE = re.compile(r"^Section path:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
 
+def clean_display_excerpt(value: str) -> str:
+    """Return the human-readable PDF excerpt without synthetic retrieval metadata.
+
+    This is intentionally display-only. The model continues to receive the original
+    chunk, including its structural context envelope. Keeping the two representations
+    separate prevents UI formatting changes from affecting retrieval or grounding.
+    """
+    _, body = _split_context(value)
+    clean = (body or value).strip()
+    # Be defensive about malformed/duplicated envelopes from older indexed chunks.
+    clean = _CONTEXT_BLOCK_RE.sub("", clean).strip()
+    return clean
+
+
 
 def format_prompt_sources_markdown(
     sources: list[PromptSource],
@@ -37,9 +51,7 @@ def format_prompt_sources_markdown(
             section = " > ".join(chunk.section_path)
         if not section:
             section = chunk.heading or ""
-        clean_body = body.strip()
-        if not clean_body:
-            clean_body = source.excerpt.strip()
+        clean_body = clean_display_excerpt(source.excerpt)
         groups.setdefault((chunk.filename, pages, section), []).append(
             (index, source, clean_body)
         )

@@ -13,7 +13,7 @@ from app.models import AnswerResponse, SourceResult
 from app.rag.chunking import chunk_pages
 from app.rag.embeddings import EmbeddingUnavailableError, embedding_service
 from app.rag.evidence import build_evidence_answer
-from app.rag.evidence_format import format_prompt_sources_markdown
+from app.rag.evidence_format import clean_display_excerpt, format_prompt_sources_markdown
 from app.rag.guardrails import cited_source_numbers, validate_grounded_answer
 from app.rag.pdf import PdfProcessingError, extract_pdf_pages
 from app.rag.postgres_store import (
@@ -30,6 +30,7 @@ from app.rag.relevance import select_context_chunks
 from app.rag.synthesis import (
     repair_direct_answer,
     repair_hierarchical_answer,
+    rescue_fact_answer,
     synthesize_answer,
 )
 from app.rag.types import PromptSource, QueryPlan, RetrievedChunk
@@ -242,6 +243,22 @@ class RagService:
         answer, grounded = validate_grounded_answer(bundle.raw_answer, len(bundle.sources))
         grounding_status = "verified" if grounded else "citation_validation_failed"
 
+        # A lower-cost model should not turn an obvious direct fact into a false
+        # "not found" merely because the broad evidence set is large. The normal
+        # pass already reviewed every selected chunk; this targeted retry exposes
+        # the strongest original excerpts while preserving the same S-number map.
+        if answer == NO_ANSWER and plan.intent in {"fact_lookup", "definition"}:
+            rescued_raw = rescue_fact_answer(plan, bundle.sources)
+            rescued_answer, rescued_grounded = validate_grounded_answer(
+                rescued_raw, len(bundle.sources)
+            )
+            if rescued_answer != NO_ANSWER:
+                answer = rescued_answer
+                grounded = rescued_grounded
+                grounding_status = (
+                    "verified_after_repair" if grounded else "citation_validation_failed"
+                )
+
         if not grounded and answer != NO_ANSWER:
             if bundle.used_hierarchy:
                 repaired_raw = repair_hierarchical_answer(
@@ -439,7 +456,7 @@ def _source_results(answer: str, context: list[PromptSource]) -> list[SourceResu
             filename=source.result.chunk.filename,
             page=source.result.chunk.page_number,
             score=round(source.result.score, 4),
-            excerpt=source.excerpt,
+            excerpt=clean_display_excerpt(source.excerpt),
             content_type=source.result.chunk.content_type,
             retrieval_method=source.result.method,
         )
@@ -455,7 +472,7 @@ def _evidence_results(context: list[PromptSource]) -> list[SourceResult]:
             filename=source.result.chunk.filename,
             page=source.result.chunk.page_number,
             score=round(source.result.score, 4),
-            excerpt=source.excerpt,
+            excerpt=clean_display_excerpt(source.excerpt),
             content_type=source.result.chunk.content_type,
             retrieval_method=source.result.method,
         )

@@ -23,16 +23,16 @@ class Settings(BaseSettings):
     # Use a stronger, pinned answer model for consistent operational-document QA.
     # QUERY_MODEL can remain smaller/cheaper because it only resolves intent and
     # produces retrieval variants; facts still have to come from document chunks.
-    llm_model: str = "gpt-5.6-sol"
-    query_model: str = "gpt-5.6-terra"
-    summary_model: str = "gpt-5.6-terra"
+    llm_model: str = "gpt-5.6-terra"
+    query_model: str = "gpt-5.6-luna"
+    summary_model: str = "gpt-5.6-luna"
     llm_base_url: str = ""
-    llm_timeout_seconds: float = Field(default=90, ge=5, le=300)
-    llm_reasoning_effort: Literal["none", "low", "medium", "high", "xhigh", "max"] = "high"
+    llm_timeout_seconds: float = Field(default=60, ge=5, le=300)
+    llm_reasoning_effort: Literal["none", "low", "medium", "high", "xhigh", "max"] = "medium"
     query_reasoning_effort: Literal["none", "low", "medium", "high", "xhigh", "max"] = "low"
-    summary_reasoning_effort: Literal["none", "low", "medium", "high", "xhigh", "max"] = "medium"
-    max_output_tokens: int = Field(default=6000, ge=100, le=20000)
-    summary_max_output_tokens: int = Field(default=5000, ge=400, le=12000)
+    summary_reasoning_effort: Literal["none", "low", "medium", "high", "xhigh", "max"] = "low"
+    max_output_tokens: int = Field(default=2500, ge=100, le=20000)
+    summary_max_output_tokens: int = Field(default=2500, ge=400, le=12000)
 
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     embedding_dimensions: int = 384
