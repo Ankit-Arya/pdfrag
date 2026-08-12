@@ -62,6 +62,17 @@ _REFERENCE_CUES = {
     "references",
     "search",
 }
+_EXPLICIT_REFERENCE_ACTION_CUES = {
+    "find",
+    "mention",
+    "mentioned",
+    "mentions",
+    "occurrence",
+    "occurrences",
+    "reference",
+    "references",
+    "search",
+}
 _ANSWER_CUES = {
     "allowed",
     "amount",
@@ -76,6 +87,18 @@ _ANSWER_CUES = {
     "height",
     "information",
     "info",
+    "item",
+    "items",
+    "equipment",
+    "equipments",
+    "contents",
+    "content",
+    "carry",
+    "carried",
+    "keep",
+    "kept",
+    "possession",
+    "required",
     "instruction",
     "instructions",
     "length",
@@ -124,6 +147,35 @@ _FACT_DIMENSION_CUES = {
     "value",
     "voltage",
     "weight",
+}
+
+_LIST_DIMENSION_CUES = {
+    "content",
+    "contents",
+    "document",
+    "documents",
+    "equipment",
+    "equipments",
+    "item",
+    "items",
+    "inventory",
+    "inventories",
+    "things",
+}
+_LIST_RELATION_CUES = {
+    "carry",
+    "carried",
+    "contain",
+    "contained",
+    "contains",
+    "have",
+    "include",
+    "included",
+    "includes",
+    "keep",
+    "kept",
+    "possession",
+    "required",
 }
 
 _PROCEDURE_PHRASE_STARTS = (
@@ -246,9 +298,12 @@ Return JSON only with these keys:
   equipment, procedure, location or internal code;
 - search_mode: either references or answer.
 
-Use search_mode=references for a bare concept/keyword lookup where the user primarily wants
-where it appears in the corpus. Use search_mode=answer for a question, request for rules/info,
-procedure, explanation, comparison, requirement or other synthesized answer.
+Use search_mode=references only for a bare concept/keyword lookup or an explicit request to
+find/search/show mentions/references in the corpus. Use search_mode=answer for a question, request
+for rules/info, procedure, explanation, comparison, requirement, list/composition, or other
+synthesized answer. Natural shorthand such as "items to be kept in kit bag", "kit bag contents",
+"equipment carried by TO", or "documents required for X" is an answer request even without a
+question mark or leading question word.
 """
 
 
@@ -303,7 +358,7 @@ class QueryPlanner:
             intent=fallback_intent,
             response_mode="evidence" if fallback_mode == "references" else "concise",
             search_mode=fallback_mode,
-            focus_terms=_extract_focus_terms(fallback_context),
+            focus_terms=_extract_focus_terms_for_intent(fallback_context, fallback_intent),
             context_terms=_unique([*_extract_context_terms(fallback_context, hints), *route_hints])[:32],
             abbreviation_hints=hints,
             routing_hints=route_hints,
@@ -525,7 +580,13 @@ def _validate_plan(
     raw_context = payload.get("context_terms")
     model_context = _validated_terms(raw_context, allowed_terms)
 
-    focus_terms = _unique([*_extract_focus_terms(contextual), *model_focus])[:48]
+    focus_terms = _unique([*_extract_focus_terms_for_intent(contextual, intent), *model_focus])
+    if intent == "list":
+        generic_list_terms = _LIST_DIMENSION_CUES | _LIST_RELATION_CUES | {"list"}
+        focus_terms = [
+            term for term in focus_terms if term.casefold() not in generic_list_terms
+        ]
+    focus_terms = focus_terms[:48]
     context_terms = _unique(
         [*_extract_context_terms(contextual, hints), *active_routing_hints, *model_context]
     )[:32]
@@ -614,9 +675,19 @@ def _infer_search_mode(original: str, contextual: str) -> str:
     terms = {token.casefold() for token in _TERM_PATTERN.findall(original)}
     if original.rstrip().endswith("?") or lowered.startswith(_QUESTION_STARTS):
         return "answer"
+
+    # Explicit corpus-navigation wording wins over answer heuristics. This keeps
+    # "find mentions of kit bag" as a reference search while allowing shorthand
+    # answer requests such as "items to be kept in kit bag".
+    if terms & _EXPLICIT_REFERENCE_ACTION_CUES:
+        return "references"
+
+    if _looks_like_list_request(lowered, terms):
+        return "answer"
+
     if terms & _ANSWER_CUES:
-        # A fact dimension needs a subject to become a synthesized answer. A lone
-        # keyword such as "speed" or "date" is still a broad reference lookup.
+        # A dimension needs a real subject to become a synthesized answer. A lone
+        # keyword such as "speed", "date", or "items" is still reference mode.
         subject_terms = {
             term
             for term in terms
@@ -627,8 +698,7 @@ def _infer_search_mode(original: str, contextual: str) -> str:
     if terms & _REFERENCE_CUES:
         return "references"
     # A bare concept or short noun phrase with no answer dimension is treated as
-    # corpus/reference discovery. Fact dimensions such as speed/date/limit are
-    # included in _ANSWER_CUES above, so "speed of pilot train on AEL" is an answer.
+    # corpus/reference discovery.
     contextual_terms = [
         token
         for token in _TERM_PATTERN.findall(contextual)
@@ -657,6 +727,8 @@ def _infer_intent(value: str) -> str:
         or {"process", "procedure", "steps", "reset", "isolate", "operate"} & terms
     ):
         return "procedure"
+    if _looks_like_list_request(lowered, terms):
+        return "list"
     if {"required", "requirement", "requirements", "must", "shall", "prerequisite", "rules", "rule"} & terms:
         return "requirement"
     # "What is ..." is not automatically a definition. Questions such as
@@ -673,6 +745,68 @@ def _infer_intent(value: str) -> str:
     if lowered.startswith("list ") or {"list", "types"} & terms:
         return "list"
     return "fact_lookup"
+
+
+def _looks_like_list_request(lowered: str, terms: set[str]) -> bool:
+    """Recognize natural shorthand that asks for the contents/composition of X.
+
+    Operators often type fragments rather than grammatical questions, for example
+    "items to be kept in kit bag". Treat these as synthesized list requests while
+    leaving a lone keyword such as "kit bag" or "items" in reference mode.
+    """
+    if lowered.startswith("what is in ") or lowered.startswith("what are in "):
+        return any(term not in _FOCUS_STOPWORDS for term in terms)
+
+    dimensions = terms & _LIST_DIMENSION_CUES
+    if not dimensions:
+        return False
+    if terms & _LIST_RELATION_CUES and len(terms) >= 2:
+        return True
+    if dimensions & {
+        "content",
+        "contents",
+        "equipment",
+        "equipments",
+        "item",
+        "items",
+        "inventory",
+        "inventories",
+        "things",
+    } and len(terms) >= 2:
+        return True
+    subject_terms = {
+        term
+        for term in terms
+        if term not in _LIST_DIMENSION_CUES
+        and term not in _LIST_RELATION_CUES
+        and term not in _ANSWER_CUES
+        and term not in _FOCUS_STOPWORDS
+    }
+    if not subject_terms:
+        return False
+    if re.search(
+        r"\b(?:contents?|items?|equipment|documents?|inventor(?:y|ies))\s+(?:of|in|inside|for|with|carried|kept)\b",
+        lowered,
+    ):
+        return True
+    if re.search(
+        r"\b(?:kit|tool|first[- ]?aid|emergency)\s+bag\s+(?:contents?|items?|equipment)\b",
+        lowered,
+    ):
+        return True
+    if dimensions & {
+        "content",
+        "contents",
+        "equipment",
+        "equipments",
+        "item",
+        "items",
+        "inventory",
+        "inventories",
+        "things",
+    }:
+        return True
+    return False
 
 
 def _deterministic_queries(
@@ -725,6 +859,10 @@ def _structural_queries(value: str, intent: str) -> list[str]:
         variants.append(f"{normalized} rules requirements shall must prohibited permitted conditions")
     elif intent == "troubleshooting":
         variants.append(f"{normalized} fault cause check remedy action")
+    elif intent == "list":
+        variants.append(
+            f"{normalized} list items contents equipment documents carried kept possession required"
+        )
     return _unique(variants)
 
 
@@ -773,6 +911,14 @@ def _extract_focus_terms(value: str) -> list[str]:
             if len(token) > 1 and token.casefold() not in _FOCUS_STOPWORDS
         ]
     )
+
+
+def _extract_focus_terms_for_intent(value: str, intent: str) -> list[str]:
+    terms = _extract_focus_terms(value)
+    if intent != "list":
+        return terms
+    generic = _LIST_DIMENSION_CUES | _LIST_RELATION_CUES | {"list"}
+    return [term for term in terms if term.casefold() not in generic]
 
 
 def _extract_context_terms(value: str, hints: list[str]) -> list[str]:

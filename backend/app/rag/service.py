@@ -32,11 +32,14 @@ from app.rag.progress import ProgressCallback, emit_progress, progress_context
 from app.rag.query import needs_conversation_context, query_planner
 from app.rag.relevance import select_context_chunks
 from app.rag.synthesis import (
+    list_answer_needs_repair,
     looks_like_negative_answer,
     procedure_answer_needs_repair,
     repair_direct_answer,
     repair_hierarchical_answer,
+    repair_list_answer,
     repair_procedure_answer,
+    rescue_best_supported_answer,
     rescue_fact_answer,
     synthesize_answer,
 )
@@ -344,6 +347,113 @@ class RagService:
             f"{len(relevant)} excerpt(s) passed applicability and relevance checks",
         )
         if not relevant:
+            if plan.search_mode == "answer" and settings.best_supported_answer_enabled:
+                # A strict deterministic relevance gate can occasionally reject all
+                # candidates even though the strongest retrieved excerpts still contain
+                # useful partial evidence. Let the answer model review a small, bounded
+                # strongest set before declaring that nothing can be answered.
+                review_results = candidates[: settings.best_supported_candidate_review_limit]
+                review_sources = [
+                    PromptSource(result=item, excerpt=item.chunk.text.strip())
+                    for item in review_results
+                ]
+                emit_progress(
+                    "best_supported",
+                    "Reviewing related evidence before giving up",
+                    f"Checking the strongest {len(review_sources)} retrieved excerpt(s)",
+                )
+                best_raw = rescue_best_supported_answer(
+                    plan,
+                    review_sources,
+                    primary_document_ids=primary_document_ids,
+                    max_sources=settings.best_supported_source_limit,
+                )
+                best_answer, best_grounded = validate_grounded_answer(
+                    best_raw, len(review_sources)
+                )
+                if best_answer != NO_ANSWER:
+                    if not best_grounded:
+                        emit_progress(
+                            "citation_repair",
+                            "Repairing citations on the best-supported answer",
+                            "Using only the related evidence already reviewed",
+                        )
+                        repaired_raw = repair_direct_answer(
+                            plan, best_answer, review_sources
+                        )
+                        repaired_answer, repaired_grounded = validate_grounded_answer(
+                            repaired_raw, len(review_sources)
+                        )
+                        if repaired_answer != NO_ANSWER:
+                            best_answer = repaired_answer
+                            best_grounded = repaired_grounded
+                    if plan.intent == "list" and list_answer_needs_repair(best_answer):
+                        emit_progress(
+                            "list_format",
+                            "Formatting the supported list",
+                            "Organizing explicit items while preserving role/context differences",
+                        )
+                        list_raw = repair_list_answer(
+                            plan,
+                            best_answer,
+                            review_sources,
+                            max_sources=settings.best_supported_source_limit,
+                        )
+                        list_answer, list_grounded = validate_grounded_answer(
+                            list_raw, len(review_sources)
+                        )
+                        if list_answer != NO_ANSWER:
+                            best_answer = list_answer
+                            best_grounded = list_grounded
+                    used_source_numbers = set(
+                        cited_source_numbers(best_answer, len(review_sources))
+                    )
+                    return AnswerResponse(
+                        answer=best_answer,
+                        sources=_source_results(best_answer, review_sources),
+                        evidence=_evidence_results(review_sources),
+                        formatted_sources=format_prompt_sources_markdown(
+                            review_sources, source_numbers=used_source_numbers
+                        ),
+                        formatted_evidence=format_prompt_sources_markdown(review_sources),
+                        grounded=best_grounded,
+                        grounding_status=(
+                            "verified_best_supported"
+                            if best_grounded
+                            else "citation_validation_failed"
+                        ),
+                        interpreted_question=plan.contextual_question or plan.rewritten_question,
+                        contextual_question=plan.contextual_question or plan.rewritten_question,
+                        retrieval_mode=plan.search_mode,
+                        resolved_abbreviations=abbreviation_hints,
+                        routing_hints=active_references,
+                        primary_documents=primary_document_names,
+                        candidate_chunks=len(candidates),
+                        evidence_chunks=len(review_sources),
+                        search_queries=plan.search_queries,
+                    )
+
+                # Even when no useful synthesis is possible, preserve the excerpts
+                # actually reviewed by AI so the user can inspect why no definitive
+                # answer was returned.
+                return AnswerResponse(
+                    answer=NO_ANSWER,
+                    sources=[],
+                    evidence=_evidence_results(review_sources),
+                    formatted_sources="",
+                    formatted_evidence=format_prompt_sources_markdown(review_sources),
+                    grounded=False,
+                    grounding_status="insufficient_evidence_with_related_evidence",
+                    interpreted_question=plan.contextual_question or plan.rewritten_question,
+                    contextual_question=plan.contextual_question or plan.rewritten_question,
+                    retrieval_mode=plan.search_mode,
+                    resolved_abbreviations=abbreviation_hints,
+                    routing_hints=active_references,
+                    primary_documents=primary_document_names,
+                    candidate_chunks=len(candidates),
+                    evidence_chunks=len(review_sources),
+                    search_queries=plan.search_queries,
+                )
             return self._empty_answer(
                 plan,
                 abbreviation_hints,
@@ -415,6 +525,34 @@ class RagService:
                     "verified_after_repair" if grounded else "citation_validation_failed"
                 )
 
+        if (
+            settings.best_supported_answer_enabled
+            and (answer == NO_ANSWER or looks_like_negative_answer(answer))
+            and bundle.sources
+        ):
+            emit_progress(
+                "best_supported",
+                "Building the best-supported answer",
+                "Using the strongest directly relevant excerpts without inventing missing facts",
+            )
+            best_raw = rescue_best_supported_answer(
+                plan,
+                bundle.sources,
+                primary_document_ids=bundle.primary_document_ids,
+                max_sources=settings.best_supported_source_limit,
+            )
+            best_answer, best_grounded = validate_grounded_answer(
+                best_raw, len(bundle.sources)
+            )
+            if best_answer != NO_ANSWER:
+                answer = best_answer
+                grounded = best_grounded
+                grounding_status = (
+                    "verified_best_supported"
+                    if grounded
+                    else "citation_validation_failed"
+                )
+
         if not grounded and answer != NO_ANSWER:
             emit_progress(
                 "citation_repair",
@@ -450,6 +588,34 @@ class RagService:
                     grounding_status = (
                         "verified_after_repair" if grounded else "citation_validation_failed"
                     )
+
+        if (
+            plan.intent == "list"
+            and answer != NO_ANSWER
+            and list_answer_needs_repair(answer)
+        ):
+            emit_progress(
+                "list_format",
+                "Formatting the answer as a supported list",
+                "Keeping only explicit items and their applicable role/context",
+            )
+            list_raw = repair_list_answer(
+                plan,
+                answer,
+                bundle.sources,
+                max_sources=settings.best_supported_source_limit,
+            )
+            list_answer, list_grounded = validate_grounded_answer(
+                list_raw, len(bundle.sources)
+            )
+            if list_answer != NO_ANSWER:
+                answer = list_answer
+                grounded = list_grounded
+                grounding_status = (
+                    "verified_after_format_repair"
+                    if grounded
+                    else "citation_validation_failed"
+                )
 
         if (
             plan.intent == "procedure"

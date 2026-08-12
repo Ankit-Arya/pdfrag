@@ -18,8 +18,10 @@ Use only the supplied PDF evidence. Conversation context may clarify intent but 
 
 Answer the user's exact question at the shortest length that is complete and safe:
 - A simple fact, figure, date, name, speed, limit or yes/no lookup should normally be one direct sentence.
+- A list/composition question (items, contents, equipment, documents, things carried/kept/required) should use a compact bullet list. Group by role/context only when the PDFs distinguish them.
 - A request for several facts should use a compact list.
 - A procedure/safety question must give the actionable solution, not a vague summary. Preserve the operational order, responsible roles, prerequisites, notifications, restrictions, special modes, restoration criteria and important alternatives actually supported by the procedure.
+- If the evidence does not contain one single definitive/complete statement but does directly support useful parts of the answer, do not discard those parts. State the limitation briefly, then give the best-supported answer from the explicit evidence. Organize and reconcile supported facts logically, but never invent a missing item, rule, number, condition, or procedure step.
 - When the evidence identifies a dedicated primary SOP/instruction for the exact scenario, use that document as the backbone of the answer. Other PDFs may supplement it only when they add a directly applicable requirement; never replace the dedicated procedure with generic nearby safety guidance.
 - Procedure formatting: start with a short applicability/scope sentence when material, then use a clear numbered sequence. If the source itself separates materially different obstruction/scenario types, use compact bold scenario labels beneath the main sequence. Do not dump raw evidence.
 - Never dump or restate all source excerpts merely because they were retrieved; the UI exposes those separately.
@@ -28,7 +30,7 @@ Answer the user's exact question at the shortest length that is complete and saf
 - Cite each factual sentence/bullet with the supplied [S#] labels.
 - Use no source label that is not supplied.
 - Do not claim that the documents do not specify/define/provide something unless the supplied evidence genuinely fails to support the answer.
-- If no supported answer exists, reply exactly with the configured no-answer sentence.
+- Return the configured no-answer sentence only when none of the supplied evidence supports any useful part of the requested answer. For an exact numerical/factual lookup, never substitute a merely related number or derive an unstated value.
 """
 
 
@@ -177,6 +179,55 @@ If no supported answer exists, reply exactly:
 
 
 
+def list_answer_needs_repair(answer: str) -> bool:
+    if not answer or answer == NO_ANSWER:
+        return False
+    return re.search(r"(?m)^\s*(?:[-*]|\d+[.)])\s+", answer) is None
+
+
+def repair_list_answer(
+    plan: QueryPlan,
+    previous_answer: str,
+    sources: list[PromptSource],
+    *,
+    max_sources: int = 64,
+) -> str:
+    """Normalize a supported list/composition answer into compact cited bullets."""
+    if not sources:
+        return previous_answer
+    ranked = list(enumerate(sources, 1))
+    ranked.sort(
+        key=lambda pair: (
+            -float(pair[1].result.score),
+            -float(pair[1].result.keyword_score),
+            pair[0],
+        )
+    )
+    blocks = [
+        _source_prompt_block(index, source)
+        for index, source in ranked[:max_sources]
+    ]
+    prompt = f"""Rewrite the previous answer as the concise list/composition requested by the user.
+Use ONLY the evidence below. Preserve any truthful limitation that the reviewed PDFs do not present
+one single definitive/complete list. Then give compact bullets for the explicitly supported items.
+Group role-specific or context-specific additions under short bold labels only when the evidence
+distinguishes them. Do not add or infer missing items. Cite every factual bullet with existing [S#]
+labels and do not renumber citations.
+
+ORIGINAL QUESTION:
+{plan.original_question}
+
+PREVIOUS ANSWER:
+{previous_answer}
+
+EVIDENCE:
+{chr(10).join(blocks)}
+
+If no useful list item is supported, reply exactly: {NO_ANSWER}
+"""
+    return _answer(prompt)
+
+
 def procedure_answer_needs_repair(
     answer: str,
     sources: list[PromptSource],
@@ -223,8 +274,10 @@ def repair_procedure_answer(
 Use ONLY the PRIMARY PROCEDURE evidence below. Do not replace it with generic rules from other
 PDFs. Start with a short applicability/scope sentence only if supported, then give a numbered
 operational sequence. Preserve responsible roles, notifications, restrictions, special modes,
-assistance/escalation, restoration criteria, and materially different scenario branches. Keep
-it concise but complete. Cite every factual step using the existing [S#] labels; do not renumber.
+assistance/escalation, restoration criteria, and materially different scenario branches. If the
+reviewed evidence is explicitly incomplete, preserve that limitation and number only the supported
+actions; do not imply that a partial sequence is a complete SOP. Keep it concise but complete for
+what the evidence actually supports. Cite every factual step using the existing [S#] labels; do not renumber.
 
 ORIGINAL QUESTION:
 {plan.original_question}
@@ -278,6 +331,70 @@ If these excerpts still do not support the answer, reply exactly: {NO_ANSWER}
     return _answer(prompt)
 
 
+def rescue_best_supported_answer(
+    plan: QueryPlan,
+    sources: list[PromptSource],
+    *,
+    primary_document_ids: set[str] | frozenset[str] | None = None,
+    max_sources: int = 64,
+) -> str:
+    """Produce a useful partial answer when retrieval is relevant but not definitive.
+
+    This is intentionally stricter than ordinary free-form reasoning: the model may
+    organize, deduplicate, and reconcile explicit evidence, but every factual item
+    must be supported by one of the supplied source labels. It must not infer new
+    operational rules from merely related excerpts.
+    """
+    if not sources:
+        return NO_ANSWER
+
+    primary_ids = set(primary_document_ids or ())
+    ranked = list(enumerate(sources, 1))
+    ranked.sort(
+        key=lambda pair: (
+            0 if pair[1].result.chunk.document_id in primary_ids else 1,
+            -float(pair[1].result.score),
+            -float(pair[1].result.keyword_score),
+            pair[0],
+        )
+    )
+    selected = ranked[:max_sources]
+    blocks = [_source_prompt_block(index, source) for index, source in selected]
+
+    prompt = f"""The normal answer pass did not produce a sufficiently useful supported answer,
+but relevant PDF excerpts were retrieved. Produce the BEST-SUPPORTED response to the original
+question using ONLY the evidence below.
+
+Rules:
+- Do not guess. Do not invent a missing rule, number, item, condition, role, or procedure step.
+- You may logically group, deduplicate, order, and reconcile facts that are explicitly stated.
+- If there is no single authoritative/complete statement but several excerpts directly support
+  parts of the request, say that briefly and then provide those supported parts.
+- For list/composition requests, return compact bullets and separate role/context-specific additions.
+- For procedures, give numbered steps only when the evidence supports their action/order; otherwise
+  state the supported actions without pretending the sequence is complete.
+- For exact fact/number questions, never substitute a related value or calculate an unstated value.
+  You may state that the exact value is not established and then give clearly labeled related facts
+  only when they materially help answer the question.
+- Omit merely keyword-related or unrelated excerpts.
+- Cite every factual sentence or bullet using the existing [S#] labels. Do not renumber them.
+- If none of these excerpts supports any useful part of the requested answer, reply exactly: {NO_ANSWER}
+
+ORIGINAL QUESTION:
+{plan.original_question}
+
+CONTEXTUAL INTERPRETATION (intent only):
+{plan.contextual_question or plan.rewritten_question}
+
+QUESTION INTENT:
+{plan.intent}
+
+STRONGEST RELEVANT EVIDENCE:
+{chr(10).join(blocks)}
+"""
+    return _answer(prompt)
+
+
 _NEGATIVE_ANSWER_RE = re.compile(
     r"\b(?:documents?|pdfs?)\b.{0,80}\b(?:do not|does not|don't|doesn't|cannot|can't)\b.{0,80}\b(?:specify|define|provide|contain|state|mention|include)\b|"
     r"\b(?:not specified|not defined|not provided|not stated|not found|no information)\b",
@@ -308,7 +425,7 @@ def _prompt_sources(
     # order for simple facts/definitions so the direct answer is not buried deep
     # in a long document-sorted prompt. For procedures and broader synthesis,
     # document/page order still helps preserve sequence and applicability.
-    if plan.intent in {"fact_lookup", "definition"}:
+    if plan.intent in {"fact_lookup", "definition", "list"}:
         ordered = list(results)
     elif primary_document_ids:
         ordered = sorted(
@@ -466,7 +583,7 @@ PRIMARY PROCEDURE DOCUMENTS (routing priority only; facts still require source c
 SOURCE CHUNKS:
 {_source_blocks(sources)}
 
-Answer only what the user asked. Use every source silently when deciding the answer, but do not reproduce unrelated or merely nearby evidence. For a single requested fact, return one direct sentence with citation. For a procedure, produce an actionable, properly structured solution: a short scope/applicability line if needed, then numbered operational steps in source order. If a dedicated primary procedure document is listed, make it the backbone and use other documents only for directly applicable supplementary requirements.
+Answer only what the user asked. Use every source silently when deciding the answer, but do not reproduce unrelated or merely nearby evidence. For a single requested fact, return one direct sentence with citation. For a list/composition request, return a clean compact bullet list, grouping role-specific additions only when supported. If no single complete list exists but the evidence directly supports useful items, state that limitation briefly and provide the supported items rather than returning no answer. For a procedure, produce an actionable, properly structured solution: a short scope/applicability line if needed, then numbered operational steps in source order. If a dedicated primary procedure document is listed, make it the backbone and use other documents only for directly applicable supplementary requirements.
 """
 
 
@@ -677,7 +794,8 @@ SOURCE EXCERPTS (HIERARCHICAL EVIDENCE DIGESTS):
 
 Required answer behavior:
 - Answer the exact question, not merely the search terms.
-- Match answer length to the question: one sentence for a single fact; compact bullets for several facts; longer structure only when required for a procedure, comparison or multi-part answer.
+- Match answer length to the question: one sentence for a single fact; compact bullets for a list/several facts; longer structure only when required for a procedure, comparison or multi-part answer.
+- When the digests directly support useful parts but not one definitive/complete statement, give a brief scope caveat and then the best-supported explicit facts. Do not invent missing content.
 - Do not dump the evidence digests or list unrelated retrieved material; the UI exposes the complete reviewed evidence separately.
 - Include every materially relevant fact preserved in the digests that is needed to answer or qualify the question.
 - Keep different documents, lines, rolling stock, systems, modes and procedures separate when

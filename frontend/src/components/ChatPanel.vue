@@ -385,15 +385,16 @@ onBeforeUnmount(() => {
           </div>
 
           <details
-            v-if="
-              message.response?.retrieval_mode !== 'references'
-              && message.response?.evidence?.length
-            "
+            v-if="message.response?.evidence?.length"
             class="sources ai-evidence"
             @toggle="handleEvidenceToggle(message.id, $event)"
           >
             <summary class="sources-summary">
-              <span>Evidence reviewed by AI</span>
+              <span>
+                {{ message.response?.retrieval_mode === 'references'
+                  ? 'Matching evidence'
+                  : 'Evidence reviewed by AI' }}
+              </span>
               <span class="sources-count">
                 {{ message.response.evidence.length }}
                 excerpt{{ message.response.evidence.length === 1 ? '' : 's' }}
@@ -425,7 +426,10 @@ onBeforeUnmount(() => {
             </div>
           </details>
 
-          <details v-if="message.response?.sources.length" class="sources">
+          <details
+            v-if="message.response?.retrieval_mode !== 'references' && message.response?.sources.length"
+            class="sources"
+          >
             <summary class="sources-summary">
               <span>Retrieved evidence</span>
               <span class="sources-count">

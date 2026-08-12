@@ -127,7 +127,22 @@ _INTENT_CUES = {
     },
     "definition": {"definition", "means", "refers", "term"},
     "summary": {"conclusion", "overview", "scope", "summary"},
-    "list": {"include", "item", "list", "types"},
+    "list": {
+        "carry",
+        "carried",
+        "contain",
+        "contents",
+        "equipment",
+        "include",
+        "item",
+        "items",
+        "keep",
+        "kept",
+        "list",
+        "possession",
+        "required",
+        "types",
+    },
     "fact_lookup": set(),
 }
 

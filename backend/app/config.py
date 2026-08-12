@@ -104,6 +104,13 @@ class Settings(BaseSettings):
     neighbor_window: int = Field(default=1, ge=0, le=3)
     evidence_top_k: int = Field(default=48, ge=4, le=500)
 
+    # When retrieval finds useful related evidence but normal synthesis cannot form
+    # a definitive answer, review a bounded strongest-evidence set and produce a
+    # clearly qualified best-supported answer rather than hiding the evidence.
+    best_supported_answer_enabled: bool = True
+    best_supported_source_limit: int = Field(default=64, ge=8, le=200)
+    best_supported_candidate_review_limit: int = Field(default=48, ge=8, le=200)
+
     # Index/catalog rows can identify the exact procedure that should be searched
     # next. Follow those PDF-derived references before answering rather than
     # treating an index row as the final evidence.
