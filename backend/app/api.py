@@ -1,3 +1,5 @@
+import asyncio
+import json
 import logging
 import uuid
 from datetime import UTC, datetime
@@ -15,7 +17,7 @@ from fastapi import (
     status,
 )
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
@@ -51,7 +53,7 @@ from app.models import (
     QuestionRequest,
 )
 from app.rag.embeddings import EmbeddingUnavailableError, embedding_service
-from app.rag.llm import LlmConfigurationError
+from app.rag.llm import LlmConfigurationError, LlmRateLimitError
 from app.rag.pdf import ocr_available, safe_filename, table_extraction_available
 from app.rag.service import rag_service
 
@@ -522,13 +524,11 @@ def delete_chat(
     db.commit()
 
 
-@router.post("/chat", response_model=AnswerResponse)
-async def chat(
+def _prepare_chat_exchange(
     payload: QuestionRequest,
-    request: Request,
-    db: Session = Depends(get_db),
-    user: User = Depends(current_user),
-) -> AnswerResponse:
+    db: Session,
+    user: User,
+) -> tuple[ChatSession, list[dict[str, str]], ChatMessage]:
     chat_session = (
         db.get(ChatSession, payload.chat_session_id)
         if payload.chat_session_id
@@ -542,11 +542,9 @@ async def chat(
         db.commit()
         db.refresh(chat_session)
 
-    # Capture history BEFORE writing the current question. It is provided only to
-    # the query planner to resolve follow-ups and context; facts are re-retrieved
-    # from PDFs for every turn.
+    # Capture history before writing the current question. History is intent
+    # context only; every factual statement is re-retrieved from the PDFs.
     conversation_context = _conversation_context(db, chat_session.id)
-
     user_message = ChatMessage(
         chat_session_id=chat_session.id,
         role="user",
@@ -556,48 +554,18 @@ async def chat(
     chat_session.updated_at = datetime.now(UTC)
     db.commit()
     db.refresh(user_message)
+    return chat_session, conversation_context, user_message
 
-    try:
-        response = await run_in_threadpool(
-            rag_service.ask,
-            db,
-            payload.question,
-            payload.top_k,
-            payload.rewrite_question,
-            conversation_context,
-        )
-    except EmbeddingUnavailableError as exc:
-        _record_chat_failure(
-            db,
-            request=request,
-            user=user,
-            chat_session=chat_session,
-            question=payload.question,
-            error=exc,
-        )
-        raise HTTPException(503, str(exc)) from exc
-    except LlmConfigurationError as exc:
-        _record_chat_failure(
-            db,
-            request=request,
-            user=user,
-            chat_session=chat_session,
-            question=payload.question,
-            error=exc,
-        )
-        raise HTTPException(503, str(exc)) from exc
-    except Exception as exc:
-        _record_chat_failure(
-            db,
-            request=request,
-            user=user,
-            chat_session=chat_session,
-            question=payload.question,
-            error=exc,
-        )
-        logger.exception("Q&A request failed")
-        raise HTTPException(502, "The language model request failed") from exc
 
+def _finalize_chat_exchange(
+    db: Session,
+    *,
+    request: Request,
+    user: User,
+    chat_session: ChatSession,
+    user_message: ChatMessage,
+    response: AnswerResponse,
+) -> AnswerResponse:
     response.chat_session_id = chat_session.id
     response.request_id = getattr(request.state, "request_id", None)
     response.question_created_at = user_message.created_at
@@ -634,7 +602,7 @@ async def chat(
         success=True,
         user=user,
         chat_session_id=chat_session.id,
-        question=payload.question,
+        question=user_message.content,
         response=response.answer,
         details={
             "grounded": response.grounded,
@@ -656,3 +624,222 @@ async def chat(
     db.refresh(assistant_message)
     response.response_created_at = assistant_message.created_at
     return response
+
+
+def _sse_event(event: str, payload: dict[str, object]) -> str:
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return f"event: {event}\ndata: {body}\n\n"
+
+
+def _stream_error_payload(error: Exception) -> dict[str, object]:
+    if isinstance(error, LlmRateLimitError):
+        return {
+            "detail": str(error),
+            "code": "rate_limit",
+            "retry_after": 5,
+        }
+    if isinstance(error, EmbeddingUnavailableError):
+        return {"detail": str(error), "code": "embedding_unavailable"}
+    if isinstance(error, LlmConfigurationError):
+        return {"detail": str(error), "code": "llm_configuration"}
+    return {
+        "detail": "The language model request failed",
+        "code": "chat_failed",
+    }
+
+
+@router.post("/chat", response_model=AnswerResponse)
+async def chat(
+    payload: QuestionRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> AnswerResponse:
+    chat_session, conversation_context, user_message = _prepare_chat_exchange(
+        payload, db, user
+    )
+
+    try:
+        response = await run_in_threadpool(
+            rag_service.ask,
+            db,
+            payload.question,
+            payload.top_k,
+            payload.rewrite_question,
+            conversation_context,
+        )
+    except EmbeddingUnavailableError as exc:
+        _record_chat_failure(
+            db,
+            request=request,
+            user=user,
+            chat_session=chat_session,
+            question=payload.question,
+            error=exc,
+        )
+        raise HTTPException(503, str(exc)) from exc
+    except LlmRateLimitError as exc:
+        _record_chat_failure(
+            db,
+            request=request,
+            user=user,
+            chat_session=chat_session,
+            question=payload.question,
+            error=exc,
+        )
+        raise HTTPException(
+            503,
+            str(exc),
+            headers={"Retry-After": "5"},
+        ) from exc
+    except LlmConfigurationError as exc:
+        _record_chat_failure(
+            db,
+            request=request,
+            user=user,
+            chat_session=chat_session,
+            question=payload.question,
+            error=exc,
+        )
+        raise HTTPException(503, str(exc)) from exc
+    except Exception as exc:
+        _record_chat_failure(
+            db,
+            request=request,
+            user=user,
+            chat_session=chat_session,
+            question=payload.question,
+            error=exc,
+        )
+        logger.exception("Q&A request failed")
+        raise HTTPException(502, "The language model request failed") from exc
+
+    return _finalize_chat_exchange(
+        db,
+        request=request,
+        user=user,
+        chat_session=chat_session,
+        user_message=user_message,
+        response=response,
+    )
+
+
+@router.post("/chat/stream")
+async def chat_stream(
+    payload: QuestionRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> StreamingResponse:
+    """Stream truthful RAG workflow progress, then the persisted final answer.
+
+    Events expose only operational stages and counts. They never expose model
+    chain-of-thought, hidden reasoning, prompts, or private scratch work.
+    """
+    chat_session, conversation_context, user_message = _prepare_chat_exchange(
+        payload, db, user
+    )
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue[tuple[str, dict[str, object]]] = asyncio.Queue()
+
+    def publish_progress(progress: dict[str, object]) -> None:
+        # rag_service runs in a worker thread. Schedule queue writes safely on the
+        # request event loop rather than touching asyncio.Queue from that thread.
+        loop.call_soon_threadsafe(queue.put_nowait, ("progress", dict(progress)))
+
+    async def run_chat_job() -> None:
+        try:
+            response = await run_in_threadpool(
+                rag_service.ask,
+                db,
+                payload.question,
+                payload.top_k,
+                payload.rewrite_question,
+                conversation_context,
+                publish_progress,
+            )
+            await queue.put(
+                (
+                    "progress",
+                    {
+                        "stage": "save",
+                        "label": "Saving the grounded answer",
+                        "detail": "Recording the answer and its cited evidence in chat history",
+                    },
+                )
+            )
+            response = _finalize_chat_exchange(
+                db,
+                request=request,
+                user=user,
+                chat_session=chat_session,
+                user_message=user_message,
+                response=response,
+            )
+            await queue.put(("answer", response.model_dump(mode="json")))
+        except (EmbeddingUnavailableError, LlmRateLimitError, LlmConfigurationError) as exc:
+            _record_chat_failure(
+                db,
+                request=request,
+                user=user,
+                chat_session=chat_session,
+                question=payload.question,
+                error=exc,
+            )
+            await queue.put(("error", _stream_error_payload(exc)))
+        except Exception as exc:
+            _record_chat_failure(
+                db,
+                request=request,
+                user=user,
+                chat_session=chat_session,
+                question=payload.question,
+                error=exc,
+            )
+            logger.exception("Streaming Q&A request failed")
+            await queue.put(("error", _stream_error_payload(exc)))
+        finally:
+            await queue.put(("done", {}))
+
+    task = asyncio.create_task(run_chat_job())
+
+    async def event_stream():
+        yield _sse_event(
+            "start",
+            {
+                "chat_session_id": str(chat_session.id),
+                "question_created_at": user_message.created_at.isoformat(),
+                "request_id": getattr(request.state, "request_id", None),
+            },
+        )
+        try:
+            while True:
+                try:
+                    event, event_payload = await asyncio.wait_for(queue.get(), timeout=15.0)
+                except TimeoutError:
+                    # SSE comment heartbeat keeps Nginx/browser connections alive
+                    # during a long model call without adding a visible UI event.
+                    yield ": keepalive\n\n"
+                    continue
+                if event == "done":
+                    break
+                yield _sse_event(event, event_payload)
+        finally:
+            # Keep the DB dependency alive until the worker is finished even if
+            # the browser disconnects. In-flight OpenAI calls cannot be forcefully
+            # interrupted safely; finishing also preserves the saved chat result.
+            if not task.done():
+                try:
+                    await asyncio.shield(task)
+                except Exception:
+                    pass
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )

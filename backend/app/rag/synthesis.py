@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
+import hashlib
 import re
+import threading
 
 from app.config import get_settings
 from app.rag.llm import llm_service
 from app.rag.prompts import NO_ANSWER
+from app.rag.progress import emit_progress
 from app.rag.types import PromptSource, QueryPlan, RetrievedChunk
 
 
@@ -26,6 +30,14 @@ Answer the user's exact question at the shortest length that is complete and saf
 - Do not claim that the documents do not specify/define/provide something unless the supplied evidence genuinely fails to support the answer.
 - If no supported answer exists, reply exactly with the configured no-answer sentence.
 """
+
+
+_CONTEXT_BLOCK_RE = re.compile(
+    r"\[PDF CHUNK CONTEXT\]\s*.*?\s*\[/PDF CHUNK CONTEXT\]\s*",
+    re.IGNORECASE | re.DOTALL,
+)
+_SUMMARY_CACHE: OrderedDict[str, str] = OrderedDict()
+_SUMMARY_CACHE_LOCK = threading.Lock()
 
 
 _SUMMARY_SYSTEM_PROMPT = """You are an evidence compressor for official internal metro documents.
@@ -67,6 +79,11 @@ def synthesize_answer(
     primary_names = primary_document_names or []
     sources = _prompt_sources(plan, results, primary_ids)
     if estimated_chars <= int(settings.max_context_chars * 0.85):
+        emit_progress(
+            "answer_generation",
+            "Writing the grounded answer",
+            f"Direct synthesis from {len(sources)} reviewed excerpt(s)",
+        )
         prompt = _build_direct_answer_prompt(plan, sources, primary_names)
         return SynthesisBundle(
             raw_answer=_answer(prompt),
@@ -76,7 +93,17 @@ def synthesize_answer(
             primary_document_names=tuple(primary_names),
         )
 
+    emit_progress(
+        "summarize",
+        "Compressing a large evidence set",
+        f"{len(sources)} excerpts require hierarchical evidence summarization",
+    )
     digests = _summarize_all_sources(plan, sources, primary_ids)
+    emit_progress(
+        "answer_generation",
+        "Writing the grounded answer",
+        "Synthesizing the final response from source-preserving evidence digests",
+    )
     final_prompt = _build_digest_answer_prompt(plan, sources, digests, primary_names, primary_ids)
     return SynthesisBundle(
         raw_answer=_answer(final_prompt),
@@ -94,7 +121,10 @@ def repair_hierarchical_answer(
     sources: list[PromptSource],
     digests: str,
 ) -> str:
-    source_map = _source_map(sources)
+    source_map = _source_map(
+        sources,
+        source_numbers=_citation_numbers(digests) | _citation_numbers(previous_answer),
+    )
     prompt = f"""Rewrite the previous draft so it is a complete, grounded answer to the current
 question. Use ONLY the evidence digests below. Keep all materially relevant facts, preserve
 separate applicability contexts, and cite every factual bullet with valid labels [S1]...[S{len(sources)}].
@@ -188,11 +218,7 @@ def repair_procedure_answer(
         return previous_answer
     blocks: list[str] = []
     for index, source in ranked:
-        chunk = source.result.chunk
-        blocks.append(
-            f"[S{index}] File: {chunk.filename} | Page: {chunk.page_number} | "
-            f"Type: {chunk.content_type}\n{source.excerpt}"
-        )
+        blocks.append(_source_prompt_block(index, source))
     prompt = f"""Rewrite the previous draft as the actionable procedure requested by the user.
 Use ONLY the PRIMARY PROCEDURE evidence below. Do not replace it with generic rules from other
 PDFs. Start with a short applicability/scope sentence only if supported, then give a numbered
@@ -232,11 +258,7 @@ def rescue_fact_answer(
     selected = list(enumerate(sources[:max_sources], 1))
     blocks: list[str] = []
     for index, source in selected:
-        chunk = source.result.chunk
-        blocks.append(
-            f"[S{index}] File: {chunk.filename} | Page: {chunk.page_number} | "
-            f"Type: {chunk.content_type}\n{source.excerpt}"
-        )
+        blocks.append(_source_prompt_block(index, source))
     prompt = f"""The broad evidence pass unexpectedly returned no answer for a direct lookup.
 Re-check only the strongest evidence below and answer the ORIGINAL QUESTION if it is supported.
 Do not infer from filenames or conversation history. For a single fact, return one sentence.
@@ -320,9 +342,16 @@ def _summarize_all_sources(
     settings = get_settings()
     batches = _source_batches(sources, settings.summary_batch_chars)
     digests: list[str] = []
-    for batch in batches:
+    for batch_index, batch in enumerate(batches, start=1):
+        emit_progress(
+            "summarize",
+            "Summarizing relevant evidence",
+            f"Evidence batch {batch_index} of {len(batches)}",
+            current=batch_index,
+            total=len(batches),
+        )
         prompt = _build_batch_summary_prompt(plan, batch, primary_document_ids)
-        digest = llm_service.summarize(
+        digest = _cached_summary(
             _SUMMARY_SYSTEM_PROMPT,
             prompt,
             max_output_tokens=settings.summary_max_output_tokens,
@@ -337,10 +366,19 @@ def _summarize_all_sources(
     # If the first compression pass is still too large, recursively compress the
     # digests themselves. Original [S#] labels are preserved through every level.
     target = int(settings.max_context_chars * 0.68)
+    compression_round = 0
     while len(combined) > target and len(digests) > 1:
+        compression_round += 1
         digest_batches = _text_batches(digests, settings.summary_batch_chars)
         next_digests: list[str] = []
-        for batch_text in digest_batches:
+        for digest_index, batch_text in enumerate(digest_batches, start=1):
+            emit_progress(
+                "consolidate",
+                "Consolidating evidence summaries",
+                f"Compression pass {compression_round}, batch {digest_index} of {len(digest_batches)}",
+                current=digest_index,
+                total=len(digest_batches),
+            )
             prompt = f"""Question:
 {plan.original_question}
 
@@ -354,7 +392,7 @@ citations. Do not add facts or labels.
 DIGESTS:
 {batch_text}
 """
-            digest = llm_service.summarize(
+            digest = _cached_summary(
                 _SUMMARY_SYSTEM_PROMPT,
                 prompt,
                 max_output_tokens=settings.summary_max_output_tokens,
@@ -377,7 +415,7 @@ def _source_batches(
     current: list[tuple[int, PromptSource]] = []
     used = 0
     for index, source in enumerate(sources, 1):
-        cost = len(source.excerpt) + len(source.result.chunk.filename) + 220
+        cost = len(_compact_excerpt(source)) + len(_compact_source_header(source)) + 80
         if current and used + cost > max_chars:
             batches.append(current)
             current = []
@@ -432,16 +470,141 @@ Answer only what the user asked. Use every source silently when deciding the ans
 """
 
 
-def _source_blocks(sources: list[PromptSource]) -> str:
-    blocks: list[str] = []
-    for index, source in enumerate(sources, 1):
-        chunk = source.result.chunk
-        blocks.append(
-            f"[S{index}] File: {chunk.filename} | Page: {chunk.page_number} | "
-            f"Type: {chunk.content_type} | Retrieval: {source.result.method}\n"
-            f"{source.excerpt}"
+def _compact_excerpt(source: PromptSource) -> str:
+    """Remove repeated synthetic chunk metadata from LLM prompts only.
+
+    The complete original excerpt remains attached to PromptSource for evidence
+    display/auditing. File/page/section/rolling-stock/procedure metadata is
+    emitted once in the compact prompt header below.
+    """
+    body = _CONTEXT_BLOCK_RE.sub("", source.excerpt or "").strip()
+    return body or (source.excerpt or "").strip()
+
+
+def _compact_source_header(source: PromptSource) -> str:
+    chunk = source.result.chunk
+    fields = [
+        f"File: {chunk.filename}",
+        f"Page: {chunk.page_number}",
+        f"Type: {chunk.content_type}",
+    ]
+
+    # Retrieved DB rows currently reconstruct the basic TextChunk fields and keep
+    # richer section/stock/procedure metadata inside the stored context envelope.
+    # Preserve those useful routing/applicability fields once, while dropping the
+    # repeated wrapper text itself.
+    metadata = _context_metadata(source.excerpt)
+    if chunk.section_path:
+        fields.append(f"Section: {' > '.join(chunk.section_path)}")
+    elif chunk.heading:
+        fields.append(f"Section: {chunk.heading}")
+    elif metadata.get("section"):
+        fields.append(f"Section: {metadata['section']}")
+    if metadata.get("pages") and metadata["pages"] != str(chunk.page_number):
+        fields.append(f"Pages: {metadata['pages']}")
+    stock = chunk.rolling_stock or metadata.get("stock", "")
+    if stock:
+        fields.append(f"Train/stock: {stock}")
+    procedure = chunk.procedure or metadata.get("procedure", "")
+    if procedure:
+        fields.append(f"Procedure: {procedure}")
+    tags = list(chunk.context_tags[:8]) if chunk.context_tags else []
+    if not tags and metadata.get("tags"):
+        tags = [item.strip() for item in metadata["tags"].split(",") if item.strip()][:12]
+    if tags:
+        fields.append(f"Tags: {', '.join(tags)}")
+    return " | ".join(fields)
+
+
+def _context_metadata(value: str) -> dict[str, str]:
+    start_marker = "[PDF CHUNK CONTEXT]"
+    end_marker = "[/PDF CHUNK CONTEXT]"
+    start = value.find(start_marker)
+    end = value.find(end_marker)
+    if start < 0 or end <= start:
+        return {}
+    header = value[start + len(start_marker) : end]
+    result: dict[str, str] = {}
+    prefixes = {
+        "Pages:": "pages",
+        "Section path:": "section",
+        "Rolling stock / train context:": "stock",
+        "Procedure context:": "procedure",
+        "Important tags:": "tags",
+    }
+    for raw_line in header.splitlines():
+        line = raw_line.strip()
+        for prefix, key in prefixes.items():
+            if line.casefold().startswith(prefix.casefold()):
+                result[key] = line[len(prefix) :].strip()
+                break
+    return result
+
+
+def _source_prompt_block(
+    index: int,
+    source: PromptSource,
+    *,
+    include_retrieval: bool = False,
+    extra_label: str = "",
+) -> str:
+    header = _compact_source_header(source)
+    if include_retrieval:
+        header += f" | Retrieval: {source.result.method}"
+    if extra_label:
+        header += f" | {extra_label}"
+    return f"[S{index}] {header}\n{_compact_excerpt(source)}"
+
+
+def _cached_summary(
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    max_output_tokens: int,
+) -> str:
+    settings = get_settings()
+    if settings.summary_cache_entries <= 0:
+        return llm_service.summarize(
+            system_prompt,
+            user_prompt,
+            max_output_tokens=max_output_tokens,
         )
-    return "\n\n---\n\n".join(blocks)
+
+    digest_key = hashlib.sha256(
+        "\x1f".join(
+            [
+                settings.summary_model,
+                settings.summary_reasoning_effort,
+                str(max_output_tokens),
+                system_prompt,
+                user_prompt,
+            ]
+        ).encode("utf-8")
+    ).hexdigest()
+    with _SUMMARY_CACHE_LOCK:
+        cached = _SUMMARY_CACHE.get(digest_key)
+        if cached is not None:
+            _SUMMARY_CACHE.move_to_end(digest_key)
+            return cached
+
+    value = llm_service.summarize(
+        system_prompt,
+        user_prompt,
+        max_output_tokens=max_output_tokens,
+    )
+    with _SUMMARY_CACHE_LOCK:
+        _SUMMARY_CACHE[digest_key] = value
+        _SUMMARY_CACHE.move_to_end(digest_key)
+        while len(_SUMMARY_CACHE) > settings.summary_cache_entries:
+            _SUMMARY_CACHE.popitem(last=False)
+    return value
+
+
+def _source_blocks(sources: list[PromptSource]) -> str:
+    return "\n\n---\n\n".join(
+        _source_prompt_block(index, source, include_retrieval=True)
+        for index, source in enumerate(sources, 1)
+    )
 
 
 def _build_batch_summary_prompt(
@@ -452,11 +615,14 @@ def _build_batch_summary_prompt(
     blocks: list[str] = []
     for index, source in batch:
         chunk = source.result.chunk
-        priority = " | PRIMARY PROCEDURE" if chunk.document_id in primary_document_ids else ""
+        priority = "PRIMARY PROCEDURE" if chunk.document_id in primary_document_ids else ""
         blocks.append(
-            f"[S{index}] File: {chunk.filename} | Page: {chunk.page_number} | "
-            f"Type: {chunk.content_type} | Retrieval: {source.result.method}{priority}\n"
-            f"{source.excerpt}"
+            _source_prompt_block(
+                index,
+                source,
+                include_retrieval=True,
+                extra_label=priority,
+            )
         )
     return f"""QUESTION TO SUPPORT:
 {plan.original_question}
@@ -500,8 +666,8 @@ QUESTION INTENT:
 PRIMARY PROCEDURE DOCUMENTS:
 {chr(10).join(primary_document_names) if primary_document_names else "None"}
 
-SOURCE MAP:
-{_source_map(sources)}
+SOURCE MAP (only labels present in the compressed evidence):
+{_source_map(sources, source_numbers=_citation_numbers(digests))}
 
 HIGH-PRIORITY DIRECT EVIDENCE:
 {_priority_source_blocks(plan, sources, primary_document_ids=primary_document_ids)}
@@ -543,11 +709,7 @@ def _priority_source_blocks(
     if primary_ids:
         ranked.sort(key=lambda pair: (0 if pair[1].result.chunk.document_id in primary_ids else 1, pair[0]))
     for index, source in ranked[:max_sources]:
-        chunk = source.result.chunk
-        block = (
-            f"[S{index}] File: {chunk.filename} | Page: {chunk.page_number} | "
-            f"Type: {chunk.content_type}\n{source.excerpt}"
-        )
+        block = _source_prompt_block(index, source)
         if blocks and used + len(block) > max_chars:
             break
         blocks.append(block)
@@ -555,11 +717,21 @@ def _priority_source_blocks(
     return "\n\n---\n\n".join(blocks) if blocks else "None"
 
 
-def _source_map(sources: list[PromptSource]) -> str:
+def _citation_numbers(value: str) -> set[int]:
+    return {int(number) for number in re.findall(r"\[S(\d+)\]", value or "")}
+
+
+def _source_map(
+    sources: list[PromptSource],
+    *,
+    source_numbers: set[int] | None = None,
+) -> str:
     lines: list[str] = []
     for index, source in enumerate(sources, 1):
+        if source_numbers is not None and index not in source_numbers:
+            continue
         chunk = source.result.chunk
         lines.append(
             f"[S{index}] {chunk.filename} — page {chunk.page_number} — {chunk.content_type}"
         )
-    return "\n".join(lines)
+    return "\n".join(lines) if lines else "None"

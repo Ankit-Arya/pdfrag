@@ -28,6 +28,20 @@ class Settings(BaseSettings):
     summary_model: str = "gpt-5.6-luna"
     llm_base_url: str = ""
     llm_timeout_seconds: float = Field(default=60, ge=5, le=300)
+    # Rate-limit-aware pacing. OpenAI can enforce TPM in rolling/quantized windows;
+    # reserve tokens conservatively, serialize same-model calls in this worker,
+    # and honor server reset headers before retrying a large evidence request.
+    llm_max_retries: int = Field(default=6, ge=0, le=12)
+    llm_retry_base_seconds: float = Field(default=1.0, ge=0.1, le=30.0)
+    llm_retry_max_seconds: float = Field(default=30.0, ge=1.0, le=120.0)
+    llm_rate_limit_max_wait_seconds: float = Field(default=75.0, ge=0.0, le=300.0)
+    llm_rate_limit_total_wait_seconds: float = Field(default=90.0, ge=0.0, le=600.0)
+    llm_rate_limit_safety_seconds: float = Field(default=0.35, ge=0.0, le=5.0)
+    llm_rate_limit_safety_tokens: int = Field(default=1500, ge=0, le=20000)
+    llm_chars_per_token_estimate: float = Field(default=3.5, ge=2.0, le=8.0)
+    llm_proactive_rate_limit_enabled: bool = True
+    llm_serialize_model_requests: bool = True
+    summary_cache_entries: int = Field(default=384, ge=0, le=4096)
     llm_reasoning_effort: Literal["none", "low", "medium", "high", "xhigh", "max"] = "medium"
     query_reasoning_effort: Literal["none", "low", "medium", "high", "xhigh", "max"] = "low"
     summary_reasoning_effort: Literal["none", "low", "medium", "high", "xhigh", "max"] = "low"

@@ -6,7 +6,7 @@ import ChatPanel from './components/ChatPanel.vue'
 import LoginPanel from './components/LoginPanel.vue'
 import UploadPanel from './components/UploadPanel.vue'
 import {
-  askQuestion,
+  askQuestionStreaming,
   clearStoredSession,
   createUser,
   currentSessionId as getCurrentSessionId,
@@ -29,6 +29,7 @@ import {
   type AdminUser,
   type AnswerResponse,
   type AuthSession,
+  type ChatProgressEvent,
   type ChatSession,
   type DocumentRecord,
   type KnowledgeStatus,
@@ -50,6 +51,7 @@ const initializing = ref(true)
 const authBusy = ref(false)
 const operationBusy = ref(false)
 const answering = ref(false)
+const chatProgress = ref<ChatProgressEvent[]>([])
 const user = ref<User | null>(null)
 const view = ref<ViewName>('chat')
 const knowledge = ref<KnowledgeStatus | null>(null)
@@ -161,6 +163,7 @@ function resetLocalSession(): void {
   activeChatId.value = null
   activeChatTitle.value = null
   messages.value = []
+  chatProgress.value = []
   question.value = ''
   view.value = 'chat'
 }
@@ -285,6 +288,7 @@ function newChat(): void {
   activeChatId.value = null
   activeChatTitle.value = null
   messages.value = []
+  chatProgress.value = []
   question.value = ''
   view.value = 'chat'
 }
@@ -296,6 +300,7 @@ async function openChat(chatId: string): Promise<void> {
     const chat = await getChat(chatId)
     activeChatId.value = chat.id
     activeChatTitle.value = chat.title
+    chatProgress.value = []
     messages.value = chat.messages
       .filter((message) => message.role === 'user' || message.role === 'assistant')
       .map((message) => ({
@@ -332,6 +337,16 @@ async function removeChat(chatId: string): Promise<void> {
   }
 }
 
+function updateChatProgress(event: ChatProgressEvent): void {
+  // Keep one live row per backend stage. When a stage resumes after a temporary
+  // rate-limit wait, move it back to the end so the newest backend activity is
+  // always the active item in the UI.
+  chatProgress.value = [
+    ...chatProgress.value.filter((item) => item.stage !== event.stage),
+    event,
+  ].slice(-8)
+}
+
 async function ask(value: string): Promise<void> {
   const questionMessageId = id()
   messages.value.push({
@@ -342,10 +357,27 @@ async function ask(value: string): Promise<void> {
   })
   question.value = ''
   answering.value = true
+  chatProgress.value = []
   error.value = ''
   controller = new AbortController()
   try {
-    const response = await askQuestion(value, activeChatId.value, controller.signal)
+    const response = await askQuestionStreaming(
+      value,
+      activeChatId.value,
+      {
+        onStart: (event) => {
+          activeChatId.value = event.chat_session_id || activeChatId.value
+          const savedQuestion = messages.value.find(
+            (message) => message.id === questionMessageId,
+          )
+          if (savedQuestion && event.question_created_at) {
+            savedQuestion.createdAt = event.question_created_at
+          }
+        },
+        onProgress: updateChatProgress,
+      },
+      controller.signal,
+    )
     activeChatId.value = response.chat_session_id ?? activeChatId.value
     if (response.question_created_at) {
       const savedQuestion = messages.value.find(
@@ -353,6 +385,9 @@ async function ask(value: string): Promise<void> {
       )
       if (savedQuestion) savedQuestion.createdAt = response.question_created_at
     }
+    // The backend work panel is temporary. Replace it with the final grounded
+    // answer instead of leaving a synthetic progress transcript in chat history.
+    chatProgress.value = []
     messages.value.push({
       id: id(),
       role: 'assistant',
@@ -368,6 +403,7 @@ async function ask(value: string): Promise<void> {
     showError(cause, 'Question failed.')
   } finally {
     answering.value = false
+    chatProgress.value = []
     controller = null
   }
 }
@@ -565,6 +601,7 @@ onMounted(() => {
       v-model:messages="messages"
       :knowledge="knowledge"
       :busy="answering"
+      :progress="chatProgress"
       :active-chat-title="activeChatTitle"
       @ask="ask"
       @cancel="cancel"

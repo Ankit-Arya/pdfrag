@@ -28,6 +28,7 @@ from app.rag.postgres_store import (
     search_stemmed_chunks,
 )
 from app.rag.prompts import NO_ANSWER
+from app.rag.progress import ProgressCallback, emit_progress, progress_context
 from app.rag.query import needs_conversation_context, query_planner
 from app.rag.relevance import select_context_chunks
 from app.rag.synthesis import (
@@ -126,6 +127,29 @@ class RagService:
         top_k: int | None = None,
         rewrite_question: bool | None = None,
         conversation_context: list[dict[str, str]] | None = None,
+        progress_callback: ProgressCallback | None = None,
+    ) -> AnswerResponse:
+        with progress_context(progress_callback):
+            emit_progress(
+                "prepare",
+                "Understanding your question",
+                "Resolving intent, abbreviations and conversation context",
+            )
+            return self._ask_impl(
+                db,
+                question,
+                top_k,
+                rewrite_question,
+                conversation_context,
+            )
+
+    def _ask_impl(
+        self,
+        db: Session,
+        question: str,
+        top_k: int | None = None,
+        rewrite_question: bool | None = None,
+        conversation_context: list[dict[str, str]] | None = None,
     ) -> AnswerResponse:
         settings = get_settings()
         history = conversation_context or []
@@ -153,6 +177,11 @@ class RagService:
             ]
         )
         abbreviation_hints = find_abbreviation_hints(db, abbreviation_probe)
+        emit_progress(
+            "interpret",
+            "Planning the document search",
+            "Using PDF-grounded abbreviations and the current topic only",
+        )
         plan = query_planner.plan(
             question,
             enabled=rewrite_question,
@@ -160,7 +189,17 @@ class RagService:
             abbreviation_hints=abbreviation_hints,
             routing_hints=routing_hints,
         )
+        emit_progress(
+            "interpret",
+            "Question interpreted",
+            f"Intent: {plan.intent.replace('_', ' ')}; {len(plan.search_queries)} search variant(s)",
+        )
 
+        emit_progress(
+            "route",
+            "Routing to likely documents",
+            "Checking document titles, subjects and dedicated procedures",
+        )
         primary_routes = find_primary_documents(
             db,
             plan.contextual_question or plan.original_question,
@@ -168,6 +207,18 @@ class RagService:
         )
         primary_document_ids = {route.document_id for route in primary_routes}
         primary_document_names = [route.filename for route in primary_routes]
+        if primary_document_names:
+            emit_progress(
+                "route",
+                "Primary document identified",
+                "; ".join(primary_document_names[:3]),
+            )
+        else:
+            emit_progress(
+                "route",
+                "No single dedicated document dominates",
+                "Searching the ready PDF corpus broadly",
+            )
 
         context_limit = (
             settings.reference_evidence_chunk_limit
@@ -183,13 +234,35 @@ class RagService:
         )
         merged: dict[str, RetrievedChunk] = {}
 
+        emit_progress(
+            "search",
+            "Searching semantic and lexical indexes",
+            f"Running {len(plan.search_queries)} retrieval variant(s)",
+            current=0,
+            total=len(plan.search_queries),
+        )
         vectors = embedding_service.encode(plan.search_queries)
-        for query, vector in zip(plan.search_queries, vectors, strict=True):
+        for query_index, (query, vector) in enumerate(
+            zip(plan.search_queries, vectors, strict=True),
+            start=1,
+        ):
+            emit_progress(
+                "search",
+                "Searching semantic and lexical indexes",
+                f"Retrieval variant {query_index} of {len(plan.search_queries)}",
+                current=query_index,
+                total=len(plan.search_queries),
+            )
             for item in search_chunks(db, vector.tolist(), query, semantic_limit):
                 _merge_candidate(merged, item)
             for item in search_stemmed_chunks(db, query, semantic_limit):
                 _merge_candidate(merged, item)
 
+        emit_progress(
+            "corpus_scan",
+            "Scanning exact matches across the PDF corpus",
+            "Checking ready chunks so direct rules are not missed by vector ranking",
+        )
         corpus_queries = _unique(
             [
                 plan.contextual_question or plan.original_question,
@@ -208,6 +281,11 @@ class RagService:
             _merge_candidate(merged, item)
 
         if plan.search_mode == "answer" and primary_routes:
+            emit_progress(
+                "primary_read",
+                "Reading the primary document",
+                f"Reviewing relevant sections from {len(primary_routes)} routed document(s)",
+            )
             for item in fetch_primary_document_chunks(
                 db,
                 primary_routes,
@@ -226,6 +304,11 @@ class RagService:
         )
         active_references = _unique([*plan.routing_hints, *discovered_references])
         if plan.search_mode == "answer" and active_references:
+            emit_progress(
+                "reference_hop",
+                "Following document references",
+                "; ".join(active_references[:6]),
+            )
             reference_queries = _unique(
                 [
                     plan.contextual_question or plan.original_question,
@@ -244,11 +327,21 @@ class RagService:
                 _merge_candidate(merged, item)
 
         candidates = sorted(merged.values(), key=_result_sort_key)
+        emit_progress(
+            "rerank",
+            "Reviewing candidate evidence",
+            f"{len(candidates)} candidate excerpt(s) collected",
+        )
         if not candidates:
             return self._empty_answer(plan, abbreviation_hints, candidate_chunks=0)
 
         relevant = self._select_context_chunks(
             plan, candidates, context_limit, preferred_document_ids=primary_document_ids
+        )
+        emit_progress(
+            "rerank",
+            "Relevant evidence selected",
+            f"{len(relevant)} excerpt(s) passed applicability and relevance checks",
         )
         if not relevant:
             return self._empty_answer(
@@ -258,6 +351,11 @@ class RagService:
             )
 
         if plan.search_mode == "references":
+            emit_progress(
+                "format",
+                "Formatting document references",
+                f"Preparing {len(relevant)} matching excerpt(s)",
+            )
             return self._reference_answer(
                 plan,
                 relevant,
@@ -265,6 +363,11 @@ class RagService:
                 candidate_chunks=len(candidates),
             )
 
+        emit_progress(
+            "context",
+            "Reading surrounding sections",
+            "Adding adjacent chunks where procedure steps continue across sections/pages",
+        )
         expanded = self._expand_context(
             db,
             plan,
@@ -272,11 +375,21 @@ class RagService:
             context_limit,
             preferred_document_ids=primary_document_ids,
         )
+        emit_progress(
+            "synthesize",
+            "Preparing a grounded answer",
+            f"{len(expanded)} evidence excerpt(s) will be reviewed by the answer pipeline",
+        )
         bundle = synthesize_answer(
             plan,
             expanded,
             primary_document_ids=primary_document_ids,
             primary_document_names=primary_document_names,
+        )
+        emit_progress(
+            "verify",
+            "Checking citations and applicability",
+            "Validating source labels before showing the answer",
         )
         answer, grounded = validate_grounded_answer(bundle.raw_answer, len(bundle.sources))
         grounding_status = "verified" if grounded else "citation_validation_failed"
@@ -286,6 +399,11 @@ class RagService:
         # pass already reviewed every selected chunk; this targeted retry exposes
         # the strongest original excerpts while preserving the same S-number map.
         if (answer == NO_ANSWER or looks_like_negative_answer(answer)) and plan.intent in {"fact_lookup", "definition"}:
+            emit_progress(
+                "fact_recheck",
+                "Re-checking the strongest evidence",
+                "The first pass did not produce a supported direct fact",
+            )
             rescued_raw = rescue_fact_answer(plan, bundle.sources)
             rescued_answer, rescued_grounded = validate_grounded_answer(
                 rescued_raw, len(bundle.sources)
@@ -298,6 +416,11 @@ class RagService:
                 )
 
         if not grounded and answer != NO_ANSWER:
+            emit_progress(
+                "citation_repair",
+                "Repairing citation grounding",
+                "Rewriting only against the evidence already reviewed",
+            )
             if bundle.used_hierarchy:
                 repaired_raw = repair_hierarchical_answer(
                     plan,
@@ -334,6 +457,11 @@ class RagService:
             and answer != NO_ANSWER
             and procedure_answer_needs_repair(answer, bundle.sources, primary_document_ids)
         ):
+            emit_progress(
+                "procedure_repair",
+                "Refining the procedure",
+                "Ensuring the primary SOP is cited and the actions are in operational order",
+            )
             procedure_raw = repair_procedure_answer(
                 plan,
                 answer,
@@ -351,6 +479,11 @@ class RagService:
                 )
 
         used_source_numbers = set(cited_source_numbers(answer, len(bundle.sources)))
+        emit_progress(
+            "finalize",
+            "Finalizing the answer",
+            f"{len(used_source_numbers)} cited source(s); {len(bundle.sources)} reviewed excerpt(s)",
+        )
         sources = _source_results(answer, bundle.sources)
         evidence = _evidence_results(bundle.sources)
         return AnswerResponse(

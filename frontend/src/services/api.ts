@@ -94,6 +94,26 @@ export interface AnswerResponse {
   response_created_at?: string | null
 }
 
+export interface ChatProgressEvent {
+  stage: string
+  label: string
+  detail?: string
+  current?: number
+  total?: number
+  timestamp?: number
+}
+
+export interface ChatStreamStart {
+  chat_session_id: string
+  question_created_at: string
+  request_id?: string | null
+}
+
+export interface ChatStreamHandlers {
+  onStart?: (event: ChatStreamStart) => void
+  onProgress?: (event: ChatProgressEvent) => void
+}
+
 export interface ChatSession {
   id: string
   title: string
@@ -399,4 +419,107 @@ export async function askQuestion(
     }),
     signal,
   })
+}
+
+interface ParsedSseEvent {
+  event: string
+  data: string
+}
+
+function parseSseFrame(frame: string): ParsedSseEvent | null {
+  let event = 'message'
+  const data: string[] = []
+  for (const rawLine of frame.replace(/\r/g, '').split('\n')) {
+    const line = rawLine.trimEnd()
+    if (!line || line.startsWith(':')) continue
+    if (line.startsWith('event:')) {
+      event = line.slice(6).trim() || 'message'
+      continue
+    }
+    if (line.startsWith('data:')) data.push(line.slice(5).trimStart())
+  }
+  if (!data.length) return null
+  return { event, data: data.join('\n') }
+}
+
+function streamErrorMessage(payload: unknown): string {
+  if (
+    payload
+    && typeof payload === 'object'
+    && 'detail' in payload
+    && typeof (payload as { detail?: unknown }).detail === 'string'
+  ) {
+    return (payload as { detail: string }).detail
+  }
+  return 'Question failed while the answer was being prepared.'
+}
+
+export async function askQuestionStreaming(
+  question: string,
+  chatSessionId: string | null,
+  handlers: ChatStreamHandlers = {},
+  signal?: AbortSignal,
+): Promise<AnswerResponse> {
+  const response = await authenticatedFetch('/api/chat/stream', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'text/event-stream',
+    },
+    body: JSON.stringify({
+      question,
+      chat_session_id: chatSessionId || null,
+    }),
+    signal,
+  })
+
+  if (!response.ok) {
+    await parseResponse<never>(response)
+    throw new Error('Question failed before streaming started.')
+  }
+  if (!response.body) throw new Error('Streaming responses are not supported by this browser.')
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let answer: AnswerResponse | null = null
+
+  const handleFrame = (frame: string): void => {
+    const parsed = parseSseFrame(frame)
+    if (!parsed) return
+    let payload: unknown
+    try {
+      payload = JSON.parse(parsed.data) as unknown
+    } catch {
+      return
+    }
+
+    if (parsed.event === 'start') {
+      handlers.onStart?.(payload as ChatStreamStart)
+    } else if (parsed.event === 'progress') {
+      handlers.onProgress?.(payload as ChatProgressEvent)
+    } else if (parsed.event === 'answer') {
+      answer = payload as AnswerResponse
+    } else if (parsed.event === 'error') {
+      throw new Error(streamErrorMessage(payload))
+    }
+  }
+
+  while (true) {
+    const { value, done } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n')
+    let boundary = buffer.indexOf('\n\n')
+    while (boundary >= 0) {
+      const frame = buffer.slice(0, boundary)
+      buffer = buffer.slice(boundary + 2)
+      handleFrame(frame)
+      boundary = buffer.indexOf('\n\n')
+    }
+  }
+
+  buffer += decoder.decode()
+  if (buffer.trim()) handleFrame(buffer)
+  if (!answer) throw new Error('The server closed the progress stream before returning an answer.')
+  return answer
 }

@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   downloadDocument,
   listDocuments,
   type AnswerResponse,
+  type ChatProgressEvent,
   type DocumentRecord,
   type KnowledgeStatus,
   type SourceResult,
@@ -21,6 +22,7 @@ interface Message {
 const props = defineProps<{
   knowledge: KnowledgeStatus | null
   busy: boolean
+  progress: ChatProgressEvent[]
   activeChatTitle: string | null
 }>()
 
@@ -140,6 +142,20 @@ function evidenceIsExpanded(messageId: string): boolean {
   return expandedEvidenceIds.value.has(messageId)
 }
 
+const visibleProgress = computed(() => props.progress.slice(-6))
+const currentProgress = computed(() => props.progress[props.progress.length - 1] ?? null)
+
+function progressPercent(event: ChatProgressEvent): number | null {
+  if (typeof event.current !== 'number' || typeof event.total !== 'number' || event.total <= 0) {
+    return null
+  }
+  return Math.max(0, Math.min(100, Math.round((event.current / event.total) * 100)))
+}
+
+function isActiveProgress(event: ChatProgressEvent): boolean {
+  return currentProgress.value?.stage === event.stage
+}
+
 interface EvidenceGroup {
   key: string
   filename: string
@@ -189,6 +205,19 @@ function groupEvidence(sources: SourceResult[] | undefined): EvidenceGroup[] {
   }
   return Array.from(groups.values())
 }
+
+watch(
+  () => props.progress,
+  async () => {
+    if (!props.busy) return
+    await nextTick()
+    scrollArea.value?.scrollTo({
+      top: scrollArea.value.scrollHeight,
+      behavior: 'smooth',
+    })
+  },
+  { deep: true },
+)
 
 onMounted(() => {
   void loadDocumentLibrary()
@@ -432,11 +461,56 @@ onBeforeUnmount(() => {
         </div>
       </article>
 
-      <article v-if="busy" class="message assistant">
+      <article v-if="busy" class="message assistant work-message">
         <div class="avatar" aria-hidden="true">D</div>
         <div class="message-content">
           <span class="message-label">DMRC Q&A</span>
-          <div class="typing"><span /><span /><span /></div>
+          <section class="work-progress" aria-live="polite" aria-label="Answer preparation progress">
+            <div class="work-progress-current">
+              <span class="work-spinner" aria-hidden="true" />
+              <div>
+                <strong>{{ currentProgress?.label || 'Starting document analysis' }}</strong>
+                <p v-if="currentProgress?.detail">{{ currentProgress.detail }}</p>
+                <p v-else>Connecting to the document retrieval pipeline…</p>
+              </div>
+            </div>
+
+            <div
+              v-if="currentProgress && progressPercent(currentProgress) !== null"
+              class="work-progress-meter"
+              role="progressbar"
+              :aria-valuenow="progressPercent(currentProgress) ?? undefined"
+              aria-valuemin="0"
+              aria-valuemax="100"
+            >
+              <span :style="{ width: `${progressPercent(currentProgress) ?? 0}%` }" />
+            </div>
+
+            <ol v-if="visibleProgress.length" class="work-progress-history">
+              <li
+                v-for="event in visibleProgress"
+                :key="event.stage"
+                :class="{ active: isActiveProgress(event) }"
+              >
+                <span class="work-step-icon" aria-hidden="true">
+                  <i v-if="isActiveProgress(event)" class="work-step-spinner" />
+                  <svg v-else viewBox="0 0 16 16">
+                    <path d="M3.2 8.1 6.5 11.2 12.8 4.9" />
+                  </svg>
+                </span>
+                <span class="work-step-copy">
+                  <strong>{{ event.label }}</strong>
+                  <small v-if="event.detail">{{ event.detail }}</small>
+                </span>
+                <span
+                  v-if="typeof event.current === 'number' && typeof event.total === 'number'"
+                  class="work-step-count"
+                >
+                  {{ event.current }}/{{ event.total }}
+                </span>
+              </li>
+            </ol>
+          </section>
           <button class="cancel-link" @click="emit('cancel')">Cancel</button>
         </div>
       </article>
@@ -472,6 +546,150 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+.work-message .message-content {
+  width: min(720px, calc(100% - 52px));
+}
+
+.work-progress {
+  margin-top: 8px;
+  padding: 13px 14px;
+  border: 1px solid #dce6e1;
+  border-radius: 14px;
+  background: linear-gradient(180deg, rgba(249, 252, 250, .98), rgba(244, 249, 246, .92));
+  box-shadow: 0 8px 24px rgba(34, 67, 55, .045);
+}
+
+.work-progress-current {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.work-progress-current strong {
+  display: block;
+  color: #293a34;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.work-progress-current p {
+  margin: 3px 0 0;
+  color: #76857f;
+  font-size: 9px;
+  line-height: 1.45;
+}
+
+.work-spinner,
+.work-step-spinner {
+  display: inline-block;
+  border-radius: 999px;
+  border: 2px solid #d9e5df;
+  border-top-color: #477b68;
+  animation: work-spin .85s linear infinite;
+}
+
+.work-spinner {
+  width: 15px;
+  height: 15px;
+  margin-top: 1px;
+  flex: 0 0 auto;
+}
+
+.work-step-spinner {
+  width: 9px;
+  height: 9px;
+}
+
+.work-progress-meter {
+  height: 3px;
+  margin: 10px 0 4px 25px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #e3ebe7;
+}
+
+.work-progress-meter > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: #628f7d;
+  transition: width .25s ease;
+}
+
+.work-progress-history {
+  margin: 10px 0 0 2px;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+  list-style: none;
+}
+
+.work-progress-history li {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 7px;
+  color: #82908b;
+  opacity: .78;
+}
+
+.work-progress-history li.active {
+  color: #355f50;
+  opacity: 1;
+}
+
+.work-step-icon {
+  width: 18px;
+  height: 18px;
+  display: inline-grid;
+  place-items: center;
+}
+
+.work-step-icon svg {
+  width: 11px;
+  height: 11px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.8;
+}
+
+.work-step-copy strong,
+.work-step-copy small {
+  display: block;
+}
+
+.work-step-copy strong {
+  font-size: 9px;
+  line-height: 1.4;
+}
+
+.work-step-copy small {
+  margin-top: 1px;
+  color: #8d9995;
+  font-size: 8px;
+  line-height: 1.35;
+}
+
+.work-step-count {
+  padding-top: 1px;
+  color: #8a9892;
+  font-size: 8px;
+  font-variant-numeric: tabular-nums;
+}
+
+@keyframes work-spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .work-spinner,
+  .work-step-spinner {
+    animation-duration: 1.8s;
+  }
+}
+
 .message-heading {
   display: flex;
   align-items: baseline;
