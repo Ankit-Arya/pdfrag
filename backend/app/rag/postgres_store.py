@@ -18,6 +18,14 @@ _DOCUMENT_REFERENCE_RE = re.compile(
     r"\b(SC|SM|SOP|JPO|INST(?:RUCTION)?|MRGR)\s*[-_ ]?\s*(\d{1,4}[A-Z]?)\b",
     re.IGNORECASE,
 )
+_NAMED_LINE_ALIAS_RE = re.compile(
+    r"\b(?P<name>(?:[A-Za-z][A-Za-z-]{1,24}\s+){0,1}[A-Za-z][A-Za-z-]{1,24})\s+Line\b",
+    re.IGNORECASE,
+)
+_GENERIC_LINE_NAMES = {
+    "main", "running", "up", "down", "dn", "train", "metro", "next",
+    "same", "this", "that", "neutral", "section", "revenue", "non-revenue",
+}
 
 
 def search_chunks(
@@ -764,6 +772,124 @@ def find_abbreviation_hints(
                 hints.append(hint)
 
     return hints
+
+
+def find_line_alias_evidence(
+    db: Session,
+    question_text: str,
+    *,
+    max_chunks: int | None = None,
+) -> tuple[list[str], list[RetrievedChunk]]:
+    """Resolve named-line wording only when a ready PDF explicitly maps it.
+
+    The assistant must not guess that a colour/name means a numbered line. This
+    resolver accepts a mapping only when a retrieved corpus chunk directly places
+    the named line and a canonical ``Line N``/``AEL`` identifier close together.
+    The mapping chunk is returned as normal evidence so the premise can be cited.
+    """
+    settings = get_settings()
+    limit = max_chunks or settings.line_alias_scan_chunks
+    aliases = _named_line_aliases(question_text)
+    if not aliases or limit <= 0:
+        return [], []
+
+    targets: list[str] = []
+    evidence: list[RetrievedChunk] = []
+    seen_chunks: set[str] = set()
+    sql = text(
+        """
+        SELECT c.id, c.document_id, c.chunk_index, c.page_number, c.content_type,
+               c.text, d.filename
+        FROM document_chunks c
+        JOIN documents d ON d.id = c.document_id
+        WHERE d.status = 'ready' AND c.text ~* :pattern
+        ORDER BY lower(d.filename), c.page_number, c.chunk_index, c.id
+        LIMIT :limit
+        """
+    )
+
+    for alias in aliases:
+        pattern = rf"(^|[^A-Za-z0-9]){re.escape(alias)}([^A-Za-z0-9]|$)"
+        rows = list(db.execute(sql, {"pattern": pattern, "limit": limit}).mappings())
+        mapped: dict[str, list[object]] = {}
+        for row in rows:
+            body = _strip_chunk_context(str(row["text"]))
+            target = _direct_line_alias_target(body, alias)
+            if target:
+                mapped.setdefault(target, []).append(row)
+        if not mapped:
+            continue
+        ordered = sorted(mapped.items(), key=lambda item: (-len(item[1]), item[0]))
+        best_target, best_rows = ordered[0]
+        if len(ordered) > 1 and len(ordered[1][1]) == len(best_rows):
+            # Conflicting equally supported mappings are unsafe; leave the name
+            # unresolved rather than guessing.
+            continue
+        targets.append(best_target)
+        for row in best_rows[:4]:
+            chunk_id = str(row["id"])
+            if chunk_id in seen_chunks:
+                continue
+            seen_chunks.add(chunk_id)
+            evidence.append(
+                _row_to_result(
+                    row,
+                    score=0.97,
+                    method="grounded-line-alias",
+                    vector_score=0.0,
+                    keyword_score=0.95,
+                )
+            )
+
+    return _deduplicate_strings(targets), evidence
+
+
+def _named_line_aliases(question_text: str) -> list[str]:
+    aliases: list[str] = []
+    seen: set[str] = set()
+    for match in _NAMED_LINE_ALIAS_RE.finditer(question_text):
+        name = " ".join(match.group("name").split())
+        parts = name.split()
+        if parts and parts[0].casefold() in {"in", "on", "for", "the"} and len(parts) > 1:
+            parts = parts[1:]
+        if not parts:
+            continue
+        normalized_name = " ".join(parts)
+        if normalized_name.casefold() in _GENERIC_LINE_NAMES:
+            continue
+        alias = f"{normalized_name} Line"
+        key = alias.casefold()
+        if key not in seen:
+            seen.add(key)
+            aliases.append(alias)
+    return aliases[:3]
+
+
+def _direct_line_alias_target(text_value: str, alias: str) -> str | None:
+    escaped = re.escape(alias)
+    patterns = [
+        rf"{escaped}.{{0,90}}?\bLine\s*[-_:]?\s*(?P<target>\d{{1,2}}|AEL)\b",
+        rf"\bLine\s*[-_:]?\s*(?P<target>\d{{1,2}}|AEL)\b.{{0,90}}?{escaped}",
+        rf"{escaped}\s*[(/:-]\s*(?P<target>\d{{1,2}}|AEL)\s*[)]?",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text_value, flags=re.IGNORECASE | re.DOTALL)
+        if not match:
+            continue
+        raw = match.group("target").upper()
+        return "AEL" if raw == "AEL" else f"Line {int(raw)}"
+    return None
+
+
+def _deduplicate_strings(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        key = value.casefold()
+        if key not in seen:
+            seen.add(key)
+            result.append(value)
+    return result
 
 
 def fetch_neighbor_chunks(

@@ -24,6 +24,7 @@ from app.rag.postgres_store import (
     fetch_primary_document_chunks,
     fetch_referenced_document_chunks,
     find_abbreviation_hints,
+    find_line_alias_evidence,
     find_primary_documents,
     scan_matching_chunks,
     search_chunks,
@@ -37,7 +38,11 @@ from app.rag.query import (
     needs_conversation_context,
     query_planner,
 )
-from app.rag.relevance import select_context_chunks
+from app.rag.relevance import (
+    filter_hard_context_candidates,
+    rank_scenario_documents,
+    select_context_chunks,
+)
 from app.rag.synthesis import (
     list_answer_needs_repair,
     looks_like_negative_answer,
@@ -50,7 +55,7 @@ from app.rag.synthesis import (
     rescue_fact_answer,
     synthesize_answer,
 )
-from app.rag.types import PromptSource, QueryPlan, RetrievedChunk
+from app.rag.types import PrimaryDocumentMatch, PromptSource, QueryPlan, RetrievedChunk
 
 logger = logging.getLogger(__name__)
 
@@ -187,6 +192,9 @@ class RagService:
             ]
         )
         abbreviation_hints = find_abbreviation_hints(db, abbreviation_probe)
+        line_alias_targets, line_alias_evidence = find_line_alias_evidence(
+            db, question, max_chunks=settings.line_alias_scan_chunks
+        )
         emit_progress(
             "interpret",
             "Planning the document search",
@@ -199,6 +207,21 @@ class RagService:
             abbreviation_hints=abbreviation_hints,
             routing_hints=routing_hints,
         )
+        if line_alias_targets:
+            contextual = plan.contextual_question or plan.original_question
+            alias_queries = [f"{contextual} {target}" for target in line_alias_targets]
+            plan = replace(
+                plan,
+                search_queries=_unique(
+                    [plan.original_question, *alias_queries, *plan.search_queries]
+                )[: settings.query_rewrite_max_variants],
+                context_terms=_unique([*plan.context_terms, *line_alias_targets])[:32],
+            )
+            emit_progress(
+                "interpret",
+                "Resolved named-line terminology from the PDFs",
+                "; ".join(line_alias_targets),
+            )
 
         # Defense in depth: the user-facing contract is answer-first for any
         # informational request that is not explicit corpus navigation or a bare
@@ -289,6 +312,8 @@ class RagService:
             settings.max_retrieval_candidates,
         )
         merged: dict[str, RetrievedChunk] = {}
+        for item in line_alias_evidence:
+            _merge_candidate(merged, item)
 
         emit_progress(
             "search",
@@ -382,7 +407,60 @@ class RagService:
             ):
                 _merge_candidate(merged, item)
 
+        if plan.search_mode == "answer" and settings.preselection_neighbor_window > 0:
+            bridge_seeds = sorted(merged.values(), key=_result_sort_key)[
+                : settings.preselection_neighbor_seed_limit
+            ]
+            if bridge_seeds:
+                emit_progress(
+                    "context_bridge",
+                    "Connecting applicability headings to procedure steps",
+                    f"Reading nearby chunks around {len(bridge_seeds)} strong candidate(s)",
+                )
+                for item in fetch_neighbor_chunks(
+                    db, bridge_seeds, window=settings.preselection_neighbor_window
+                ):
+                    _merge_candidate(merged, item)
+
         candidates = sorted(merged.values(), key=_result_sort_key)
+
+        # A dedicated procedure can be named generically while the exact scenario
+        # lives deep in section 6.x. Route again from local body evidence after
+        # retrieval, then read the winning procedure document comprehensively.
+        if (
+            plan.search_mode == "answer"
+            and settings.scenario_document_routing_enabled
+            and _use_primary_document_backbone(plan)
+            and candidates
+        ):
+            scenario_routes = rank_scenario_documents(
+                plan,
+                candidates,
+                max_documents=settings.scenario_document_max_documents,
+            )
+            if scenario_routes:
+                previous_ids = {route.document_id for route in primary_routes}
+                primary_routes = _merge_primary_routes(primary_routes, scenario_routes)
+                primary_document_ids = {route.document_id for route in primary_routes}
+                primary_document_names = [route.filename for route in primary_routes]
+                newly_routed = [
+                    route for route in scenario_routes if route.document_id not in previous_ids
+                ]
+                emit_progress(
+                    "scenario_route",
+                    "Exact scenario procedure identified",
+                    "; ".join(route.filename for route in scenario_routes[:3]),
+                )
+                if newly_routed:
+                    for item in fetch_primary_document_chunks(
+                        db,
+                        newly_routed,
+                        corpus_queries,
+                        chunks_per_document=settings.primary_document_chunks_per_document,
+                    ):
+                        _merge_candidate(merged, item)
+                    candidates = sorted(merged.values(), key=_result_sort_key)
+
         emit_progress(
             "rerank",
             "Reviewing candidate evidence",
@@ -405,7 +483,19 @@ class RagService:
                 # candidates even though the strongest retrieved excerpts still contain
                 # useful partial evidence. Let the answer model review a small, bounded
                 # strongest set before declaring that nothing can be answered.
-                review_results = candidates[: settings.best_supported_candidate_review_limit]
+                safe_candidates = filter_hard_context_candidates(plan, candidates)
+                review_results = safe_candidates[: settings.best_supported_candidate_review_limit]
+                if not review_results:
+                    emit_progress(
+                        "best_supported",
+                        "No evidence matches the explicit scenario constraints",
+                        "Refusing to substitute a different line/equipment procedure",
+                    )
+                    return self._empty_answer(
+                        plan,
+                        abbreviation_hints,
+                        candidate_chunks=len(candidates),
+                    )
                 review_sources = [
                     PromptSource(result=item, excerpt=item.chunk.text.strip())
                     for item in review_results
@@ -579,6 +669,35 @@ class RagService:
                 )
 
         if (
+            plan.intent == "procedure"
+            and primary_document_ids
+            and (answer == NO_ANSWER or looks_like_negative_answer(answer))
+            and bundle.sources
+        ):
+            emit_progress(
+                "procedure_recheck",
+                "Re-checking the primary procedure",
+                "The first answer missed a scenario covered by the routed SOP",
+            )
+            procedure_raw = repair_procedure_answer(
+                plan,
+                answer,
+                bundle.sources,
+                primary_document_ids,
+            )
+            procedure_answer, procedure_grounded = validate_grounded_answer(
+                procedure_raw, len(bundle.sources)
+            )
+            if procedure_answer != NO_ANSWER:
+                answer = procedure_answer
+                grounded = procedure_grounded
+                grounding_status = (
+                    "verified_after_primary_procedure_recheck"
+                    if grounded
+                    else "citation_validation_failed"
+                )
+
+        if (
             settings.best_supported_answer_enabled
             and (answer == NO_ANSWER or looks_like_negative_answer(answer))
             and bundle.sources
@@ -588,9 +707,10 @@ class RagService:
                 "Building the best-supported answer",
                 "Using the strongest directly relevant excerpts without inventing missing facts",
             )
+            safe_sources = _hard_context_prompt_sources(plan, bundle.sources)
             best_raw = rescue_best_supported_answer(
                 plan,
-                bundle.sources,
+                safe_sources,
                 primary_document_ids=bundle.primary_document_ids,
                 max_sources=settings.best_supported_source_limit,
             )
@@ -674,7 +794,13 @@ class RagService:
             plan.intent == "procedure"
             and primary_document_ids
             and answer != NO_ANSWER
-            and procedure_answer_needs_repair(answer, bundle.sources, primary_document_ids)
+            and (
+                procedure_answer_needs_repair(answer, bundle.sources, primary_document_ids)
+                or (
+                    line_alias_targets
+                    and not _answer_cites_grounded_line_alias(answer, bundle.sources)
+                )
+            )
         ):
             emit_progress(
                 "procedure_repair",
@@ -832,6 +958,59 @@ class RagService:
             max_chunks=max_chunks,
             preferred_document_ids=preferred_document_ids,
         )
+
+
+def _merge_primary_routes(
+    existing: list[PrimaryDocumentMatch],
+    discovered: list[PrimaryDocumentMatch],
+) -> list[PrimaryDocumentMatch]:
+    by_id: dict[str, PrimaryDocumentMatch] = {}
+    for route in [*existing, *discovered]:
+        document_id = str(getattr(route, "document_id"))
+        old = by_id.get(document_id)
+        if old is None or float(getattr(route, "score", 0.0)) > float(getattr(old, "score", 0.0)):
+            by_id[document_id] = route
+    return sorted(
+        by_id.values(),
+        key=lambda route: (
+            -float(getattr(route, "score", 0.0)),
+            str(getattr(route, "filename", "")).casefold(),
+            str(getattr(route, "document_id", "")),
+        ),
+    )
+
+
+def _answer_cites_grounded_line_alias(
+    answer: str,
+    sources: list[PromptSource],
+) -> bool:
+    for number in cited_source_numbers(answer, len(sources)):
+        if 1 <= number <= len(sources):
+            if "grounded-line-alias" in sources[number - 1].result.method:
+                return True
+    return False
+
+
+def _hard_context_prompt_sources(
+    plan: QueryPlan,
+    sources: list[PromptSource],
+) -> list[PromptSource]:
+    if not sources:
+        return []
+    allowed = filter_hard_context_candidates(plan, [source.result for source in sources])
+    allowed_ids = {item.chunk.chunk_id for item in allowed}
+    # Keep corpus-grounded line-name mapping evidence even though it naturally
+    # does not repeat equipment anchors such as VCB/NSCZ. It may establish only
+    # the applicability premise; the procedure itself must still come from a
+    # hard-context-matching document.
+    return [
+        source
+        for source in sources
+        if (
+            source.result.chunk.chunk_id in allowed_ids
+            or "grounded-line-alias" in source.result.method
+        )
+    ]
 
 
 _DOCUMENT_CODE_RE = re.compile(

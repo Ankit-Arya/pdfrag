@@ -92,6 +92,19 @@ class Settings(BaseSettings):
     primary_document_chunks_per_document: int = Field(default=600, ge=20, le=2500)
     primary_document_supplement_limit: int = Field(default=96, ge=0, le=500)
 
+    # Scenario-body routing is a second stage after normal retrieval. It finds an
+    # exact procedure even when the line/scenario wording occurs deep in the PDF
+    # rather than in the filename/opening title. Small local windows also inherit
+    # line/applicability headings across continuation chunks without re-embedding.
+    scenario_document_routing_enabled: bool = True
+    scenario_document_max_documents: int = Field(default=3, ge=1, le=8)
+    scenario_document_window_chunks: int = Field(default=6, ge=2, le=16)
+    applicability_inherit_chunk_window: int = Field(default=8, ge=1, le=24)
+    local_anchor_context_window: int = Field(default=2, ge=0, le=5)
+    preselection_neighbor_seed_limit: int = Field(default=180, ge=20, le=800)
+    preselection_neighbor_window: int = Field(default=2, ge=0, le=4)
+    line_alias_scan_chunks: int = Field(default=60, ge=5, le=300)
+
     # Hybrid retrieval still provides semantic candidates, but answer correctness
     # no longer depends on a tiny top-K. A corpus-wide lexical scan examines every
     # ready chunk and then returns matching rows up to a high safety ceiling.

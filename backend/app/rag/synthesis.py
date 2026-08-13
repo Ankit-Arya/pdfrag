@@ -289,7 +289,10 @@ def repair_procedure_answer(
     ranked = [
         (index, source)
         for index, source in enumerate(sources, 1)
-        if source.result.chunk.document_id in primary_document_ids
+        if (
+            source.result.chunk.document_id in primary_document_ids
+            or "grounded-line-alias" in source.result.method
+        )
     ][:max_primary_sources]
     if not ranked:
         return previous_answer
@@ -298,7 +301,10 @@ def repair_procedure_answer(
         blocks.append(_source_prompt_block(index, source))
     prompt = f"""Rewrite the previous draft as the actionable procedure requested by the user.
 Use ONLY the PRIMARY PROCEDURE evidence below. Do not replace it with generic rules from other
-PDFs. Start with a short applicability/scope sentence only if supported, then give a numbered
+PDFs. A source marked as grounded line-alias evidence may be used only to establish an explicit
+named-line to canonical-line mapping found in the PDFs; it cannot supply procedure steps. If the
+original question uses that named-line wording, cite the alias-mapping source wherever the answer
+relies on the mapped canonical line. Start with a short applicability/scope sentence only if supported, then give a numbered
 operational sequence. Preserve responsible roles, notifications, restrictions, special modes,
 assistance/escalation, restoration criteria, and materially different scenario branches. If the
 reviewed evidence is explicitly incomplete, preserve that limitation and number only the supported

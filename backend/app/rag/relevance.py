@@ -10,7 +10,7 @@ from app.rag.structure import (
     section_match_score,
     section_path_from_text,
 )
-from app.rag.types import QueryPlan, RetrievedChunk, TextChunk
+from app.rag.types import PrimaryDocumentMatch, QueryPlan, RetrievedChunk, TextChunk
 
 _TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./:#-]*")
 _QUOTED_RE = re.compile(r"[\"']([^\"']{2,80})[\"']")
@@ -19,6 +19,20 @@ _CONTEXT_LINE_RE = re.compile(
     r"^(?:Rolling stock / train context|Procedure context):\s*(.+)$",
     re.IGNORECASE | re.MULTILINE,
 )
+_LINE_SCOPE_RE = re.compile(
+    r"\b(?:in\s+|for\s+|applicable(?:\s+to|\s+for)?\s+)?"
+    r"lines?\s*[-\u2013\u2014:]?\s*"
+    r"(?P<values>(?:\d{1,2}|AEL)(?:\s*(?:,|&|and|/)\s*(?:\d{1,2}|AEL))*)",
+    re.IGNORECASE,
+)
+_DOCUMENT_CODE_RE = re.compile(
+    r"\b(?:SC|SM|SOP|JPO|INST(?:RUCTION)?|MRGR)\s*[-_/]?\s*\d+[A-Z]?\b",
+    re.IGNORECASE,
+)
+_ROLE_ACRONYMS = {
+    "to", "tc", "occ", "sc", "ra", "eto", "ic", "tpc", "rsc", "sgc",
+    "chc", "dcc", "sm",
+}
 
 _STOPWORDS = {
     "a",
@@ -164,6 +178,8 @@ class _ScoredChunk:
     relevance: float
     coverage: float
     anchor_coverage: float
+    direct_anchor_coverage: float
+    mandatory_anchor_coverage: float
     intent_evidence: float
     section_match: float
     major_section_match: float
@@ -183,9 +199,21 @@ def select_context_chunks(
 
     focus_terms = _focus_terms(plan)
     anchor_groups = _anchor_groups(plan)
+    mandatory_groups = _mandatory_anchor_groups(plan)
     preferred_ids = preferred_document_ids or set()
+    inherited_scopes = _inherited_line_scope_terms(candidates)
+    local_anchor_terms = _local_anchor_terms_by_chunk(candidates, inherited_scopes)
     scored = [
-        _score_candidate(plan, candidate, focus_terms, anchor_groups, preferred_ids)
+        _score_candidate(
+            plan,
+            candidate,
+            focus_terms,
+            anchor_groups,
+            mandatory_groups,
+            preferred_ids,
+            inherited_scopes.get(candidate.chunk.chunk_id, set()),
+            local_anchor_terms.get(candidate.chunk.chunk_id, set()),
+        )
         for candidate in candidates
     ]
     scored.sort(key=_scored_sort_key)
@@ -212,21 +240,27 @@ def select_context_chunks(
         eligible = []
         for item in scored:
             preferred = _is_preferred(item.result.chunk, preferred_ids)
+            grounded_alias = "grounded-line-alias" in item.result.method
             has_focus = (
                 item.coverage >= 0.25
                 or item.section_match >= 0.82
                 or not focus_terms
+                or grounded_alias
                 or (preferred and plan.intent == "procedure" and item.intent_evidence >= 0.05)
             )
-            required_anchor_coverage = (
-                1.0 / len(anchor_groups)
-                if anchor_groups and plan.intent == "comparison"
-                else 1.0
-            )
+            required_anchor_coverage = _required_anchor_coverage(plan, anchor_groups)
             has_anchor = item.anchor_coverage >= required_anchor_coverage or not anchor_groups
+            mandatory_ok = (
+                not mandatory_groups or item.mandatory_anchor_coverage >= 1.0
+            )
             has_intent = item.intent_evidence >= 0.08
-            constraint_ok = preferred or item.section_match >= 0.82 or (
-                has_anchor if anchor_groups else (has_focus or has_intent)
+            constraint_ok = grounded_alias or (
+                mandatory_ok
+                and (
+                    preferred
+                    or item.section_match >= 0.82
+                    or (has_anchor if anchor_groups else (has_focus or has_intent))
+                )
             )
             if item.relevance >= cutoff and has_focus and constraint_ok:
                 eligible.append(item)
@@ -276,16 +310,22 @@ def _score_candidate(
     result: RetrievedChunk,
     focus_terms: set[str],
     anchor_groups: list[set[str]],
+    mandatory_groups: list[set[str]],
     preferred_document_ids: set[str],
+    inherited_scope_terms: set[str],
+    local_context_terms: set[str],
 ) -> _ScoredChunk:
     chunk = result.chunk
     text_terms = _tokens(chunk.text)
     exact_text_terms = _tokens(chunk.text, keep_single=True)
+    contextual_anchor_terms = exact_text_terms | inherited_scope_terms | local_context_terms
     heading_terms = _tokens(_heading_text(chunk))
     section_path = _context_label(chunk)
     coverage = _coverage(focus_terms, text_terms)
     heading_coverage = _coverage(focus_terms, heading_terms)
-    anchor_coverage = _group_coverage(anchor_groups, exact_text_terms)
+    direct_anchor_coverage = _group_coverage(anchor_groups, exact_text_terms)
+    anchor_coverage = _group_coverage(anchor_groups, contextual_anchor_terms)
+    mandatory_anchor_coverage = _group_coverage(mandatory_groups, contextual_anchor_terms)
     question_for_structure = plan.contextual_question or plan.original_question
     structural_match = section_match_score(question_for_structure, section_path)
     major_structural_match = major_section_match_score(
@@ -312,6 +352,8 @@ def _score_candidate(
     )
     if _is_preferred(chunk, preferred_document_ids):
         relevance += 0.16
+    if "grounded-line-alias" in result.method:
+        relevance += 0.24
     if _is_low_information_excerpt(chunk.text):
         relevance *= 0.12
 
@@ -327,11 +369,359 @@ def _score_candidate(
         relevance=max(0.0, min(1.0, relevance)),
         coverage=coverage,
         anchor_coverage=anchor_coverage,
+        direct_anchor_coverage=direct_anchor_coverage,
+        mandatory_anchor_coverage=mandatory_anchor_coverage,
         intent_evidence=intent_evidence,
         section_match=structural_match,
         major_section_match=major_structural_match,
         context_key=(chunk.filename.casefold(), _context_label(chunk).casefold()),
     )
+
+
+def rank_scenario_documents(
+    plan: QueryPlan,
+    candidates: list[RetrievedChunk],
+    *,
+    max_documents: int = 3,
+) -> list[PrimaryDocumentMatch]:
+    """Infer a dedicated procedure document from local body evidence.
+
+    Filename/opening-title routing can miss a document when the exact scenario is
+    stated deep inside the SOP. This second-stage router scores small consecutive
+    windows of already retrieved chunks, so a line/applicability heading may live
+    in one chunk while VCB/NSCZ actions continue in the next chunks.
+    """
+    if max_documents <= 0 or not candidates or plan.search_mode != "answer":
+        return []
+    if plan.intent not in {"procedure", "requirement", "troubleshooting", "summary"}:
+        return []
+
+    settings = get_settings()
+    focus_terms = _focus_terms(plan)
+    anchor_groups = _anchor_groups(plan)
+    inherited_scopes = _inherited_line_scope_terms(candidates)
+    mandatory_groups = _mandatory_anchor_groups(plan)
+    grouped = _group_results_by_document(candidates)
+    matches: list[PrimaryDocumentMatch] = []
+
+    for document_key, rows in grouped.items():
+        if not rows or not rows[0].chunk.document_id:
+            continue
+        best_score = 0.0
+        window_size = max(2, settings.scenario_document_window_chunks)
+        ordered = sorted(rows, key=_chunk_position_key)
+        for start in range(len(ordered)):
+            window = _consecutive_window(ordered, start, window_size)
+            if not window:
+                continue
+            combined_terms: set[str] = set()
+            for item in window:
+                combined_terms |= _tokens(item.chunk.text, keep_single=True)
+                combined_terms |= inherited_scopes.get(item.chunk.chunk_id, set())
+            anchor_coverage = _group_coverage(anchor_groups, combined_terms)
+            mandatory_coverage = _group_coverage(mandatory_groups, combined_terms)
+            focus_coverage = _coverage(focus_terms, combined_terms)
+            if mandatory_groups and mandatory_coverage < 1.0:
+                continue
+            if anchor_groups and anchor_coverage < _required_anchor_coverage(plan, anchor_groups):
+                continue
+            if focus_terms and focus_coverage < 0.28:
+                continue
+            best_retrieval = max(float(item.score) for item in window)
+            procedure_terms = _INTENT_CUES.get(plan.intent, set())
+            procedure_signal = min(1.0, len(procedure_terms & combined_terms) / 3.0) if procedure_terms else 0.0
+            score = (
+                anchor_coverage * 0.44
+                + focus_coverage * 0.28
+                + max(0.0, min(1.0, best_retrieval)) * 0.18
+                + procedure_signal * 0.10
+            )
+            best_score = max(best_score, score)
+        if best_score >= 0.54:
+            first = rows[0].chunk
+            matches.append(
+                PrimaryDocumentMatch(
+                    document_id=str(first.document_id),
+                    filename=first.filename,
+                    score=round(min(0.99, best_score), 6),
+                    reason="scenario-body",
+                )
+            )
+
+    matches.sort(key=lambda item: (-item.score, item.filename.casefold(), item.document_id))
+    return matches[:max_documents]
+
+
+def filter_hard_context_candidates(
+    plan: QueryPlan,
+    candidates: list[RetrievedChunk],
+) -> list[RetrievedChunk]:
+    """Keep fallback synthesis inside explicit scenario/equipment constraints.
+
+    This guard is deliberately document-local. If a user asks about Line 1 + VCB
+    + NSCZ, a BHS/airport undershoot chunk cannot become the "closest supported"
+    answer merely because both mention a stopped train. Documents must satisfy the
+    hard groups within a small consecutive evidence window.
+    """
+    groups = _hard_anchor_groups(plan)
+    if not groups or not candidates:
+        return candidates
+    settings = get_settings()
+    inherited_scopes = _inherited_line_scope_terms(candidates)
+    mandatory_groups = _mandatory_anchor_groups(plan)
+    grouped = _group_results_by_document(candidates)
+    allowed_documents: set[str] = set()
+    required = _required_anchor_coverage(plan, groups)
+
+    for document_key, rows in grouped.items():
+        ordered = sorted(rows, key=_chunk_position_key)
+        for start in range(len(ordered)):
+            window = _consecutive_window(
+                ordered,
+                start,
+                max(2, settings.scenario_document_window_chunks),
+            )
+            combined: set[str] = set()
+            for item in window:
+                combined |= _tokens(item.chunk.text, keep_single=True)
+                combined |= inherited_scopes.get(item.chunk.chunk_id, set())
+            if mandatory_groups and _group_coverage(mandatory_groups, combined) < 1.0:
+                continue
+            if _group_coverage(groups, combined) >= required:
+                allowed_documents.add(document_key)
+                break
+
+    if not allowed_documents:
+        return []
+    return [item for item in candidates if _document_key(item.chunk) in allowed_documents]
+
+
+def _required_anchor_coverage(plan: QueryPlan, anchor_groups: list[set[str]]) -> float:
+    if not anchor_groups:
+        return 0.0
+    if plan.intent == "comparison":
+        return 1.0 / len(anchor_groups)
+    # Operational procedures are commonly split across chunks: a line/applicability
+    # heading is followed by action subparagraphs that do not repeat every acronym
+    # or actor. Allow one anchor group to be supplied by adjacent local context, but
+    # never relax enough for a different scenario/equipment family to qualify.
+    if plan.intent in {"procedure", "requirement", "troubleshooting"} and len(anchor_groups) >= 3:
+        return max(0.67, (len(anchor_groups) - 1) / len(anchor_groups))
+    return 1.0
+
+
+def _hard_anchor_groups(plan: QueryPlan) -> list[set[str]]:
+    question = plan.contextual_question or plan.original_question
+    groups: list[set[str]] = []
+    seen: set[frozenset[str]] = set()
+
+    for value in plan.context_terms:
+        lowered = value.casefold()
+        if any(char.isdigit() for char in value) or lowered.startswith("line ") or _DOCUMENT_CODE_RE.search(value):
+            group = _tokens(value, keep_single=True)
+            key = frozenset(group)
+            if group and key not in seen:
+                groups.append(group)
+                seen.add(key)
+
+    for token in _TOKEN_RE.findall(question):
+        if len(token) >= 2 and token.upper() == token and any(char.isalpha() for char in token):
+            group = _tokens(token, keep_single=True)
+            key = frozenset(group)
+            if group and key not in seen:
+                groups.append(group)
+                seen.add(key)
+
+    for quoted in _QUOTED_RE.findall(question):
+        group = _tokens(quoted, keep_single=True)
+        key = frozenset(group)
+        if group and key not in seen:
+            groups.append(group)
+            seen.add(key)
+    return groups
+
+
+def _mandatory_anchor_groups(plan: QueryPlan) -> list[set[str]]:
+    """Return explicit line/equipment/document constraints that may not be dropped."""
+    question = plan.contextual_question or plan.original_question
+    groups: list[set[str]] = []
+    seen: set[frozenset[str]] = set()
+
+    for value in plan.context_terms:
+        lowered = value.casefold().strip()
+        is_line = lowered.startswith("line ") or lowered == "ael"
+        is_document = bool(_DOCUMENT_CODE_RE.search(value))
+        is_numeric_context = any(char.isdigit() for char in value)
+        is_non_role_acronym = (
+            len(value) >= 2
+            and value.upper() == value
+            and any(char.isalpha() for char in value)
+            and lowered not in _ROLE_ACRONYMS
+        )
+        if not (is_line or is_document or is_numeric_context or is_non_role_acronym):
+            continue
+        group = _tokens(value, keep_single=True)
+        key = frozenset(group)
+        if group and key not in seen:
+            groups.append(group)
+            seen.add(key)
+
+    for token in _TOKEN_RE.findall(question):
+        lowered = token.casefold()
+        if (
+            len(token) >= 2
+            and token.upper() == token
+            and any(char.isalpha() for char in token)
+            and lowered not in _ROLE_ACRONYMS
+        ):
+            group = _tokens(token, keep_single=True)
+            key = frozenset(group)
+            if group and key not in seen:
+                groups.append(group)
+                seen.add(key)
+    return groups
+
+
+def _inherited_line_scope_terms(candidates: list[RetrievedChunk]) -> dict[str, set[str]]:
+    settings = get_settings()
+    max_gap = max(1, settings.applicability_inherit_chunk_window)
+    inherited: dict[str, set[str]] = {}
+    for _document_key_value, rows in _group_results_by_document(candidates).items():
+        ordered = sorted(rows, key=_chunk_position_key)
+        active_scope: set[str] = set()
+        active_index: int | None = None
+        active_major = ""
+        for item in ordered:
+            chunk = item.chunk
+            current_index = chunk.chunk_index if chunk.chunk_index is not None else chunk.page_number
+            major = _major_context_label(chunk)
+            explicit_scopes = _extract_line_scope_sets(chunk.text)
+            if explicit_scopes:
+                # Multiple different line groups in one chunk are an index/table or
+                # mixed context; do not propagate an ambiguous scope forward.
+                unique = {frozenset(scope) for scope in explicit_scopes if scope}
+                if len(unique) == 1:
+                    active_scope = set(next(iter(unique)))
+                    active_index = current_index
+                    active_major = major
+                else:
+                    active_scope = set()
+                    active_index = None
+                    active_major = major
+            elif active_scope and active_index is not None:
+                if current_index - active_index > max_gap:
+                    active_scope = set()
+                    active_index = None
+                elif active_major and major and active_major != major:
+                    active_scope = set()
+                    active_index = None
+            if active_scope:
+                inherited[chunk.chunk_id] = set(active_scope)
+    return inherited
+
+
+def _local_anchor_terms_by_chunk(
+    candidates: list[RetrievedChunk],
+    inherited_scopes: dict[str, set[str]],
+) -> dict[str, set[str]]:
+    settings = get_settings()
+    radius = max(0, settings.local_anchor_context_window)
+    if radius <= 0:
+        return {}
+    result: dict[str, set[str]] = {}
+    for _document_key_value, rows in _group_results_by_document(candidates).items():
+        ordered = sorted(rows, key=_chunk_position_key)
+        for index, item in enumerate(ordered):
+            current_scope = inherited_scopes.get(item.chunk.chunk_id, set())
+            terms: set[str] = set(current_scope)
+            for offset in range(max(0, index - radius), min(len(ordered), index + radius + 1)):
+                neighbor = ordered[offset]
+                if not _locally_compatible(item.chunk, neighbor.chunk, current_scope, inherited_scopes):
+                    continue
+                terms |= _tokens(neighbor.chunk.text, keep_single=True)
+                terms |= inherited_scopes.get(neighbor.chunk.chunk_id, set())
+            result[item.chunk.chunk_id] = terms
+    return result
+
+
+def _locally_compatible(
+    center: TextChunk,
+    neighbor: TextChunk,
+    center_scope: set[str],
+    scopes: dict[str, set[str]],
+) -> bool:
+    if _document_key(center) != _document_key(neighbor):
+        return False
+    center_index = center.chunk_index if center.chunk_index is not None else center.page_number
+    neighbor_index = neighbor.chunk_index if neighbor.chunk_index is not None else neighbor.page_number
+    if abs(center_index - neighbor_index) > max(2, get_settings().local_anchor_context_window + 1):
+        return False
+    if _major_context_label(center) and _major_context_label(neighbor):
+        if _major_context_label(center) != _major_context_label(neighbor):
+            return False
+    neighbor_scope = scopes.get(neighbor.chunk_id, set())
+    if center_scope and neighbor_scope and center_scope != neighbor_scope:
+        return False
+    return True
+
+
+def _extract_line_scope_sets(value: str) -> list[set[str]]:
+    scopes: list[set[str]] = []
+    for match in _LINE_SCOPE_RE.finditer(value):
+        raw = match.group("values")
+        values = re.findall(r"AEL|\d{1,2}", raw, flags=re.IGNORECASE)
+        if not values:
+            continue
+        scope: set[str] = {"line"}
+        for item in values:
+            normalized = item.upper() if item.casefold() == "ael" else str(int(item))
+            scope |= _tokens(normalized, keep_single=True)
+        scopes.append(scope)
+    return scopes
+
+
+def _group_results_by_document(candidates: list[RetrievedChunk]) -> dict[str, list[RetrievedChunk]]:
+    grouped: dict[str, list[RetrievedChunk]] = {}
+    for item in candidates:
+        grouped.setdefault(_document_key(item.chunk), []).append(item)
+    return grouped
+
+
+def _chunk_position_key(item: RetrievedChunk) -> tuple[int, int, str]:
+    chunk = item.chunk
+    return (
+        chunk.chunk_index if chunk.chunk_index is not None else chunk.page_number * 1000,
+        chunk.page_number,
+        chunk.chunk_id,
+    )
+
+
+def _consecutive_window(
+    ordered: list[RetrievedChunk],
+    start: int,
+    max_items: int,
+) -> list[RetrievedChunk]:
+    if start >= len(ordered):
+        return []
+    first = ordered[start]
+    first_index = first.chunk.chunk_index
+    window: list[RetrievedChunk] = []
+    for item in ordered[start : start + max_items]:
+        if first.chunk.document_id != item.chunk.document_id:
+            break
+        if first_index is not None and item.chunk.chunk_index is not None:
+            if item.chunk.chunk_index - first_index > max_items + 2:
+                break
+        window.append(item)
+    return window
+
+
+def _major_context_label(chunk: TextChunk) -> str:
+    label = _context_label(chunk)
+    if not label:
+        return ""
+    parts = [part.strip() for part in label.split(">") if part.strip()]
+    return " > ".join(parts[:2]).casefold()
 
 
 def _enumeration_evidence_bonus(plan: QueryPlan, text: str) -> float:

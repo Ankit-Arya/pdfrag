@@ -13,7 +13,7 @@ from app.rag.types import QueryPlan
 
 logger = logging.getLogger(__name__)
 
-ANSWER_POLICY_VERSION = "answer-first-v3-2026-08-13"
+ANSWER_POLICY_VERSION = "answer-first-v4-scenario-scope-2026-08-13"
 
 _TERM_PATTERN = re.compile(r"[A-Za-z0-9]+(?:[._/:#-][A-Za-z0-9]+)*")
 _UPPER_ACRONYM_PATTERN = re.compile(r"(?<![A-Za-z0-9])[A-Z][A-Z0-9]{1,9}(?![A-Za-z0-9])")
@@ -213,6 +213,21 @@ _PROCEDURE_PHRASE_STARTS = (
     "how do ",
     "how should ",
     "how can ",
+)
+
+# Operators often describe the abnormal condition first and ask for the action at
+# the end: "if train stops ... what should TO do". Treat this deterministically
+# as a procedure so tiny wording changes cannot switch retrieval strategy.
+_CONDITIONAL_PROCEDURE_RE = re.compile(
+    r"\b(?:if|when|whenever)\b.{0,1600}\b(?:"
+    r"what\s+(?:should|shall|can|must|does)\b.{0,120}\bdo\b|"
+    r"how\s+(?:should|shall|can|must)\b"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
+_ACTION_QUESTION_RE = re.compile(
+    r"\bwhat\s+(?:should|shall|can|must)\s+(?:[A-Za-z0-9_./:#-]+\s+){0,5}do\b",
+    re.IGNORECASE,
 )
 
 _FOLLOWUP_STARTS = (
@@ -813,6 +828,8 @@ def _infer_intent(value: str) -> str:
     terms = {token.casefold() for token in _TERM_PATTERN.findall(value)}
     if lowered.startswith(_PROCEDURE_PHRASE_STARTS):
         return "procedure"
+    if _CONDITIONAL_PROCEDURE_RE.search(value) or _ACTION_QUESTION_RE.search(value):
+        return "procedure"
     if (
         lowered.startswith("what ")
         and {"do", "action", "actions", "steps"} & terms
@@ -1061,16 +1078,26 @@ def _extract_context_terms(value: str, hints: list[str]) -> list[str]:
         for hint in hints
         if (match := _HINT_TOKEN_PATTERN.match(hint))
     }
+    context_phrases = list(_CONTEXT_PATTERN.findall(value))
+    # Do not create duplicate hard constraints such as both "Line 1" and the
+    # standalone token "1". The phrase is the real applicability constraint;
+    # duplicating its number previously made correct continuation chunks fail
+    # anchor coverage merely because they did not repeat the line heading.
+    phrase_tokens = {
+        token.casefold()
+        for phrase in context_phrases
+        for token in _TERM_PATTERN.findall(phrase)
+    }
     codes: list[str] = []
     for token in _TERM_PATTERN.findall(value):
         lowered = token.casefold()
-        if (
-            any(char.isdigit() for char in token)
-            or (len(token) >= 2 and token.upper() == token and any(char.isalpha() for char in token))
-            or lowered in hint_tokens
-        ):
+        is_number = any(char.isdigit() for char in token)
+        is_acronym = len(token) >= 2 and token.upper() == token and any(char.isalpha() for char in token)
+        if is_number and lowered in phrase_tokens:
+            continue
+        if is_number or is_acronym or lowered in hint_tokens:
             codes.append(hint_tokens.get(lowered, token))
-    return _unique([*_CONTEXT_PATTERN.findall(value), *codes])
+    return _unique([*context_phrases, *codes])
 
 
 def _context_is_safe(

@@ -103,3 +103,22 @@ def test_procedure_and_explicit_document_code_allow_primary_backbone() -> None:
     explicit_doc_plan = _plan("SC-06 high wind speed")
     assert _use_primary_document_backbone(explicit_doc_plan)
 
+
+
+def test_conditional_operator_action_is_procedure() -> None:
+    plan = _plan(
+        "In line 1 if train stops after passing VCB open board but before NSCZ board "
+        "and both VCBs are open, what should TO do to bring the train to next station"
+    )
+    assert plan.intent == "procedure"
+    assert plan.search_mode == "answer"
+
+
+def test_line_number_is_not_duplicated_as_separate_context_anchor() -> None:
+    plan = _plan(
+        "In Line 1 if train stops after VCB open board but before NSCZ, what should TO do"
+    )
+    assert "Line 1" in plan.context_terms
+    assert "1" not in plan.context_terms
+    assert "VCB" in plan.context_terms
+    assert "NSCZ" in plan.context_terms
