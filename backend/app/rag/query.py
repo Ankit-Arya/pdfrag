@@ -13,6 +13,8 @@ from app.rag.types import QueryPlan
 
 logger = logging.getLogger(__name__)
 
+ANSWER_POLICY_VERSION = "answer-first-v3-2026-08-13"
+
 _TERM_PATTERN = re.compile(r"[A-Za-z0-9]+(?:[._/:#-][A-Za-z0-9]+)*")
 _UPPER_ACRONYM_PATTERN = re.compile(r"(?<![A-Za-z0-9])[A-Z][A-Z0-9]{1,9}(?![A-Za-z0-9])")
 _CONTEXT_PATTERN = re.compile(
@@ -149,6 +151,16 @@ _FACT_DIMENSION_CUES = {
     "weight",
 }
 
+_ENUMERATION_CUES = {
+    "categories",
+    "classes",
+    "forms",
+    "kinds",
+    "methods",
+    "modes",
+    "types",
+    "ways",
+}
 _LIST_DIMENSION_CUES = {
     "content",
     "contents",
@@ -161,6 +173,15 @@ _LIST_DIMENSION_CUES = {
     "inventory",
     "inventories",
     "things",
+    *_ENUMERATION_CUES,
+}
+_SYNTHESIS_INTENTS = {
+    "comparison",
+    "list",
+    "procedure",
+    "requirement",
+    "summary",
+    "troubleshooting",
 }
 _LIST_RELATION_CUES = {
     "carry",
@@ -341,7 +362,9 @@ class QueryPlanner:
             ]
         fallback_context = _fallback_contextual_question(normalized, history)
         fallback_intent = _infer_intent(fallback_context)
-        fallback_mode = _infer_search_mode(normalized, fallback_context)
+        fallback_mode = deterministic_search_mode(
+            normalized, fallback_context, fallback_intent
+        )
         fallback_queries = _deterministic_queries(
             normalized,
             fallback_context,
@@ -530,15 +553,21 @@ def _validate_plan(
         else fallback.contextual_question
     )
 
-    heuristic_intent = _infer_intent(contextual)
+    original_intent = _infer_intent(original)
+    contextual_intent = _infer_intent(contextual)
     raw_intent = _clean_string(payload.get("intent")).casefold()
-    intent = raw_intent if raw_intent in _VALID_INTENTS else heuristic_intent
-    # Explicit procedure/question cues in the current text are more reliable than
-    # model classification and should not vary between otherwise identical calls.
-    if heuristic_intent != "fact_lookup":
-        intent = heuristic_intent
+    intent = raw_intent if raw_intent in _VALID_INTENTS else contextual_intent
+    # Explicit intent cues in the CURRENT user wording are the most stable source
+    # of truth. A planner rewrite must not turn "types of signals" from a list
+    # into a fact lookup, or vice versa, merely by rephrasing it. For genuinely
+    # underspecified follow-ups, the contextual interpretation can still supply
+    # the non-fact intent.
+    if original_intent != "fact_lookup":
+        intent = original_intent
+    elif contextual_intent != "fact_lookup":
+        intent = contextual_intent
 
-    search_mode = _infer_search_mode(original, contextual)
+    search_mode = deterministic_search_mode(original, contextual, intent)
     protected = _protected_tokens(original, hints)
 
     raw_queries = payload.get("search_queries")
@@ -670,41 +699,113 @@ def needs_conversation_context(question: str) -> bool:
     return False
 
 
-def _infer_search_mode(original: str, contextual: str) -> str:
+def deterministic_search_mode(
+    original: str,
+    contextual: str | None = None,
+    intent: str | None = None,
+) -> str:
+    """Return the deterministic UI/answer contract for a user turn.
+
+    Reference mode is intentionally narrow. It is for explicit corpus navigation
+    (find/search/mentions/references) or genuinely bare one/two-term lookups such
+    as ``AEL`` or ``kit bag``. Multi-word informational fragments and all clear
+    synthesis intents are answer mode even when the user omits a question mark.
+
+    Keeping this decision deterministic prevents punctuation, model variability,
+    browser transport, or conversation history from flipping the same request
+    between a synthesized answer and a raw evidence dump.
+    """
+    contextual = contextual or original
     lowered = original.casefold().strip()
     terms = {token.casefold() for token in _TERM_PATTERN.findall(original)}
-    if original.rstrip().endswith("?") or lowered.startswith(_QUESTION_STARTS):
-        return "answer"
+    resolved_intent = intent or _infer_intent(contextual)
 
-    # Explicit corpus-navigation wording wins over answer heuristics. This keeps
-    # "find mentions of kit bag" as a reference search while allowing shorthand
-    # answer requests such as "items to be kept in kit bag".
+    # Explicit corpus-navigation wording is the only strong reason to prefer the
+    # broad evidence view over a synthesized answer.
     if terms & _EXPLICIT_REFERENCE_ACTION_CUES:
         return "references"
+
+    if original.rstrip().endswith("?") or lowered.startswith(_QUESTION_STARTS):
+        return "answer"
 
     if _looks_like_list_request(lowered, terms):
         return "answer"
 
+    # Procedures, lists, summaries, comparisons and requirements are inherently
+    # synthesis requests when a concrete subject is present, even when phrased as
+    # shorthand (for example "types of signals for train operation").
+    if resolved_intent in _SYNTHESIS_INTENTS and _has_concrete_subject(
+        terms, resolved_intent
+    ):
+        return "answer"
+    if resolved_intent == "definition" and ({"define", "definition"} & terms):
+        return "answer"
+
     if terms & _ANSWER_CUES:
-        # A dimension needs a real subject to become a synthesized answer. A lone
-        # keyword such as "speed", "date", or "items" is still reference mode.
         subject_terms = {
             term
             for term in terms
-            if term not in _ANSWER_CUES and term not in _FOCUS_STOPWORDS
+            if term not in _ANSWER_CUES
+            and term not in _FOCUS_STOPWORDS
+            and term not in _REQUEST_VERBS
         }
         if subject_terms:
             return "answer"
-    if terms & _REFERENCE_CUES:
+
+    if _is_bare_reference_lookup(lowered, terms):
         return "references"
-    # A bare concept or short noun phrase with no answer dimension is treated as
-    # corpus/reference discovery.
-    contextual_terms = [
-        token
-        for token in _TERM_PATTERN.findall(contextual)
-        if token.casefold() not in _FOCUS_STOPWORDS
+
+    # Answer-first fallback: a multi-word request that is not explicit corpus
+    # navigation should receive the best supported synthesis, not raw chunks.
+    return "answer"
+
+
+def _infer_search_mode(original: str, contextual: str) -> str:
+    """Backward-compatible wrapper for older imports/tests."""
+    return deterministic_search_mode(original, contextual)
+
+
+def _has_concrete_subject(terms: set[str], intent: str) -> bool:
+    generic = set(_FOCUS_STOPWORDS) | set(_REQUEST_VERBS)
+    generic |= _CONTEXT_DEPENDENT_WORDS
+    if intent == "list":
+        generic |= _LIST_DIMENSION_CUES | _LIST_RELATION_CUES | {"list"}
+    elif intent in {"procedure", "requirement", "summary"}:
+        generic |= _ANSWER_CUES
+    subject_terms = {term for term in terms if term not in generic}
+    return bool(subject_terms)
+
+
+def _is_bare_reference_lookup(lowered: str, terms: set[str]) -> bool:
+    if not terms:
+        return True
+    if lowered.startswith(_QUESTION_STARTS) or lowered.startswith(_FOLLOWUP_STARTS):
+        return False
+    ordered_terms = [token.casefold() for token in _TERM_PATTERN.findall(lowered)]
+    if ordered_terms and ordered_terms[0] in _REQUEST_VERBS:
+        return False
+    if _looks_like_list_request(lowered, terms):
+        return False
+    if terms & _ANSWER_CUES:
+        return False
+
+    # "document SC-06" and similar short navigation phrases remain references.
+    if terms & _REFERENCE_CUES:
+        non_reference = {
+            term
+            for term in terms
+            if term not in _REFERENCE_CUES and term not in _FOCUS_STOPWORDS
+        }
+        return len(non_reference) <= 2
+
+    substantive = [
+        term
+        for term in terms
+        if term not in _FOCUS_STOPWORDS
+        and term not in _REQUEST_VERBS
+        and term not in _CONTEXT_DEPENDENT_WORDS
     ]
-    return "references" if len(contextual_terms) <= 5 else "answer"
+    return len(substantive) <= 2
 
 
 def _infer_intent(value: str) -> str:
@@ -748,11 +849,11 @@ def _infer_intent(value: str) -> str:
 
 
 def _looks_like_list_request(lowered: str, terms: set[str]) -> bool:
-    """Recognize natural shorthand that asks for the contents/composition of X.
+    """Recognize natural shorthand that asks for an enumeration/composition.
 
-    Operators often type fragments rather than grammatical questions, for example
-    "items to be kept in kit bag". Treat these as synthesized list requests while
-    leaving a lone keyword such as "kit bag" or "items" in reference mode.
+    This includes both composition questions (``kit bag contents``) and taxonomy
+    questions (``types of signals for train operation``). A lone word such as
+    ``types`` or a bare concept such as ``kit bag`` remains reference mode.
     """
     if lowered.startswith("what is in ") or lowered.startswith("what are in "):
         return any(term not in _FOCUS_STOPWORDS for term in terms)
@@ -760,8 +861,33 @@ def _looks_like_list_request(lowered: str, terms: set[str]) -> bool:
     dimensions = terms & _LIST_DIMENSION_CUES
     if not dimensions:
         return False
+
+    subject_terms = {
+        term
+        for term in terms
+        if term not in _LIST_DIMENSION_CUES
+        and term not in _LIST_RELATION_CUES
+        and term not in _ANSWER_CUES
+        and term not in _FOCUS_STOPWORDS
+        and term not in _REQUEST_VERBS
+    }
+
+    # Taxonomy/enumeration phrasing: "types of signals", "operating modes",
+    # "kinds of train signals", etc. Require a real subject so "types" alone
+    # remains a bare lookup.
+    if dimensions & _ENUMERATION_CUES:
+        if subject_terms:
+            return True
+        if re.search(
+            r"\b(?:types?|kinds?|categories?|classes?|forms?|modes?|methods?|ways?)\s+of\s+\w+",
+            lowered,
+        ):
+            return True
+        return False
+
     if terms & _LIST_RELATION_CUES and len(terms) >= 2:
-        return True
+        return bool(subject_terms)
+
     if dimensions & {
         "content",
         "contents",
@@ -773,15 +899,8 @@ def _looks_like_list_request(lowered: str, terms: set[str]) -> bool:
         "inventories",
         "things",
     } and len(terms) >= 2:
-        return True
-    subject_terms = {
-        term
-        for term in terms
-        if term not in _LIST_DIMENSION_CUES
-        and term not in _LIST_RELATION_CUES
-        and term not in _ANSWER_CUES
-        and term not in _FOCUS_STOPWORDS
-    }
+        return bool(subject_terms)
+
     if not subject_terms:
         return False
     if re.search(
@@ -794,19 +913,20 @@ def _looks_like_list_request(lowered: str, terms: set[str]) -> bool:
         lowered,
     ):
         return True
-    if dimensions & {
-        "content",
-        "contents",
-        "equipment",
-        "equipments",
-        "item",
-        "items",
-        "inventory",
-        "inventories",
-        "things",
-    }:
-        return True
-    return False
+    return bool(
+        dimensions
+        & {
+            "content",
+            "contents",
+            "equipment",
+            "equipments",
+            "item",
+            "items",
+            "inventory",
+            "inventories",
+            "things",
+        }
+    )
 
 
 def _deterministic_queries(
@@ -860,9 +980,23 @@ def _structural_queries(value: str, intent: str) -> list[str]:
     elif intent == "troubleshooting":
         variants.append(f"{normalized} fault cause check remedy action")
     elif intent == "list":
-        variants.append(
-            f"{normalized} list items contents equipment documents carried kept possession required"
-        )
+        list_terms = {token.casefold() for token in _TERM_PATTERN.findall(normalized)}
+        if list_terms & _ENUMERATION_CUES:
+            subject = re.sub(
+                r"\b(?:types?|kinds?|categories?|classes?|forms?|modes?|methods?|ways?)\s+of\s+",
+                "",
+                normalized,
+                flags=re.IGNORECASE,
+            ).strip()
+            if subject and subject.casefold() != normalized.casefold():
+                variants.append(subject)
+            variants.append(
+                f"{normalized} types kinds categories classification list"
+            )
+        else:
+            variants.append(
+                f"{normalized} list items contents equipment documents carried kept possession required"
+            )
     return _unique(variants)
 
 

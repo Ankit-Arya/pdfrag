@@ -142,6 +142,10 @@ function messageResponse(
     search_queries: Array.isArray(metadata.search_queries)
       ? (metadata.search_queries as string[])
       : [],
+    answer_policy_version:
+      typeof metadata.answer_policy_version === 'string'
+        ? metadata.answer_policy_version
+        : undefined,
     request_id:
       typeof metadata.request_id === 'string' ? metadata.request_id : null,
     chat_session_id: activeChatId.value,

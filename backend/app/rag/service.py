@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+import re
 import threading
+from dataclasses import replace
 from datetime import UTC, datetime
 
 from sqlalchemy import delete
@@ -29,7 +31,12 @@ from app.rag.postgres_store import (
 )
 from app.rag.prompts import NO_ANSWER
 from app.rag.progress import ProgressCallback, emit_progress, progress_context
-from app.rag.query import needs_conversation_context, query_planner
+from app.rag.query import (
+    ANSWER_POLICY_VERSION,
+    deterministic_search_mode,
+    needs_conversation_context,
+    query_planner,
+)
 from app.rag.relevance import select_context_chunks
 from app.rag.synthesis import (
     list_answer_needs_repair,
@@ -192,6 +199,37 @@ class RagService:
             abbreviation_hints=abbreviation_hints,
             routing_hints=routing_hints,
         )
+
+        # Defense in depth: the user-facing contract is answer-first for any
+        # informational request that is not explicit corpus navigation or a bare
+        # lookup. Recompute the mode from the final validated plan so a future
+        # query-planner regression cannot bypass synthesis and dump raw evidence.
+        expected_mode = deterministic_search_mode(
+            plan.original_question,
+            plan.contextual_question or plan.rewritten_question,
+            plan.intent,
+        )
+        if plan.search_mode != expected_mode:
+            logger.warning(
+                "Correcting inconsistent search mode from %s to %s for intent=%s question=%r",
+                plan.search_mode,
+                expected_mode,
+                plan.intent,
+                plan.original_question,
+            )
+            plan = replace(
+                plan,
+                search_mode=expected_mode,
+                response_mode="evidence" if expected_mode == "references" else "concise",
+            )
+
+        logger.info(
+            "RAG policy=%s mode=%s intent=%s question=%r",
+            ANSWER_POLICY_VERSION,
+            plan.search_mode,
+            plan.intent,
+            plan.original_question,
+        )
         emit_progress(
             "interpret",
             "Question interpreted",
@@ -203,10 +241,19 @@ class RagService:
             "Routing to likely documents",
             "Checking document titles, subjects and dedicated procedures",
         )
-        primary_routes = find_primary_documents(
+        routed_documents = find_primary_documents(
             db,
             plan.contextual_question or plan.original_question,
             max_documents=settings.primary_document_max_documents,
+        )
+        # A fuzzy title/subject match is valuable routing evidence, but it should
+        # not become a dominant answer backbone for ordinary fact/list/taxonomy
+        # questions. For those questions, the cleanest authoritative rule may live
+        # in another document (for example MRGR Rule 16 for signal categories).
+        # Reserve primary-document dominance for procedure/requirement-style work
+        # or when the user explicitly names a document code.
+        primary_routes = (
+            routed_documents if _use_primary_document_backbone(plan) else []
         )
         primary_document_ids = {route.document_id for route in primary_routes}
         primary_document_names = [route.filename for route in primary_routes]
@@ -215,6 +262,12 @@ class RagService:
                 "route",
                 "Primary document identified",
                 "; ".join(primary_document_names[:3]),
+            )
+        elif routed_documents:
+            emit_progress(
+                "route",
+                "Relevant document titles found",
+                "Keeping broad rule-level search active for this question type",
             )
         else:
             emit_progress(
@@ -387,7 +440,7 @@ class RagService:
                         if repaired_answer != NO_ANSWER:
                             best_answer = repaired_answer
                             best_grounded = repaired_grounded
-                    if plan.intent == "list" and list_answer_needs_repair(best_answer):
+                    if plan.intent == "list" and list_answer_needs_repair(plan, best_answer):
                         emit_progress(
                             "list_format",
                             "Formatting the supported list",
@@ -592,7 +645,7 @@ class RagService:
         if (
             plan.intent == "list"
             and answer != NO_ANSWER
-            and list_answer_needs_repair(answer)
+            and list_answer_needs_repair(plan, answer)
         ):
             emit_progress(
                 "list_format",
@@ -779,6 +832,38 @@ class RagService:
             max_chunks=max_chunks,
             preferred_document_ids=preferred_document_ids,
         )
+
+
+_DOCUMENT_CODE_RE = re.compile(
+    r"\b(?:SC|SM|SOP|JPO|INST(?:RUCTION)?|MRGR)\s*[-_/]?\s*\d+[A-Z]?\b",
+    re.IGNORECASE,
+)
+_PRIMARY_BACKBONE_INTENTS = {
+    "procedure",
+    "requirement",
+    "summary",
+    "troubleshooting",
+}
+
+
+def _use_primary_document_backbone(plan: QueryPlan) -> bool:
+    """Return True when fuzzy title routing should dominate evidence selection.
+
+    Dedicated procedure/requirement documents benefit from backbone treatment.
+    General fact/list/taxonomy questions do not: a title match is only a routing
+    hint because an authoritative rule in another document can be more direct.
+    An explicitly named document code is always allowed to become the backbone.
+    """
+    if plan.intent in _PRIMARY_BACKBONE_INTENTS:
+        return True
+    text = " ".join(
+        [
+            plan.original_question,
+            plan.contextual_question or "",
+            *plan.routing_hints,
+        ]
+    )
+    return bool(_DOCUMENT_CODE_RE.search(text))
 
 
 def _focused_conversation_context(history: list[dict[str, str]]) -> list[dict[str, str]]:

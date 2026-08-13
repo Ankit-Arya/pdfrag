@@ -179,10 +179,32 @@ If no supported answer exists, reply exactly:
 
 
 
-def list_answer_needs_repair(answer: str) -> bool:
+_EXHAUSTIVE_REQUEST_RE = re.compile(
+    r"\b(?:all|complete|comprehensive|every|exhaustive|full|entire)\b",
+    re.IGNORECASE,
+)
+_EVIDENCE_DUMP_RE = re.compile(
+    r"(?:^|\n)#{1,6}\s+Information found in the documents|(?:^|\n)#{1,6}\s+.*?\.pdf\s+[—-]\s+pages?",
+    re.IGNORECASE,
+)
+
+
+def list_answer_needs_repair(plan: QueryPlan, answer: str) -> bool:
+    """Detect list answers that are missing structure or are clearly over-expanded."""
     if not answer or answer == NO_ANSWER:
         return False
-    return re.search(r"(?m)^\s*(?:[-*]|\d+[.)])\s+", answer) is None
+    bullets = re.findall(r"(?m)^\s*(?:[-*]|\d+[.)])\s+", answer)
+    if not bullets:
+        return True
+    if _EVIDENCE_DUMP_RE.search(answer):
+        return True
+
+    # Straightforward enumeration questions should be summarized. Only preserve
+    # very long lists when the user explicitly asks for exhaustive coverage.
+    exhaustive = bool(_EXHAUSTIVE_REQUEST_RE.search(plan.original_question))
+    if not exhaustive and (len(bullets) > 20 or len(answer) > 5000):
+        return True
+    return False
 
 
 def repair_list_answer(
@@ -208,11 +230,15 @@ def repair_list_answer(
         for index, source in ranked[:max_sources]
     ]
     prompt = f"""Rewrite the previous answer as the concise list/composition requested by the user.
-Use ONLY the evidence below. Preserve any truthful limitation that the reviewed PDFs do not present
-one single definitive/complete list. Then give compact bullets for the explicitly supported items.
-Group role-specific or context-specific additions under short bold labels only when the evidence
-distinguishes them. Do not add or infer missing items. Cite every factual bullet with existing [S#]
-labels and do not renumber citations.
+Use ONLY the evidence below. Prefer the most direct authoritative enumeration that answers the
+question (for example a rule saying the following types/items shall be used) and use supplementary
+sources only when they add a directly applicable missing category or qualification. Preserve any
+truthful limitation that the reviewed PDFs do not present one single definitive/complete list.
+Then give the SMALLEST COMPLETE set of compact bullets supported by the evidence. Do not repeat
+background material, operating details, degraded-mode precautions, or document references unless
+they are needed to answer the requested list. Group role-specific or context-specific additions
+under short bold labels only when the evidence distinguishes them. Do not add or infer missing
+items. Cite every factual bullet with existing [S#] labels and do not renumber citations.
 
 ORIGINAL QUESTION:
 {plan.original_question}

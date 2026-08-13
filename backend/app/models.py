@@ -55,6 +55,7 @@ class AnswerResponse(BaseModel):
     candidate_chunks: int = 0
     evidence_chunks: int = 0
     search_queries: list[str] = Field(default_factory=list)
+    answer_policy_version: str = ""
     request_id: str | None = None
     chat_session_id: uuid.UUID | None = None
     question_created_at: datetime | None = None
@@ -71,6 +72,7 @@ class HealthResponse(BaseModel):
     llm_model: str
     query_model: str = ""
     summary_model: str = ""
+    answer_policy_version: str = ""
     ocr_mode: str
     ocr_available: bool
     table_extraction: bool

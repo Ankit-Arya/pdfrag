@@ -128,19 +128,30 @@ _INTENT_CUES = {
     "definition": {"definition", "means", "refers", "term"},
     "summary": {"conclusion", "overview", "scope", "summary"},
     "list": {
+        "categories",
+        "category",
+        "class",
+        "classes",
         "carry",
         "carried",
         "contain",
         "contents",
         "equipment",
+        "following",
         "include",
         "item",
         "items",
         "keep",
         "kept",
+        "kind",
+        "kinds",
         "list",
+        "mode",
+        "modes",
+        "namely",
         "possession",
         "required",
+        "type",
         "types",
     },
     "fact_lookup": set(),
@@ -289,6 +300,7 @@ def _score_candidate(
         intent_evidence = min(1.0, coverage)
 
     retrieval = max(0.0, min(1.0, float(result.score)))
+    enumeration_bonus = _enumeration_evidence_bonus(plan, chunk.text)
     relevance = (
         retrieval * 0.36
         + coverage * 0.34
@@ -296,6 +308,7 @@ def _score_candidate(
         + intent_evidence * 0.08
         + anchor_coverage * 0.10
         + structural_match * 0.24
+        + enumeration_bonus
     )
     if _is_preferred(chunk, preferred_document_ids):
         relevance += 0.16
@@ -319,6 +332,26 @@ def _score_candidate(
         major_section_match=major_structural_match,
         context_key=(chunk.filename.casefold(), _context_label(chunk).casefold()),
     )
+
+
+def _enumeration_evidence_bonus(plan: QueryPlan, text: str) -> float:
+    """Boost canonical enumerations for list/taxonomy questions.
+
+    A rule that says "the following ... namely" is stronger list evidence than a
+    nearby document that merely contains words such as "types" or "signals".
+    The normal focus/constraint gates still apply, so this cannot make an
+    unrelated list outrank evidence about the requested subject.
+    """
+    if plan.intent != "list":
+        return 0.0
+    lowered = text.casefold()
+    if "namely" in lowered and "following" in lowered:
+        return 0.16
+    if "namely" in lowered:
+        return 0.10
+    if re.search(r"\bfollowing\b.{0,160}\b(?:are|include|includes|comprise|consist)", lowered, re.DOTALL):
+        return 0.08
+    return 0.0
 
 
 def _supports_anchor(candidate: _ScoredChunk, anchor: _ScoredChunk) -> bool:

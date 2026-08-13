@@ -55,6 +55,7 @@ from app.models import (
 from app.rag.embeddings import EmbeddingUnavailableError, embedding_service
 from app.rag.llm import LlmConfigurationError, LlmRateLimitError
 from app.rag.pdf import ocr_available, safe_filename, table_extraction_available
+from app.rag.query import ANSWER_POLICY_VERSION
 from app.rag.service import rag_service
 
 logger = logging.getLogger(__name__)
@@ -253,6 +254,7 @@ def health() -> HealthResponse:
         llm_model=settings.llm_model,
         query_model=settings.query_model,
         summary_model=settings.summary_model,
+        answer_policy_version=ANSWER_POLICY_VERSION,
         ocr_mode=settings.ocr_mode,
         ocr_available=ocr_available(),
         table_extraction=settings.extract_tables,
@@ -568,6 +570,7 @@ def _finalize_chat_exchange(
 ) -> AnswerResponse:
     response.chat_session_id = chat_session.id
     response.request_id = getattr(request.state, "request_id", None)
+    response.answer_policy_version = ANSWER_POLICY_VERSION
     response.question_created_at = user_message.created_at
     source_details = [source.model_dump() for source in response.sources]
     evidence_details = [source.model_dump() for source in response.evidence]
@@ -591,6 +594,7 @@ def _finalize_chat_exchange(
             "candidate_chunks": response.candidate_chunks,
             "evidence_chunks": response.evidence_chunks,
             "search_queries": response.search_queries,
+            "answer_policy_version": response.answer_policy_version,
             "request_id": response.request_id,
         },
     )
@@ -616,6 +620,7 @@ def _finalize_chat_exchange(
             "candidate_chunks": response.candidate_chunks,
             "evidence_chunks": response.evidence_chunks,
             "search_queries": response.search_queries,
+            "answer_policy_version": response.answer_policy_version,
             "sources": source_details,
         },
     )

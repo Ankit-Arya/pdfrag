@@ -88,6 +88,8 @@ export interface AnswerResponse {
   candidate_chunks?: number
   evidence_chunks?: number
   search_queries: string[]
+  /** Backend answer-routing policy fingerprint for deployment diagnostics. */
+  answer_policy_version?: string
   request_id?: string | null
   chat_session_id?: string | null
   question_created_at?: string | null
