@@ -35,8 +35,12 @@ const question = defineModel<string>('question', { required: true })
 const messages = defineModel<Message[]>('messages', { required: true })
 const scrollArea = ref<HTMLElement | null>(null)
 const documents = ref<DocumentRecord[]>([])
+const libraryOpen = ref(false)
 const libraryBusy = ref(false)
 const libraryError = ref('')
+const librarySearch = ref('')
+const libraryStatus = ref('all')
+const downloadingDocumentId = ref<string | null>(null)
 const copiedMessageId = ref<string | null>(null)
 const expandedEvidenceIds = ref<Set<string>>(new Set())
 let copyResetTimer: number | null = null
@@ -56,7 +60,17 @@ function formatBytes(bytes: number): string {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`
 }
 
+const filteredDocuments = computed(() => {
+  const query = librarySearch.value.trim().toLowerCase()
+  return documents.value.filter((documentRecord) => {
+    const matchesQuery = !query || documentRecord.filename.toLowerCase().includes(query)
+    const matchesStatus = libraryStatus.value === 'all' || documentRecord.status === libraryStatus.value
+    return matchesQuery && matchesStatus
+  })
+})
+
 async function loadDocumentLibrary(): Promise<void> {
+  if (libraryBusy.value) return
   libraryBusy.value = true
   libraryError.value = ''
   try {
@@ -68,15 +82,32 @@ async function loadDocumentLibrary(): Promise<void> {
   }
 }
 
+async function openDocumentLibrary(): Promise<void> {
+  libraryOpen.value = true
+  if (!documents.value.length) await loadDocumentLibrary()
+}
+
+function closeDocumentLibrary(): void {
+  libraryOpen.value = false
+}
+
+function clearLibrarySearch(): void {
+  librarySearch.value = ''
+}
+
+function handleGlobalKeydown(event: KeyboardEvent): void {
+  if (event.key === 'Escape' && libraryOpen.value) closeDocumentLibrary()
+}
+
 async function downloadPdf(documentRecord: DocumentRecord): Promise<void> {
-  libraryBusy.value = true
+  downloadingDocumentId.value = documentRecord.id
   libraryError.value = ''
   try {
     await downloadDocument(documentRecord.id, documentRecord.filename)
   } catch (cause) {
     libraryError.value = cause instanceof Error ? cause.message : 'Could not download this PDF.'
   } finally {
-    libraryBusy.value = false
+    if (downloadingDocumentId.value === documentRecord.id) downloadingDocumentId.value = null
   }
 }
 
@@ -219,12 +250,18 @@ watch(
   { deep: true },
 )
 
+watch(libraryOpen, (open) => {
+  window.document.body.style.overflow = open ? 'hidden' : ''
+})
+
 onMounted(() => {
-  void loadDocumentLibrary()
+  window.addEventListener('keydown', handleGlobalKeydown)
 })
 
 onBeforeUnmount(() => {
   if (copyResetTimer !== null) window.clearTimeout(copyResetTimer)
+  window.removeEventListener('keydown', handleGlobalKeydown)
+  window.document.body.style.overflow = ''
 })
 </script>
 
@@ -240,64 +277,148 @@ onBeforeUnmount(() => {
       </div>
       <div class="topbar-badges">
         <span class="memory-badge"><i /> History saved</span>
-        <span class="knowledge-badge">
-          {{ knowledge?.ready_documents ?? 0 }} docs · {{ knowledge?.total_chunks ?? 0 }} chunks
-        </span>
+        <button
+          type="button"
+          class="knowledge-badge document-library-trigger"
+          aria-haspopup="dialog"
+          :aria-expanded="libraryOpen"
+          @click="openDocumentLibrary"
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M6 3.5h8l4 4V20.5H6z" />
+            <path d="M14 3.5v4h4M9 12h6M9 15h6" />
+          </svg>
+          Documents · {{ knowledge?.ready_documents ?? 0 }}
+        </button>
       </div>
     </header>
 
-    <section ref="scrollArea" class="conversation" aria-live="polite">
-      <section class="document-library-card" aria-labelledby="document-library-title">
-        <div class="document-library-heading">
-          <div>
-            <span class="eyebrow">Available PDFs</span>
-            <h2 id="document-library-title">
-              {{ documents.length }} uploaded PDF{{ documents.length === 1 ? '' : 's' }}
-            </h2>
-            <p>All signed-in users can view and download the shared PDF library.</p>
-          </div>
-          <button
-            type="button"
-            class="ghost-action compact"
-            :disabled="libraryBusy"
-            @click="loadDocumentLibrary"
-          >
-            {{ libraryBusy ? 'Loading…' : 'Refresh PDFs' }}
-          </button>
-        </div>
-
-        <p v-if="libraryError" class="library-error">{{ libraryError }}</p>
-        <p v-else-if="!documents.length" class="library-empty">
-          No PDFs have been uploaded yet.
-        </p>
-        <div v-else class="library-doc-list">
-          <article
-            v-for="documentRecord in documents"
-            :key="documentRecord.id"
-            class="library-doc-row"
-          >
-            <div class="file-icon">PDF</div>
-            <div class="library-doc-main">
-              <strong>{{ documentRecord.filename }}</strong>
-              <span>
-                {{ formatBytes(documentRecord.size_bytes) }} · {{ documentRecord.page_count }} pages ·
-                {{ documentRecord.chunk_count }} chunks
-              </span>
-              <small v-if="documentRecord.error" class="row-error">{{ documentRecord.error }}</small>
+    <Teleport to="body">
+      <div
+        v-if="libraryOpen"
+        class="document-library-backdrop"
+        role="presentation"
+        @mousedown.self="closeDocumentLibrary"
+      >
+        <section
+          class="document-library-dialog"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="document-library-title"
+          aria-describedby="document-library-description"
+        >
+          <header class="document-library-dialog-header">
+            <div>
+              <span class="eyebrow">Shared knowledge base</span>
+              <h2 id="document-library-title">Documents</h2>
+              <p id="document-library-description">
+                Search the PDFs available to this assistant and download a source when needed.
+              </p>
             </div>
-            <span class="status-tag" :class="documentRecord.status">{{ documentRecord.status }}</span>
             <button
               type="button"
-              class="library-download-button"
-              :disabled="libraryBusy"
-              @click="downloadPdf(documentRecord)"
+              class="library-close-button"
+              aria-label="Close document library"
+              @click="closeDocumentLibrary"
             >
-              Download
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M6 6l12 12M18 6 6 18" />
+              </svg>
             </button>
-          </article>
-        </div>
-      </section>
+          </header>
 
+          <div class="document-library-toolbar">
+            <label class="library-search-box">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <circle cx="11" cy="11" r="6.5" />
+                <path d="m16 16 4 4" />
+              </svg>
+              <input
+                v-model="librarySearch"
+                type="search"
+                placeholder="Search PDF names…"
+                autocomplete="off"
+                autofocus
+              />
+              <button
+                v-if="librarySearch"
+                type="button"
+                class="library-search-clear"
+                aria-label="Clear document search"
+                @click="clearLibrarySearch"
+              >
+                Clear
+              </button>
+            </label>
+
+            <label class="library-status-filter">
+              <span>Status</span>
+              <select v-model="libraryStatus">
+                <option value="all">All</option>
+                <option value="ready">Ready</option>
+                <option value="processing">Processing</option>
+                <option value="uploaded">Uploaded</option>
+                <option value="failed">Failed</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="document-library-summary">
+            <span v-if="libraryBusy && !documents.length">Loading documents…</span>
+            <span v-else>
+              {{ filteredDocuments.length }} of {{ documents.length }} document{{ documents.length === 1 ? '' : 's' }}
+            </span>
+            <button type="button" :disabled="libraryBusy" @click="loadDocumentLibrary">
+              {{ libraryBusy ? 'Refreshing…' : 'Refresh' }}
+            </button>
+          </div>
+
+          <p v-if="libraryError" class="library-error document-library-message">{{ libraryError }}</p>
+          <div v-else-if="libraryBusy && !documents.length" class="document-library-loading">
+            <span class="spinner" aria-hidden="true" />
+            <span>Loading the shared PDF library…</span>
+          </div>
+          <p v-else-if="!documents.length" class="library-empty document-library-message">
+            No PDFs have been uploaded yet.
+          </p>
+          <p
+            v-else-if="!filteredDocuments.length"
+            class="library-empty document-library-message"
+          >
+            No documents match your search and status filters.
+          </p>
+
+          <div v-else class="library-doc-list document-library-results">
+            <article
+              v-for="documentRecord in filteredDocuments"
+              :key="documentRecord.id"
+              class="library-doc-row"
+            >
+              <div class="file-icon">PDF</div>
+              <div class="library-doc-main">
+                <strong :title="documentRecord.filename">{{ documentRecord.filename }}</strong>
+                <span>
+                  {{ formatBytes(documentRecord.size_bytes) }} · {{ documentRecord.page_count }} pages ·
+                  {{ documentRecord.chunk_count }} chunks
+                </span>
+                <small v-if="documentRecord.error" class="row-error">{{ documentRecord.error }}</small>
+              </div>
+              <span class="status-tag" :class="documentRecord.status">{{ documentRecord.status }}</span>
+              <button
+                type="button"
+                class="library-download-button"
+                :disabled="downloadingDocumentId === documentRecord.id"
+                @click="downloadPdf(documentRecord)"
+              >
+                {{ downloadingDocumentId === documentRecord.id ? 'Downloading…' : 'Download' }}
+              </button>
+            </article>
+          </div>
+        </section>
+      </div>
+    </Teleport>
+
+    <section ref="scrollArea" class="conversation" aria-live="polite">
       <div v-if="!messages.length" class="empty-state">
         <div class="empty-orb" aria-hidden="true">
           <svg viewBox="0 0 24 24">
@@ -764,36 +885,229 @@ onBeforeUnmount(() => {
   font-size: 9px;
 }
 
-.document-library-card {
-  max-width: 880px;
-  margin: 0 auto 26px;
-  padding: 18px;
-  border: 1px solid var(--line);
-  border-radius: 18px;
-  background: rgba(255, 255, 255, .9);
-  box-shadow: 0 8px 24px rgba(36, 69, 58, .04);
+.document-library-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  font: inherit;
 }
 
-.document-library-heading {
+.document-library-trigger svg {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.7;
+}
+
+.document-library-trigger:hover {
+  border-color: #98b5aa;
+  background: #f8fbfa;
+}
+
+.document-library-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(24, 35, 31, .34);
+  backdrop-filter: blur(3px);
+}
+
+.document-library-dialog {
+  width: min(920px, 100%);
+  max-height: min(82vh, 760px);
+  display: grid;
+  grid-template-rows: auto auto auto minmax(0, 1fr);
+  overflow: hidden;
+  border: 1px solid #d8e2de;
+  border-radius: 20px;
+  background: #fff;
+  box-shadow: 0 24px 70px rgba(24, 45, 37, .22);
+}
+
+.document-library-dialog-header {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 14px;
+  gap: 16px;
+  padding: 20px 22px 16px;
+  border-bottom: 1px solid #e6ece9;
 }
 
-.document-library-heading h2 {
+.document-library-dialog-header h2 {
   margin: 5px 0 0;
-  font-size: 18px;
-  letter-spacing: -.03em;
+  color: #26352f;
+  font-size: 21px;
+  letter-spacing: -.035em;
 }
 
-.document-library-heading p,
-.library-empty,
-.library-error {
-  margin: 7px 0 0;
+.document-library-dialog-header p {
+  margin: 6px 0 0;
   color: var(--muted);
   font-size: 11px;
-  line-height: 1.6;
+  line-height: 1.55;
+}
+
+.library-close-button {
+  width: 34px;
+  height: 34px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  border: 1px solid #d9e2de;
+  border-radius: 10px;
+  color: #65756f;
+  background: #fff;
+}
+
+.library-close-button:hover {
+  color: #244c3e;
+  border-color: #9cb8ad;
+  background: #f7faf8;
+}
+
+.library-close-button svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-width: 1.8;
+}
+
+.document-library-toolbar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 150px;
+  gap: 10px;
+  padding: 14px 22px;
+  background: #fafcfb;
+}
+
+.library-search-box {
+  min-height: 38px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px;
+  border: 1px solid #d8e2de;
+  border-radius: 10px;
+  background: #fff;
+}
+
+.library-search-box:focus-within {
+  border-color: #87aa9b;
+  box-shadow: 0 0 0 3px rgba(89, 132, 115, .09);
+}
+
+.library-search-box > svg {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 auto;
+  fill: none;
+  stroke: #74847e;
+  stroke-linecap: round;
+  stroke-width: 1.7;
+}
+
+.library-search-box input {
+  width: 100%;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  color: #293731;
+  background: transparent;
+  font: inherit;
+  font-size: 11px;
+}
+
+.library-search-box input::-webkit-search-cancel-button {
+  display: none;
+}
+
+.library-search-clear,
+.document-library-summary button {
+  border: 0;
+  color: #4c7464;
+  background: transparent;
+  font-size: 9px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.library-search-clear:hover,
+.document-library-summary button:hover:not(:disabled) {
+  color: #214f3e;
+}
+
+.library-status-filter {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 7px;
+  padding: 0 9px;
+  border: 1px solid #d8e2de;
+  border-radius: 10px;
+  background: #fff;
+}
+
+.library-status-filter span {
+  color: #75827d;
+  font-size: 9px;
+  font-weight: 700;
+}
+
+.library-status-filter select {
+  min-width: 0;
+  height: 36px;
+  border: 0;
+  outline: 0;
+  color: #36463f;
+  background: transparent;
+  font: inherit;
+  font-size: 10px;
+}
+
+.document-library-summary {
+  min-height: 35px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0 22px;
+  border-top: 1px solid #edf1ef;
+  border-bottom: 1px solid #edf1ef;
+  color: #76837e;
+  font-size: 9px;
+}
+
+.document-library-results {
+  min-height: 0;
+  margin-top: 0;
+  padding: 0 22px 12px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.document-library-message {
+  margin: 0;
+  padding: 24px 22px;
+}
+
+.document-library-loading {
+  min-height: 130px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  color: #73817b;
+  font-size: 10px;
 }
 
 .library-error,
@@ -801,8 +1115,18 @@ onBeforeUnmount(() => {
   color: #a0362d;
 }
 
+.library-empty,
+.library-error {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.library-error {
+  color: #a0362d;
+}
+
 .library-doc-list {
-  margin-top: 12px;
   display: grid;
 }
 
@@ -858,6 +1182,10 @@ onBeforeUnmount(() => {
   background: #f7faf9;
 }
 
+.library-download-button:disabled {
+  opacity: .6;
+}
+
 .formatted-evidence-wrap {
   padding: 0 7px 7px;
 }
@@ -895,8 +1223,22 @@ onBeforeUnmount(() => {
 }
 
 @media (max-width: 820px) {
-  .document-library-heading {
-    display: grid;
+  .document-library-backdrop {
+    align-items: end;
+    padding: 0;
+  }
+
+  .document-library-dialog {
+    width: 100%;
+    max-height: 88vh;
+    border-right: 0;
+    border-bottom: 0;
+    border-left: 0;
+    border-radius: 18px 18px 0 0;
+  }
+
+  .document-library-toolbar {
+    grid-template-columns: 1fr;
   }
 
   .library-doc-row {
