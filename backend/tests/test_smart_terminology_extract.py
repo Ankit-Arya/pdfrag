@@ -80,3 +80,9 @@ def test_what_is_bic_is_definition_request() -> None:
     from app.rag.terminology import is_definition_request
 
     assert is_definition_request("what is BIC")
+
+
+def test_initialism_ignores_connective_words_in_long_form() -> None:
+    assert ("TCMS", "Train Control and Monitoring System") in _pairs(
+        "Train Control and Monitoring System (TCMS)"
+    )

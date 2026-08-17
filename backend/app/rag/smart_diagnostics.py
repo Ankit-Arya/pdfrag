@@ -20,7 +20,8 @@ def main() -> None:
                   (SELECT count(*) FROM document_chunks) AS chunks,
                   (SELECT count(*) FROM rag_terminology) AS terminology_rows,
                   (SELECT count(*) FROM rag_procedure_cards) AS procedure_cards,
-                  (SELECT count(*) FROM rag_rules) AS rules
+                  (SELECT count(*) FROM rag_rules) AS rules,
+                  (SELECT count(*) FROM rag_authority_directives) AS authority_directives
                 """
             )
         ).mappings().one()
@@ -33,7 +34,7 @@ def main() -> None:
                 """
                 SELECT indexname
                 FROM pg_indexes
-                WHERE tablename IN ('document_chunks', 'rag_terminology', 'rag_procedure_cards', 'rag_rules')
+                WHERE tablename IN ('document_chunks', 'rag_terminology', 'rag_procedure_cards', 'rag_rules', 'rag_authority_directives')
                   AND (indexname LIKE '%hnsw%' OR indexname LIKE '%fts%' OR indexname LIKE 'ix_rag_%')
                 ORDER BY indexname
                 """
@@ -42,6 +43,35 @@ def main() -> None:
         print("Smart RAG indexes")
         for name in rows:
             print(f"  {name}")
+
+        authority = db.execute(
+            text(
+                """
+                SELECT directive_type, count(*) AS rows, count(DISTINCT document_id) AS documents
+                FROM rag_authority_directives
+                GROUP BY directive_type
+                ORDER BY directive_type
+                """
+            )
+        ).mappings()
+        print("Authority directives")
+        for row in authority:
+            print(f"  {row['directive_type']}: {row['rows']} rows across {row['documents']} document(s)")
+
+        conflicts = db.execute(
+            text(
+                """
+                SELECT count(*)
+                FROM (
+                    SELECT alias_norm
+                    FROM rag_terminology
+                    GROUP BY alias_norm
+                    HAVING count(DISTINCT canonical_norm) > 1
+                ) x
+                """
+            )
+        ).scalar_one()
+        print(f"Terminology aliases with multiple corpus meanings: {conflicts}")
 
 
 if __name__ == "__main__":

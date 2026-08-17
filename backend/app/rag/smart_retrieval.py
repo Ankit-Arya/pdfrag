@@ -11,8 +11,9 @@ from collections.abc import Iterable
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from app.rag.authority import normalize_authority_text
 from app.rag.scenario_reasoning import current_scenario, logical_match_score
-from app.rag.terminology import definition_request_aliases
+from app.rag.terminology import definition_for_token, definition_request_aliases
 from app.rag.types import RetrievedChunk, TextChunk
 
 _STOP = {
@@ -27,6 +28,22 @@ _LOW_SIGNAL = {
     "full", "form", "meaning", "mean", "define", "definition", "expand", "expansion",
 }
 _MONEY_TERMS = {"compensation", "claim", "payable", "payment"}
+_VALUE_DIMENSION_TERMS = {
+    "amount", "compensation", "claim", "payable", "payment", "price", "cost", "fee",
+    "rate", "limit", "maximum", "minimum", "speed", "pressure", "voltage", "current",
+    "temperature", "time", "duration", "distance", "weight", "capacity", "quantity",
+    "number", "count", "frequency", "height", "length", "width", "clearance", "allowance",
+    "penalty", "fine", "threshold", "value", "range",
+}
+_STRUCTURED_LIST_CUES = {
+    "different", "various", "each", "every", "types", "categories", "classes",
+    "cases", "conditions", "modes", "injuries", "items", "table", "schedule", "list",
+}
+_VALUE_NUMBER_RE = re.compile(r"(?<![A-Za-z0-9])(?:₹|rs\.?\s*)?\d(?:[\d,]*(?:\.\d+)?)?(?![A-Za-z0-9])", re.IGNORECASE)
+_MEASUREMENT_UNIT_RE = re.compile(
+    r"\b(?:km/?h|kmph|m/?s|kpa|bar|psi|v|kv|a|ma|hz|kg|g|mm|cm|m|km|sec(?:ond)?s?|min(?:ute)?s?|hours?|days?|rupees?|lakh|crore|percent|%)\b",
+    re.IGNORECASE,
+)
 _VERSION_SENSITIVE_TERMS = {
     "compensation", "claim", "payable", "amount", "rate", "fee", "penalty", "allowance",
     "schedule", "limit", "current", "latest", "revised", "revision", "amendment", "amended",
@@ -103,54 +120,97 @@ def _money_lookup_query(value: str) -> bool:
     return bool(terms & _MONEY_TERMS)
 
 
+def value_lookup_request(value: str) -> bool:
+    """Return True for questions asking for a numeric/measurable value or schedule."""
+    terms = _terms(value)
+    if terms & _VALUE_DIMENSION_TERMS:
+        return True
+    lowered = value.casefold()
+    return bool(re.search(r"\b(?:how\s+much|how\s+many|at\s+what\s+speed|what\s+speed|what\s+limit|what\s+pressure|what\s+voltage)\b", lowered))
+
+
 def _version_sensitive_query(value: str) -> bool:
     terms = _terms(value)
-    return bool(terms & _VERSION_SENSITIVE_TERMS)
+    return bool(terms & _VERSION_SENSITIVE_TERMS) or value_lookup_request(value)
 
 
 def is_amendment_anchor_text(value: str) -> bool:
     folded = " ".join(value.casefold().split())
     return (
         "shall be substituted" in folded
+        or "shall be replaced" in folded
+        or "shall be omitted" in folded
         or "amendment rules" in folded
-        or ("rules, 2025" in folded and "amendment" in folded)
+        or "amendment regulations" in folded
+        or bool(re.search(r"\bamend(?:ed|ment)\b", folded) and re.search(r"\b(?:rule|schedule|section|clause|provision)\b", folded))
     )
 
 
 def structured_lookup_request(value: str) -> bool:
-    """Detect category-to-value/list requests such as compensation by injury type."""
-    lowered = value.casefold()
-    terms = _terms(value)
-    if not (terms & _MONEY_TERMS):
+    """Detect category-to-value/table requests across any measurable dimension."""
+    if not value_lookup_request(value):
         return False
-    return bool(
-        {"different", "various", "each", "type", "category", "injury", "injuries"}
-        & set(_TOKEN_RE.findall(lowered))
-    )
+    tokens = set(_TOKEN_RE.findall(value.casefold()))
+    return bool(tokens & _STRUCTURED_LIST_CUES)
+
+
+def _has_explicit_value(text_value: str) -> bool:
+    return bool(_VALUE_NUMBER_RE.search(text_value) and (_MEASUREMENT_UNIT_RE.search(text_value) or re.search(r"\b\d[\d,]{2,}\b", text_value)))
 
 
 def retrieval_answerable(query_text: str, results: list[RetrievedChunk]) -> bool:
-    """Check whether retrieved evidence has the shape required by the question.
+    """Assess whether the *set* of evidence can answer the requested shape.
 
-    Similar accident/injury prose is not enough for a monetary compensation lookup;
-    at least one candidate must actually contain a compensation/claim cue and a
-    monetary-looking number. Other query types retain the normal top-score logic.
+    This deliberately reasons across adjacent chunks. PDF tables often split the
+    header (``Amount of Compensation``) from the numeric row, so requiring every
+    cue in one chunk causes false negatives and favors verbose obsolete prose.
     """
     if not results:
         return False
-    if not _money_lookup_query(query_text):
+
+    aliases = definition_request_aliases(query_text)
+    if aliases:
+        for alias in aliases:
+            if not any(
+                "terminology-definition" in item.method
+                and definition_for_token(item.chunk.text, alias)
+                for item in results[:80]
+            ):
+                return False
         return True
+
+    if not value_lookup_request(query_text):
+        return True
+
     priority = _priority_terms(query_text)
-    for item in results[:80]:
-        body = item.chunk.text
-        folded = body.casefold()
-        if not re.search(r"\b(?:compensation|payable|claim)\b", folded):
-            continue
-        if not re.search(r"\b\d[\d,]{3,}\b", body):
-            continue
-        source_terms = _terms(body[:12000])
-        if not priority or len(priority & source_terms) >= min(2, len(priority)):
-            return True
+    grouped: dict[str, list[RetrievedChunk]] = defaultdict(list)
+    for item in results[:120]:
+        grouped[item.chunk.document_id or item.chunk.filename.casefold()].append(item)
+
+    for items in grouped.values():
+        items.sort(key=lambda item: item.chunk.chunk_index if item.chunk.chunk_index is not None else -1)
+        for item in items:
+            body = item.chunk.text
+            if not _VALUE_NUMBER_RE.search(body):
+                continue
+            neighborhood = [
+                other for other in items
+                if abs((other.chunk.chunk_index or 0) - (item.chunk.chunk_index or 0)) <= 2
+            ]
+            combined = "\n".join(other.chunk.text for other in neighborhood)
+            combined_terms = _terms(combined[:24000])
+            if not (_MEASUREMENT_UNIT_RE.search(combined) or re.search(r"\b\d[\d,]{2,}\b", body)):
+                continue
+            dimension_supported = bool(combined_terms & _VALUE_DIMENSION_TERMS) or any(
+                "structured-value" in other.method or "answer-shape" in other.method
+                for other in neighborhood
+            )
+            if not dimension_supported:
+                continue
+            subject_overlap = len(priority & combined_terms)
+            semantic_support = max((float(other.vector_score) for other in neighborhood), default=0.0) >= 0.32
+            if not priority or subject_overlap >= 1 or semantic_support:
+                return True
     return False
 
 
@@ -177,100 +237,114 @@ def definition_evidence_chunks(
     query_text: str,
     *,
     aliases: Iterable[str] = (),
-    limit: int = 8,
+    limit: int = 12,
 ) -> list[RetrievedChunk]:
-    """Fetch original PDF chunks that explicitly define requested abbreviations."""
-    requested = list(aliases) or definition_request_aliases(query_text)
-    normalized: list[str] = []
+    """Fetch original definition chunks with per-target coverage guarantees.
+
+    A global ORDER BY can otherwise spend the entire limit on one common acronym.
+    We query each requested alias independently and keep at least one direct source
+    for every resolvable target before adding secondary corroboration.
+    """
+    requested: list[str] = []
     seen: set[str] = set()
-    for alias in requested:
-        norm = " ".join(re.findall(r"[A-Za-z0-9]+", str(alias).casefold()))
-        if not norm or norm in seen:
+    for alias in (list(aliases) or definition_request_aliases(query_text)):
+        clean = " ".join(re.findall(r"[A-Za-z0-9]+", str(alias)))
+        norm = clean.casefold()
+        if not clean or norm in seen:
             continue
         seen.add(norm)
-        normalized.append(norm)
-    if not normalized:
+        requested.append(clean)
+    if not requested:
         return []
 
-    params: dict[str, object] = {"limit": max(1, min(30, limit))}
-    placeholders: list[str] = []
-    for index, norm in enumerate(normalized[:8]):
-        key = f"alias{index}"
-        params[key] = norm
-        placeholders.append(f":{key}")
+    primary: list[RetrievedChunk] = []
+    secondary: list[RetrievedChunk] = []
+    resolved_aliases: set[str] = set()
 
-    rows = list(
-        db.execute(
-            text(
-                f"""
-                SELECT c.id, c.document_id, c.chunk_index, c.page_number, c.content_type,
-                       c.text, d.filename, t.alias, t.canonical_name, t.confidence, t.verified
-                FROM rag_terminology t
-                JOIN document_chunks c ON c.id = t.chunk_id
-                JOIN documents d ON d.id = c.document_id
-                WHERE d.status = 'ready'
-                  AND t.alias_norm IN ({', '.join(placeholders)})
-                ORDER BY t.verified DESC, t.confidence DESC, lower(d.filename), c.page_number, c.chunk_index
-                LIMIT :limit
-                """
-            ),
-            params,
-        ).mappings()
-    )
-    results = [
-        _row_result(
-            row,
-            score=1.0 if bool(row["verified"]) else 0.995,
-            method="direct-terminology-definition",
-            vector_score=0.0,
-            keyword_score=0.99,
+    for alias in requested[:10]:
+        alias_norm = " ".join(re.findall(r"[A-Za-z0-9]+", alias.casefold()))
+        rows = list(
+            db.execute(
+                text(
+                    """
+                    SELECT c.id, c.document_id, c.chunk_index, c.page_number, c.content_type,
+                           c.text, d.filename, t.alias, t.canonical_name, t.confidence, t.verified
+                    FROM rag_terminology t
+                    JOIN document_chunks c ON c.id = t.chunk_id
+                    JOIN documents d ON d.id = c.document_id
+                    WHERE d.status = 'ready' AND t.alias_norm = :alias_norm
+                    ORDER BY t.verified DESC, t.confidence DESC, lower(d.filename), c.page_number, c.chunk_index
+                    LIMIT 4
+                    """
+                ),
+                {"alias_norm": alias_norm},
+            ).mappings()
         )
-        for row in rows
-    ]
-    if results:
-        return _diverse(results, limit)
-
-    # Backfill may be missing or stale. Search definition-shaped occurrences
-    # directly rather than accepting the first arbitrary BIC/SC/OCC usages.
-    fallback: list[RetrievedChunk] = []
-    for alias in requested[:6]:
-        escaped = re.escape(str(alias))
-        sql = text(
-            """
-            SELECT c.id, c.document_id, c.chunk_index, c.page_number, c.content_type,
-                   c.text, d.filename
-            FROM document_chunks c
-            JOIN documents d ON d.id = c.document_id
-            WHERE d.status = 'ready'
-              AND (
-                c.text ~* :paren_pattern
-                OR c.text ~* :leading_pattern
-                OR c.text ~* :direct_pattern
-              )
-            ORDER BY lower(d.filename), c.page_number, c.chunk_index
-            LIMIT :limit
-            """
-        )
-        fallback_rows = db.execute(
-            sql,
-            {
-                "paren_pattern": rf"\([[:space:]]*{escaped}[[:space:]]*\)",
-                "leading_pattern": rf"(^|[^A-Za-z0-9]){escaped}[[:space:]]*\(",
-                "direct_pattern": rf"(^|[^A-Za-z0-9]){escaped}[[:space:]]*([-:–—]|means|stands[[:space:]]+for)",
-                "limit": max(8, limit * 4),
-            },
-        ).mappings()
-        for row in fallback_rows:
-            fallback.append(
-                _row_result(
+        if rows:
+            resolved_aliases.add(alias_norm)
+            for position, row in enumerate(rows):
+                result = _row_result(
                     row,
-                    score=0.99,
-                    method="direct-terminology-definition-fallback",
+                    score=1.0 if bool(row["verified"]) else 0.995,
+                    method="direct-terminology-definition",
                     vector_score=0.0,
-                    keyword_score=0.96,
+                    keyword_score=0.99,
                 )
+                (primary if position == 0 else secondary).append(result)
+            continue
+
+        # Backfill may be missing or stale. Search definition-shaped occurrences
+        # directly instead of accepting arbitrary usage-only acronym occurrences.
+        escaped = re.escape(alias)
+        fallback_rows = list(
+            db.execute(
+                text(
+                    """
+                    SELECT c.id, c.document_id, c.chunk_index, c.page_number, c.content_type,
+                           c.text, d.filename
+                    FROM document_chunks c
+                    JOIN documents d ON d.id = c.document_id
+                    WHERE d.status = 'ready'
+                      AND (
+                        c.text ~* :paren_pattern
+                        OR c.text ~* :leading_pattern
+                        OR c.text ~* :direct_pattern
+                      )
+                    ORDER BY
+                      CASE WHEN c.text ~* :paren_pattern THEN 0 ELSE 1 END,
+                      lower(d.filename), c.page_number, c.chunk_index
+                    LIMIT 16
+                    """
+                ),
+                {
+                    "paren_pattern": rf"\([[:space:]]*{escaped}[[:space:]]*\)",
+                    "leading_pattern": rf"(^|[^A-Za-z0-9]){escaped}[[:space:]]*\(",
+                    "direct_pattern": rf"(^|[^A-Za-z0-9]){escaped}[[:space:]]*([-:–—]|means|stands[[:space:]]+for)",
+                },
+            ).mappings()
+        )
+        for position, row in enumerate(fallback_rows[:3]):
+            result = _row_result(
+                row,
+                score=0.99,
+                method="direct-terminology-definition-fallback",
+                vector_score=0.0,
+                keyword_score=0.96,
             )
-    return _diverse(fallback, limit)
+            (primary if position == 0 else secondary).append(result)
+            resolved_aliases.add(alias_norm)
+
+    ordered = [*primary, *secondary]
+    deduped: list[RetrievedChunk] = []
+    seen_ids: set[str] = set()
+    for item in ordered:
+        if item.chunk.chunk_id in seen_ids:
+            continue
+        seen_ids.add(item.chunk.chunk_id)
+        deduped.append(item)
+        if len(deduped) >= max(len(primary), min(30, limit)):
+            break
+    return deduped
 
 
 def route_procedure_documents(
@@ -323,6 +397,276 @@ def route_procedure_documents(
         scores[key] = max(scores[key], float(row["score"] or 0.0))
     max_docs = _int_env("SMART_RAG_ROUTED_DOCUMENTS", 8, 1, 30)
     return dict(sorted(scores.items(), key=lambda item: (-item[1], item[0]))[:max_docs])
+
+
+def _structured_value_rows(
+    db: Session,
+    query_vector: list[float],
+    document_ids: Iterable[str],
+    *,
+    limit: int = 80,
+) -> list[tuple[object, str, float, float]]:
+    """Retrieve numeric/table rows semantically inside a small routed document set.
+
+    This is the generic bridge between colloquial wording and formal tables. It does
+    not manufacture synonyms: the embedding chooses semantically related source rows,
+    then nearby original chunks are included to reconnect split headers and units.
+    """
+    ids = list(dict.fromkeys(str(value) for value in document_ids if str(value).strip()))[:6]
+    if not ids:
+        return []
+    params: dict[str, object] = {"embedding": str(query_vector), "limit": max(12, min(240, limit))}
+    placeholders: list[str] = []
+    for index, document_id in enumerate(ids):
+        key = f"svdoc{index}"
+        params[key] = document_id
+        placeholders.append(f"CAST(:{key} AS uuid)")
+    doc_filter = ", ".join(placeholders)
+    rows = list(
+        db.execute(
+            text(
+                f"""
+                WITH ranked AS (
+                    SELECT c.id, c.document_id, c.chunk_index, c.page_number, c.content_type,
+                           c.text, d.filename,
+                           GREATEST(0.0, 1 - (c.embedding <=> CAST(:embedding AS vector))) AS vector_score,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY c.document_id
+                               ORDER BY c.embedding <=> CAST(:embedding AS vector), c.id
+                           ) AS doc_rank
+                    FROM document_chunks c
+                    JOIN documents d ON d.id = c.document_id
+                    WHERE d.status = 'ready'
+                      AND c.document_id IN ({doc_filter})
+                      AND (
+                        c.content_type = 'table'
+                        OR c.text ~ '[0-9][0-9,]*([.][0-9]+)?'
+                      )
+                )
+                SELECT id, document_id, chunk_index, page_number, content_type, text, filename, vector_score
+                FROM ranked
+                WHERE doc_rank <= 20
+                ORDER BY vector_score DESC, id
+                LIMIT :limit
+                """
+            ),
+            params,
+        ).mappings()
+    )
+    if not rows:
+        return []
+
+    output: list[tuple[object, str, float, float]] = []
+    seed_pairs: list[tuple[str, int]] = []
+    for row in rows:
+        vector_score = float(row["vector_score"] or 0.0)
+        body = str(row["text"])
+        shape_boost = 0.08 if str(row["content_type"]).casefold() == "table" else 0.0
+        if _has_explicit_value(body):
+            shape_boost += 0.08
+        output.append((row, "smart-structured-value", min(1.0, vector_score + shape_boost), 0.0))
+        if vector_score >= 0.24 and len(seed_pairs) < 20:
+            seed_pairs.append((str(row["document_id"]), int(row["chunk_index"])))
+
+    # Preserve table headings/units split into neighboring chunks. These neighbors
+    # are navigation context; the answer still cites their original PDF text.
+    if seed_pairs:
+        values_sql = ",".join(f"(CAST(:sd{n} AS uuid), :si{n})" for n, _ in enumerate(seed_pairs))
+        neighbor_params: dict[str, object] = {"window": 2}
+        for n, (document_id, chunk_index) in enumerate(seed_pairs):
+            neighbor_params[f"sd{n}"] = document_id
+            neighbor_params[f"si{n}"] = chunk_index
+        neighbor_rows = db.execute(
+            text(
+                f"""
+                WITH seeds(document_id, chunk_index) AS (VALUES {values_sql})
+                SELECT c.id, c.document_id, c.chunk_index, c.page_number, c.content_type,
+                       c.text, d.filename,
+                       MIN(ABS(c.chunk_index - seeds.chunk_index)) AS distance
+                FROM seeds
+                JOIN document_chunks c ON c.document_id = seeds.document_id
+                  AND c.chunk_index BETWEEN seeds.chunk_index - :window AND seeds.chunk_index + :window
+                JOIN documents d ON d.id = c.document_id
+                GROUP BY c.id, c.document_id, c.chunk_index, c.page_number, c.content_type, c.text, d.filename
+                ORDER BY MIN(ABS(c.chunk_index - seeds.chunk_index)), c.id
+                """
+            ),
+            neighbor_params,
+        ).mappings()
+        for row in neighbor_rows:
+            distance = int(row["distance"] or 0)
+            output.append((row, "smart-structured-value-neighbor", max(0.40, 0.72 - 0.10 * distance), 0.0))
+    return output
+
+
+def _authority_directives_for_documents(db: Session, document_ids: Iterable[str]) -> list[object]:
+    ids = list(dict.fromkeys(str(value) for value in document_ids if str(value).strip()))[:20]
+    if not ids:
+        return []
+    params: dict[str, object] = {}
+    placeholders: list[str] = []
+    for index, document_id in enumerate(ids):
+        key = f"adoc{index}"
+        params[key] = document_id
+        placeholders.append(f"CAST(:{key} AS uuid)")
+    return list(
+        db.execute(
+            text(
+                f"""
+                SELECT ad.*, c.id AS anchor_id, c.content_type AS anchor_content_type,
+                       c.text AS anchor_text, d.filename
+                FROM rag_authority_directives ad
+                JOIN document_chunks c ON c.id = ad.anchor_chunk_id
+                JOIN documents d ON d.id = ad.document_id
+                WHERE d.status = 'ready' AND ad.document_id IN ({', '.join(placeholders)})
+                ORDER BY ad.effective_year DESC NULLS LAST, ad.confidence DESC, ad.id
+                """
+            ),
+            params,
+        ).mappings()
+    )
+
+
+def _authority_adjust_results(
+    db: Session,
+    query_text: str,
+    results: list[RetrievedChunk],
+) -> list[RetrievedChunk]:
+    """Prefer explicitly current replacement text and quarantine superseded facts.
+
+    Hard precedence is used only for explicit source directives (replace/substitute/
+    omit). For section replacement, old-looking rows are penalized only when the
+    replacement span itself already contains relevant answer-shaped evidence, so a
+    weak heuristic can never erase the only available answer.
+    """
+    if not results or not _version_sensitive_query(query_text):
+        return results
+    document_ids = [item.chunk.document_id for item in results if item.chunk.document_id]
+    try:
+        directives = _authority_directives_for_documents(db, document_ids)
+    except Exception:
+        return results
+    if not directives:
+        return results
+
+    by_doc: dict[str, list[RetrievedChunk]] = defaultdict(list)
+    for item in results:
+        by_doc[item.chunk.document_id or ""].append(item)
+
+    active_section_directives: set[int] = set()
+    current_rows_by_directive: dict[int, list[RetrievedChunk]] = defaultdict(list)
+    for directive in directives:
+        if str(directive["directive_type"]) != "replace_section":
+            continue
+        directive_id = int(directive["id"])
+        doc_id = str(directive["document_id"])
+        start = int(directive["span_start_chunk"])
+        end = int(directive["span_end_chunk"])
+        for item in by_doc.get(doc_id, []):
+            idx = item.chunk.chunk_index if item.chunk.chunk_index is not None else -1
+            if not (start <= idx <= end):
+                continue
+            semantic = float(item.vector_score) >= 0.24 or _weighted_lexical(query_text, item.chunk.text) >= 0.14
+            if semantic and (not value_lookup_request(query_text) or _has_explicit_value(item.chunk.text)):
+                active_section_directives.add(directive_id)
+                current_rows_by_directive[directive_id].append(item)
+
+    relevant_directive_ids: set[int] = set(active_section_directives)
+    query_norm = normalize_authority_text(query_text)
+    for directive in directives:
+        directive_id = int(directive["id"])
+        dtype = str(directive["directive_type"])
+        doc_id = str(directive["document_id"])
+        if dtype == "replace_words":
+            old_norm = str(directive["old_norm"] or "")
+            new_norm = str(directive["new_norm"] or "")
+            if any(
+                (old_norm and old_norm in normalize_authority_text(item.chunk.text))
+                or (new_norm and new_norm in normalize_authority_text(item.chunk.text))
+                for item in by_doc.get(doc_id, [])
+            ):
+                relevant_directive_ids.add(directive_id)
+        elif dtype == "omit":
+            target_norm = str(directive["target_norm"] or "")
+            if target_norm and (target_norm in query_norm or any(target_norm in normalize_authority_text(item.chunk.text) for item in by_doc.get(doc_id, []))):
+                relevant_directive_ids.add(directive_id)
+
+    active_directives = [directive for directive in directives if int(directive["id"]) in relevant_directive_ids]
+    if not active_directives:
+        return results
+
+    adjusted: list[RetrievedChunk] = []
+    anchor_results: list[RetrievedChunk] = []
+    for directive in active_directives:
+        anchor_results.append(
+            _row_result(
+                {
+                    "id": directive["anchor_id"],
+                    "document_id": directive["document_id"],
+                    "chunk_index": directive["anchor_chunk_index"],
+                    "page_number": directive["page_number"],
+                    "content_type": directive["anchor_content_type"],
+                    "text": directive["anchor_text"],
+                    "filename": directive["filename"],
+                },
+                score=0.995,
+                method="smart-authority-anchor",
+                vector_score=0.0,
+                keyword_score=0.99,
+            )
+        )
+
+    for item in results:
+        score = float(item.score)
+        method = item.method
+        doc_id = item.chunk.document_id or ""
+        normalized_body = normalize_authority_text(item.chunk.text)
+        for directive in active_directives:
+            if str(directive["document_id"]) != doc_id:
+                continue
+            dtype = str(directive["directive_type"])
+            if dtype == "replace_words":
+                old_norm = str(directive["old_norm"] or "")
+                if old_norm and old_norm in normalized_body and item.chunk.chunk_id != str(directive["anchor_id"]):
+                    score -= 0.60
+                    method += "+superseded-explicit-wording"
+                new_norm = str(directive["new_norm"] or "")
+                if new_norm and new_norm in normalized_body:
+                    score += 0.10
+                    method += "+current-explicit-wording"
+            elif dtype == "omit":
+                target_norm = str(directive["target_norm"] or "")
+                if target_norm and target_norm in normalized_body and item.chunk.chunk_id != str(directive["anchor_id"]):
+                    score -= 0.55
+                    method += "+superseded-omitted-provision"
+            elif dtype == "replace_section" and int(directive["id"]) in active_section_directives:
+                idx = item.chunk.chunk_index if item.chunk.chunk_index is not None else -1
+                start = int(directive["span_start_chunk"])
+                end = int(directive["span_end_chunk"])
+                if start <= idx <= end:
+                    score += 0.20
+                    method += "+current-authority-span"
+                elif idx > end and _has_explicit_value(item.chunk.text):
+                    target_norm = str(directive["target_norm"] or "")
+                    in_same_named_section = bool(target_norm and target_norm in normalized_body)
+                    competing_similarity = max(
+                        (_lexical(current.chunk.text, item.chunk.text) for current in current_rows_by_directive.get(int(directive["id"]), [])),
+                        default=0.0,
+                    )
+                    # Quarantine only a genuinely competing row: either its source
+                    # context names the replaced section or it is textually the same
+                    # category as a current replacement row but carries another value.
+                    if in_same_named_section or competing_similarity >= 0.30:
+                        score -= 0.42
+                        method += "+superseded-competing-section"
+        adjusted.append(replace(item, score=max(0.0, min(1.0, score)), method=method))
+
+    merged: dict[str, RetrievedChunk] = {item.chunk.chunk_id: item for item in adjusted}
+    for anchor in anchor_results:
+        old = merged.get(anchor.chunk.chunk_id)
+        if old is None or anchor.score > old.score:
+            merged[anchor.chunk.chunk_id] = anchor
+    return list(merged.values())
 
 
 def _mark_current_amendment_context(
@@ -597,8 +941,32 @@ def fast_search_chunks(
         for row in rows:
             merge_row(row, "smart-routed-fts", keyword_score=float(row["keyword_score"] or 0.0))
 
-    if _version_sensitive_query(query_text):
-        _mark_current_amendment_context(db, collected, merge_row)
+    if value_lookup_request(query_text):
+        # Add semantically matched numeric/table rows from the small set of likely
+        # documents. This is intentionally independent of exact user vocabulary.
+        candidate_docs = list(routed_docs)
+        if len(candidate_docs) < 6:
+            ranked_docs: dict[str, float] = defaultdict(float)
+            for entry in collected.values():
+                row = entry["row"]
+                doc_id = str(row["document_id"])
+                ranked_docs[doc_id] = max(
+                    ranked_docs[doc_id],
+                    float(entry["vector"]) * 0.65 + float(entry["keyword"]) * 0.35,
+                )
+            for doc_id, _score in sorted(ranked_docs.items(), key=lambda pair: (-pair[1], pair[0])):
+                if doc_id not in candidate_docs:
+                    candidate_docs.append(doc_id)
+                if len(candidate_docs) >= 6:
+                    break
+        for row, method, vector_score, keyword_score in _structured_value_rows(
+            db,
+            query_vector,
+            candidate_docs,
+            limit=_int_env("SMART_RAG_STRUCTURED_VALUE_K", 96, 24, 240),
+        ):
+            merge_row(row, method, vector_score=vector_score, keyword_score=keyword_score)
+            routed_docs[str(row["document_id"])] = max(0.88, routed_docs.get(str(row["document_id"]), 0.0))
 
     results: list[RetrievedChunk] = []
     for entry in collected.values():
@@ -613,6 +981,9 @@ def fast_search_chunks(
         methods = sorted(str(value) for value in entry["methods"])
         priority_boost = 0.10 if "smart-priority-fts" in methods else 0.0
         answer_shape_boost = 0.12 if "smart-answer-shape-money" in methods else 0.0
+        structured_value_boost = 0.14 if "smart-structured-value" in methods else 0.0
+        if "smart-structured-value-neighbor" in methods:
+            structured_value_boost = max(structured_value_boost, 0.06)
         amendment_boost = 0.18 if "current-amendment-context" in methods else 0.0
         anchor_boost = 0.18 if "smart-amendment-authority-anchor" in methods else 0.0
         base = vector_score * 0.46 + keyword_score * 0.30 + lexical * 0.24
@@ -625,6 +996,7 @@ def fast_search_chunks(
                 + logical_boost
                 + priority_boost
                 + answer_shape_boost
+                + structured_value_boost
                 + amendment_boost
                 + anchor_boost,
             ),
@@ -642,6 +1014,8 @@ def fast_search_chunks(
                 keyword_score=keyword_score,
             )
         )
+
+    results = _authority_adjust_results(db, query_text, results)
 
     results.sort(
         key=lambda item: (
@@ -740,6 +1114,8 @@ def fast_corpus_scan(
                 method += "+deterministic-rule-mismatch"
             adjusted.append(replace(item, score=max(0.0, min(1.0, item.score + boost)), method=method))
         results = adjusted
+    if not reference_mode:
+        results = _authority_adjust_results(db, combined, results)
     results.sort(key=lambda item: -item.score)
     return _diverse(results, cap)
 

@@ -1,0 +1,25 @@
+Smart RAG Reliability Hotfix v2 overlay files
+
+NEW
+backend/app/rag/authority.py
+backend/tests/test_smart_reliability.py
+
+UPDATED
+backend/app/rag/smart_schema.py
+backend/app/rag/smart_index.py
+backend/app/rag/smart_diagnostics.py
+backend/app/rag/terminology.py
+backend/app/rag/smart_retrieval.py
+backend/app/rag/smart_runtime.py
+backend/tests/test_smart_terminology_extract.py
+docker-compose.smart-rag.yml
+.env.smart-rag.example
+
+DOCUMENTATION / VERIFICATION
+HOTFIX_V2_README.md
+INSTALL_POWERSHELL.txt
+verify-reliability-hotfix.ps1
+BASE_CURRENT_COMMIT.txt
+HOTFIX_V2.patch
+QA_RESULTS.txt
+CHECKSUMS.sha256

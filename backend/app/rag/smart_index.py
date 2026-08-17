@@ -12,6 +12,11 @@ from dataclasses import dataclass
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from app.rag.authority import (
+    extract_authority_directives,
+    normalize_authority_text,
+    replacement_span_end,
+)
 from app.rag.scenario_reasoning import (
     extract_numeric_rules,
     parse_chunk_context,
@@ -63,10 +68,16 @@ def _best_long_form(alias: str, value: str, *, require_initials: bool) -> str:
     words = re.findall(r"[A-Za-z][A-Za-z0-9/&.'-]*", cleaned)
     letters = "".join(char for char in alias.upper() if char.isalpha())
     if require_initials and letters and words:
+        ignored = {"and", "or", "of", "the", "for", "to", "in", "on", "a", "an"}
         for start in range(len(words)):
             suffix = words[start:]
-            initials = "".join(word[0].upper() for word in suffix if word)
-            if initials == letters:
+            strict_initials = "".join(word[0].upper() for word in suffix if word)
+            semantic_initials = "".join(
+                word[0].upper() for word in suffix if word and word.casefold() not in ignored
+            )
+            if letters in {strict_initials, semantic_initials}:
+                while suffix and suffix[0].casefold() in ignored:
+                    suffix = suffix[1:]
                 return " ".join(suffix)[:160]
         # Parenthetical forms are noisy in OCR. Reject a long form whose initials
         # do not support the abbreviation instead of poisoning the global alias map.
@@ -178,8 +189,9 @@ def index_document(db: Session, document_id: str | uuid.UUID) -> dict[str, int]:
         ).mappings()
     ]
     if not rows:
-        return {"terminology": 0, "procedure_cards": 0, "rules": 0}
+        return {"terminology": 0, "procedure_cards": 0, "rules": 0, "authority_directives": 0}
 
+    db.execute(text("DELETE FROM rag_authority_directives WHERE document_id = CAST(:document_id AS uuid)"), {"document_id": document_id_text})
     db.execute(text("DELETE FROM rag_rules WHERE document_id = CAST(:document_id AS uuid)"), {"document_id": document_id_text})
     db.execute(text("DELETE FROM rag_procedure_cards WHERE document_id = CAST(:document_id AS uuid)"), {"document_id": document_id_text})
     db.execute(text("DELETE FROM rag_terminology WHERE document_id = CAST(:document_id AS uuid)"), {"document_id": document_id_text})
@@ -214,6 +226,71 @@ def index_document(db: Session, document_id: str | uuid.UUID) -> dict[str, int]:
                 },
             )
             terminology_count += 1
+
+    authority_count = 0
+    seen_authority: set[tuple[str, str, str, str, int | None]] = set()
+    for row in rows:
+        directives = extract_authority_directives(
+            strip_chunk_context(row.text),
+            chunk_index=row.chunk_index,
+            page_number=row.page_number,
+        )
+        for directive in directives:
+            authority_key = (
+                directive.directive_type,
+                normalize_authority_text(directive.target),
+                normalize_authority_text(directive.old_text),
+                normalize_authority_text(directive.new_text),
+                directive.effective_year,
+            )
+            if authority_key in seen_authority:
+                continue
+            seen_authority.add(authority_key)
+            span_end = directive.span_end_chunk
+            if directive.directive_type == "replace_section":
+                span_end = replacement_span_end(
+                    rows,
+                    anchor_chunk_index=row.chunk_index,
+                    anchor_year=directive.effective_year,
+                    max_chunks=48,
+                )
+            db.execute(
+                text(
+                    """
+                    INSERT INTO rag_authority_directives(
+                        document_id, anchor_chunk_id, anchor_chunk_index, page_number,
+                        directive_type, target, target_norm, old_text, old_norm, new_text,
+                        new_norm, effective_year, span_start_chunk, span_end_chunk,
+                        confidence, evidence
+                    ) VALUES (
+                        CAST(:document_id AS uuid), CAST(:anchor_chunk_id AS uuid), :anchor_chunk_index, :page_number,
+                        :directive_type, :target, :target_norm, :old_text, :old_norm, :new_text,
+                        :new_norm, :effective_year, :span_start_chunk, :span_end_chunk,
+                        :confidence, :evidence
+                    )
+                    ON CONFLICT DO NOTHING
+                    """
+                ),
+                {
+                    "document_id": row.document_id,
+                    "anchor_chunk_id": row.id,
+                    "anchor_chunk_index": row.chunk_index,
+                    "page_number": row.page_number,
+                    "directive_type": directive.directive_type,
+                    "target": directive.target,
+                    "target_norm": normalize_authority_text(directive.target),
+                    "old_text": directive.old_text,
+                    "old_norm": normalize_authority_text(directive.old_text),
+                    "new_text": directive.new_text,
+                    "new_norm": normalize_authority_text(directive.new_text),
+                    "effective_year": directive.effective_year,
+                    "span_start_chunk": directive.span_start_chunk,
+                    "span_end_chunk": span_end,
+                    "confidence": directive.confidence,
+                    "evidence": strip_chunk_context(row.text)[:1800],
+                },
+            )
+            authority_count += 1
 
     groups: dict[str, list[_ChunkRow]] = defaultdict(list)
     group_titles: dict[str, str] = {}
@@ -345,6 +422,7 @@ def index_document(db: Session, document_id: str | uuid.UUID) -> dict[str, int]:
         "terminology": terminology_count,
         "procedure_cards": len(card_payloads),
         "rules": rules_count,
+        "authority_directives": authority_count,
     }
 
 
@@ -353,7 +431,7 @@ def backfill_all(db: Session) -> dict[str, int]:
         str(value)
         for value in db.scalars(text("SELECT id FROM documents WHERE status = 'ready' ORDER BY created_at"))
     ]
-    totals = {"documents": 0, "terminology": 0, "procedure_cards": 0, "rules": 0}
+    totals = {"documents": 0, "terminology": 0, "procedure_cards": 0, "rules": 0, "authority_directives": 0}
     for number, document_id in enumerate(document_ids, start=1):
         try:
             counts = index_document(db, document_id)
@@ -362,15 +440,16 @@ def backfill_all(db: Session) -> dict[str, int]:
             logger.exception("Smart-index backfill failed for document %s", document_id)
             continue
         totals["documents"] += 1
-        for key in ("terminology", "procedure_cards", "rules"):
+        for key in ("terminology", "procedure_cards", "rules", "authority_directives"):
             totals[key] += counts[key]
         logger.info(
-            "Smart-indexed document %d/%d: %s cards=%d terms=%d rules=%d",
+            "Smart-indexed document %d/%d: %s cards=%d terms=%d rules=%d authority=%d",
             number,
             len(document_ids),
             document_id,
             counts["procedure_cards"],
             counts["terminology"],
             counts["rules"],
+            counts["authority_directives"],
         )
     return totals

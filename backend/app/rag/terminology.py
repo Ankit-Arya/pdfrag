@@ -85,52 +85,88 @@ def candidate_aliases(value: str) -> list[str]:
 
 
 def definition_request_aliases(value: str, hints: Iterable[str] = ()) -> list[str]:
-    """Return acronym/short-term targets when the user is asking for a definition.
+    """Return all short-term targets when the turn is genuinely definitional.
 
-    Bare uppercase acronyms are treated as definition requests. Lowercase bare terms
-    are only promoted when corpus-derived abbreviation hints already establish that
-    the token is an organisation abbreviation. Explicit cues such as ``full form``
-    work in either case.
+    This intentionally handles multi-target turns (``BIC and TCMS``, ``what are
+    ATP, ATO and ATS?``) while refusing to reinterpret procedural/status questions
+    as definitions. Explicit corpus-navigation wording remains reference mode.
     """
     normalized = " ".join(value.split()).strip()
     if not normalized or _DOC_CODE_RE.fullmatch(normalized):
         return []
 
+    lowered = normalized.casefold()
+    if re.search(r"\b(?:find|search|locate|references?|mentions?|occurrences?)\b", lowered):
+        return []
+
+    hinted = {alias.casefold(): alias for alias in _hint_aliases(hints)}
     targets: list[str] = []
     seen: set[str] = set()
 
-    def add(raw: str) -> None:
+    def add(raw: str, *, explicit: bool = False) -> None:
         token = raw.strip()
         if not re.fullmatch(r"[A-Za-z][A-Za-z0-9]{1,9}", token):
             return
-        lowered = token.casefold()
-        if lowered in _STOP or lowered in seen:
+        lowered_token = token.casefold()
+        if lowered_token in _STOP or lowered_token in seen:
             return
-        seen.add(lowered)
+        if not explicit and not token.isupper() and lowered_token not in hinted:
+            return
+        seen.add(lowered_token)
         targets.append(token.upper() if token.isalpha() else token)
 
+    # Preserve the original precise single-target forms.
     for pattern in _DEFINITION_TARGET_PATTERNS:
         for match in pattern.finditer(normalized):
-            add(match.group("alias"))
+            add(match.group("alias"), explicit=True)
 
     if _BARE_ACRONYM_RE.fullmatch(normalized):
         add(normalized)
 
-    hinted = _hint_aliases(hints)
     if len(normalized.split()) == 1:
-        for alias in hinted:
-            if alias.casefold() == normalized.casefold():
-                add(alias)
+        alias = hinted.get(normalized.casefold())
+        if alias:
+            add(alias, explicit=True)
 
-    # For phrasing such as ``BIC full form`` the regex above catches the target.
-    # If a definition cue is present but unusual word order is used, fall back to
-    # explicit uppercase candidates rather than treating "full"/"form" as aliases.
-    if _DEFINITION_CUE_RE.search(normalized):
-        for token in candidate_aliases(normalized):
-            if token.isupper():
-                add(token)
+    explicit_cue = bool(_DEFINITION_CUE_RE.search(normalized))
+    question_prefix = bool(re.match(r"^\s*what\s+(?:is|are)\b", normalized, re.IGNORECASE))
 
-    return targets[:6]
+    # Multi-target definition detection is conservative: after removing ordinary
+    # definition/connective words, every remaining substantive token must itself
+    # look like a short alias. This keeps ``what is BIC procedure`` procedural,
+    # while accepting ``what is BIC and TCMS`` and ``what are ATP/ATO/ATS``.
+    if explicit_cue or question_prefix or re.fullmatch(
+        r"\s*[A-Za-z][A-Za-z0-9]{1,9}(?:\s*[,/&+]\s*|\s+and\s+)[A-Za-z0-9, /&+]+[?.!]*\s*",
+        normalized,
+        re.IGNORECASE,
+    ):
+        stripped = re.sub(r"^\s*what\s+(?:is|are)\s+", "", normalized, flags=re.IGNORECASE)
+        words = re.findall(r"[A-Za-z][A-Za-z0-9]{1,20}", stripped)
+        connective = {
+            "and", "or", "of", "the", "a", "an", "full", "form", "forms",
+            "meaning", "mean", "means", "define", "definition", "expand",
+            "expansion", "stands", "stand", "for",
+        }
+        aliases: list[str] = []
+        unsupported: list[str] = []
+        for word in words:
+            low = word.casefold()
+            if low in connective:
+                continue
+            is_alias = (
+                bool(re.fullmatch(r"[A-Z][A-Z0-9]{1,9}", word))
+                or low in hinted
+                or (explicit_cue and bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9]{1,5}", word)) and low not in _STOP)
+            )
+            if is_alias:
+                aliases.append(word)
+            else:
+                unsupported.append(word)
+        if aliases and not unsupported:
+            for alias in aliases:
+                add(alias, explicit=explicit_cue or question_prefix)
+
+    return targets[:10]
 
 
 def is_definition_request(value: str, hints: Iterable[str] = ()) -> bool:
@@ -260,25 +296,46 @@ def terminology_hints(db: Session, value: str) -> list[str]:
     return result[:16]
 
 
+def _initials_support_alias(alias: str, canonical: str) -> bool:
+    letters = "".join(char for char in alias.upper() if char.isalpha())
+    words = re.findall(r"[A-Za-z][A-Za-z0-9/&.'-]*", canonical)
+    if not letters or not words:
+        return False
+    ignored = {"and", "or", "of", "the", "for", "to", "in", "on", "a", "an"}
+    initials = "".join(word[0].upper() for word in words if word.casefold() not in ignored)
+    return initials == letters
+
+
 def _definition_for_token(text_value: str, token: str) -> str:
     escaped = re.escape(token)
     word = r"[A-Za-z][A-Za-z0-9/&.'-]*"
-    before = re.compile(
-        rf"((?:{word}[ \t]+){{1,7}}{word})[ \t]*\([ \t]*{escaped}[ \t]*\)",
-        re.IGNORECASE,
+    parenthetical = (
+        re.compile(
+            rf"((?:{word}[ \t]+){{1,7}}{word})[ \t]*\([ \t]*{escaped}[ \t]*\)",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            rf"(?<![A-Za-z0-9]){escaped}[ \t]*\([ \t]*((?:{word}[ \t]+){{0,7}}{word})[ \t]*\)",
+            re.IGNORECASE,
+        ),
     )
-    after = re.compile(
-        rf"(?<![A-Za-z0-9]){escaped}[ \t]*\([ \t]*((?:{word}[ \t]+){{0,7}}{word})[ \t]*\)",
-        re.IGNORECASE,
+    direct = (
+        re.compile(
+            rf"(?im)(?<![A-Za-z0-9]){escaped}[ \t]*(?:[-:–—]|means\b|stands\s+for\b)[ \t]*"
+            rf"((?:{word}[ \t]+){{0,7}}{word})"
+        ),
+        re.compile(
+            rf"(?im)^\s*\|?\s*{escaped}\s*\|\s*((?:{word}[ \t]+){{0,7}}{word})\s*\|?\s*$"
+        ),
     )
-    direct = re.compile(
-        rf"(?im)(?<![A-Za-z0-9]){escaped}[ \t]*(?:[-:–—]|means\b|stands\s+for\b)[ \t]*"
-        rf"((?:{word}[ \t]+){{0,7}}{word})"
-    )
-    table = re.compile(
-        rf"(?im)^\s*\|?\s*{escaped}\s*\|\s*((?:{word}[ \t]+){{0,7}}{word})\s*\|?\s*$"
-    )
-    for pattern in (before, after, direct, table):
+    for pattern in parenthetical:
+        match = pattern.search(text_value[:16000])
+        if not match:
+            continue
+        expansion = re.sub(r"\s+", " ", match.group(1)).strip(" -,:;|")
+        if 3 <= len(expansion) <= 120 and expansion.casefold() != token.casefold() and _initials_support_alias(token, expansion):
+            return expansion
+    for pattern in direct:
         match = pattern.search(text_value[:16000])
         if not match:
             continue
@@ -286,6 +343,11 @@ def _definition_for_token(text_value: str, token: str) -> str:
         if 3 <= len(expansion) <= 120 and expansion.casefold() != token.casefold():
             return expansion
     return ""
+
+
+def definition_for_token(text_value: str, token: str) -> str:
+    """Public wrapper used by deterministic definition synthesis."""
+    return _definition_for_token(text_value, token)
 
 
 def explicit_definition_hints(

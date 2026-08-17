@@ -1,0 +1,7 @@
+Verified target repository: Ankit-Arya/pdfrag
+Verified current commit when this hotfix was packaged:
+f19e864655a1aca24527ff9a93202b5b8973ec04
+Commit message: Updated queries
+
+The current repository's smart_runtime.py, smart_retrieval.py, and terminology.py
+blob SHAs were verified to match the first-hotfix base used to build this overlay.

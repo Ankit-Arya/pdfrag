@@ -1,17 +1,35 @@
-QA performed in hotfix build workspace on 2026-08-17:
+Smart RAG Reliability Hotfix v2 - QA
+Date: 2026-08-17
+Verified repository state: f19e864655a1aca24527ff9a93202b5b8973ec04
 
-Command:
-PYTHONPATH=. pytest -q tests/test_smart_terminology_extract.py tests/test_smart_reasoning.py tests/test_smart_query_shapes.py
+Focused regression suite:
+  PYTHONPATH=backend pytest -q \
+    backend/tests/test_smart_terminology_extract.py \
+    backend/tests/test_smart_reasoning.py \
+    backend/tests/test_smart_query_shapes.py \
+    backend/tests/test_smart_reliability.py
+  RESULT: 46 passed
 
-Result:
-32 passed in 0.22s
+Static checks:
+  python -m compileall -q backend/app/rag backend/tests
+  RESULT: PASS
 
-Command:
-python -m compileall -q app tests
+  docker-compose.smart-rag.yml YAML parse
+  RESULT: PASS
 
-Result:
-PASS
+Source-document checks using the supplied Metro Railways Procedure of Claims + 2025 Amendment PDF:
+  - Parser extracted explicit Rule 18 substitution: five lakh -> eight lakh.
+  - Parser extracted explicit Second Schedule replacement directive.
+  - Current replacement schedule source contains the Femur/Tibia one-limb fracture row and 80,000.
+  RESULT: PASS
 
-Notes:
-- The existing test_smart_reasoning.py was executed from the prerequisite Smart RAG patch and passed.
-- Full repository CI was not run because outbound GitHub cloning is unavailable in the build environment.
+Generalization / anti-hardcode check:
+  - Production code contains no conditional hardcode for "broken leg" or "one eye".
+  - BIC/TCMS occur only in explanatory comments/docstrings as examples; runtime behavior is generic.
+
+Installation model:
+  - Incremental overlay only.
+  - No frontend application files included.
+  - No nginx application files included.
+  - New authority table is additive and derived from existing original chunks.
+  - One smart_backfill run is required after installation.

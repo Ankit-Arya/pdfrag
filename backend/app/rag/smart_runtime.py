@@ -26,9 +26,11 @@ from app.rag.smart_retrieval import (
     retrieval_answerable,
     rule_notes_for_chunk,
     structured_lookup_request,
+    value_lookup_request,
 )
 from app.rag.smart_schema import ensure_smart_schema
 from app.rag.terminology import (
+    definition_for_token,
     definition_request_aliases,
     explicit_definition_hints,
     is_definition_request,
@@ -95,6 +97,7 @@ def install_smart_rag_patch() -> None:
     original_plan = query_module.QueryPlanner.plan
     original_search_mode = service_module.deterministic_search_mode
     original_source_header = synthesis_module._compact_source_header
+    original_synthesize_answer = service_module.synthesize_answer
 
     def smart_find_abbreviation_hints(db, text_value, *, max_terms=None, chunks_per_term=None):  # type: ignore[no-untyped-def]
         started = time.perf_counter()
@@ -221,7 +224,7 @@ def install_smart_rag_patch() -> None:
                     db,
                     _CURRENT_ORIGINAL_QUESTION.get() or query_text,
                     aliases=definition_aliases,
-                    limit=min(8, max(2, limit)),
+                    limit=min(30, max(len(definition_aliases) * 3, 8, limit // 4)),
                 )
             except Exception:
                 logger.exception("Definition evidence retrieval failed")
@@ -266,8 +269,21 @@ def install_smart_rag_patch() -> None:
             by_id = {item.chunk.chunk_id: item for item in result}
             for item in legacy:
                 current = by_id.get(item.chunk.chunk_id)
-                if current is None or item.score > current.score:
+                if current is None:
                     by_id[item.chunk.chunk_id] = item
+                    continue
+                # Never discard smart authority/definition/structured metadata just
+                # because the legacy scorer assigns the same chunk a larger number.
+                merged_method = current.method
+                if "legacy-fallback" not in merged_method:
+                    merged_method += "+legacy-fallback"
+                by_id[item.chunk.chunk_id] = replace(
+                    current,
+                    score=max(float(current.score), float(item.score)),
+                    vector_score=max(float(current.vector_score), float(item.vector_score)),
+                    keyword_score=max(float(current.keyword_score), float(item.keyword_score)),
+                    method=merged_method,
+                )
             result = sorted(
                 by_id.values(),
                 key=lambda item: (
@@ -410,7 +426,11 @@ def install_smart_rag_patch() -> None:
     def smart_select(plan, candidates, max_chunks=None, *, preferred_document_ids=None):  # type: ignore[no-untyped-def]
         cap = _int_env("SMART_RAG_FINAL_CONTEXT_CHUNKS", 48, 12, 120)
         definition_aliases = _CURRENT_DEFINITION_ALIASES.get()
-        effective_cap = min(cap, 12) if definition_aliases else cap
+        current_question = _CURRENT_ORIGINAL_QUESTION.get() or plan.original_question
+        if definition_aliases:
+            effective_cap = min(cap, max(12, len(definition_aliases) * 4))
+        else:
+            effective_cap = cap
         requested_cap = min(max_chunks or effective_cap, effective_cap)
         scenario = current_scenario()
         adjusted = []
@@ -425,11 +445,25 @@ def install_smart_rag_patch() -> None:
                 adjusted.append(replace(item, score=max(0.0, min(1.0, item.score + boost)), method=method))
             else:
                 adjusted.append(item)
+
+        # Once explicit current-authority evidence is present, do not pass chunks
+        # already identified as superseded into synthesis. They remain available in
+        # diagnostics/retrieval logs but cannot silently win by cleaner OCR wording.
+        has_current_authority = any(
+            "current-authority-span" in item.method or "current-explicit-wording" in item.method
+            for item in adjusted
+        )
+        if has_current_authority:
+            adjusted = [item for item in adjusted if "superseded-" not in item.method]
+
         adjusted.sort(
             key=lambda item: (
                 0 if "terminology-definition" in item.method else 1,
+                0 if "current-authority-span" in item.method else 1,
+                0 if "current-explicit-wording" in item.method else 1,
+                0 if "authority-anchor" in item.method else 1,
+                0 if "structured-value" in item.method else 1,
                 0 if "current-amendment-context" in item.method else 1,
-                0 if "amendment-authority-anchor" in item.method else 1,
                 -item.score,
             )
         )
@@ -442,25 +476,33 @@ def install_smart_rag_patch() -> None:
         )
         restored = restore_original_chunks(selected, originals)
 
-        # Some evidence is navigationally essential even if its wording has low
-        # lexical overlap with the user question. Keep the exact acronym-definition
-        # chunk and the explicit amendment/substitution anchor in the final context.
+        # Some chunks are essential navigation/structure evidence even when their
+        # wording has little lexical overlap with a colloquial user question.
         definition_forced = [
-            item
-            for item in adjusted
+            item for item in adjusted
             if definition_aliases and "terminology-definition" in item.method
         ]
-        current_amendment_forced = [
-            item for item in adjusted if "current-amendment-context" in item.method
-        ][:_int_env("SMART_RAG_CURRENT_AMENDMENT_CONTEXT_CHUNKS", 12, 2, 24)]
+        current_authority_forced = [
+            item for item in adjusted
+            if "current-authority-span" in item.method or "current-explicit-wording" in item.method
+        ][:_int_env("SMART_RAG_CURRENT_AUTHORITY_CONTEXT_CHUNKS", 16, 4, 32)]
         authority_forced = [
-            item for item in adjusted if "amendment-authority-anchor" in item.method
-        ][:4]
-        forced = [*definition_forced, *current_amendment_forced, *authority_forced]
+            item for item in adjusted if "authority-anchor" in item.method
+        ][:6]
+        structured_forced = []
+        if value_lookup_request(current_question):
+            structured_forced = [
+                item for item in adjusted
+                if "smart-structured-value" in item.method and "superseded-" not in item.method
+            ][:_int_env("SMART_RAG_STRUCTURED_VALUE_CONTEXT_CHUNKS", 12, 4, 24)]
+
+        forced = [*definition_forced, *current_authority_forced, *authority_forced, *structured_forced]
         merged = []
         seen_ids: set[str] = set()
         for item in [*forced, *restored]:
             if item.chunk.chunk_id in seen_ids:
+                continue
+            if has_current_authority and "superseded-" in item.method:
                 continue
             seen_ids.add(item.chunk.chunk_id)
             merged.append(item)
@@ -480,6 +522,78 @@ def install_smart_rag_patch() -> None:
             logger.exception("Document processed, but smart derived-index refresh failed for %s", getattr(result, "id", "?"))
         return result
 
+    def smart_synthesize_answer(plan, results, *, primary_document_ids=None, primary_document_names=None):  # type: ignore[no-untyped-def]
+        """Use deterministic synthesis only where source text fully determines the answer.
+
+        Acronym/full-form answers are exact strings from original definition chunks;
+        the LLM is not allowed to paraphrase them into plausible-but-wrong expansions.
+        Other intents continue through the existing grounded synthesis pipeline.
+        """
+        definition_aliases = _CURRENT_DEFINITION_ALIASES.get()
+        current_question = _CURRENT_ORIGINAL_QUESTION.get() or plan.original_question
+        filtered_results = list(results)
+        if value_lookup_request(current_question) and any(
+            "current-authority-span" in item.method or "current-explicit-wording" in item.method
+            for item in filtered_results
+        ):
+            filtered_results = [item for item in filtered_results if "superseded-" not in item.method]
+
+        if definition_aliases and plan.intent == "definition":
+            primary_ids = set(primary_document_ids or ())
+            primary_names = list(primary_document_names or ())
+            sources = synthesis_module._prompt_sources(plan, filtered_results, primary_ids)
+            definitions: dict[str, list[tuple[str, int]]] = {}
+            for alias in definition_aliases:
+                canonical_to_source: dict[str, int] = {}
+                canonical_case: dict[str, str] = {}
+                for number, source in enumerate(sources, 1):
+                    canonical = definition_for_token(source.excerpt, alias)
+                    if not canonical:
+                        continue
+                    key = " ".join(canonical.casefold().split())
+                    canonical_to_source.setdefault(key, number)
+                    canonical_case.setdefault(key, canonical)
+                if canonical_to_source:
+                    definitions[alias] = [
+                        (canonical_case[key], number)
+                        for key, number in canonical_to_source.items()
+                    ]
+
+            # Deterministic mode is used only when every requested target has an
+            # explicit source definition. Partial coverage falls back to the normal
+            # grounded model rather than inventing the missing expansion.
+            if len(definitions) == len(definition_aliases):
+                lines: list[str] = []
+                multi = len(definition_aliases) > 1
+                for alias in definition_aliases:
+                    values = definitions[alias]
+                    if len(values) == 1:
+                        canonical, source_number = values[0]
+                        sentence = f"{alias} stands for {canonical}. [S{source_number}]"
+                    else:
+                        alternatives = "; ".join(
+                            f"{canonical} [S{source_number}]" for canonical, source_number in values[:3]
+                        )
+                        sentence = (
+                            f"{alias} has more than one explicit expansion in the reviewed PDFs: "
+                            f"{alternatives}. The applicable meaning depends on document/scope."
+                        )
+                    lines.append(f"- {sentence}" if multi else sentence)
+                return synthesis_module.SynthesisBundle(
+                    raw_answer="\n".join(lines),
+                    sources=sources,
+                    used_hierarchy=False,
+                    primary_document_ids=frozenset(primary_ids),
+                    primary_document_names=tuple(primary_names),
+                )
+
+        return original_synthesize_answer(
+            plan,
+            filtered_results,
+            primary_document_ids=primary_document_ids,
+            primary_document_names=primary_document_names,
+        )
+
     def smart_source_header(source):  # type: ignore[no-untyped-def]
         header = original_source_header(source)
         notes = rule_notes_for_chunk(source.result.chunk.chunk_id, source.excerpt)
@@ -488,13 +602,23 @@ def install_smart_rag_patch() -> None:
             # e.g. user=4 to a source threshold of >=2 without pretending the PDF said 4.
             header += " | SYSTEM-DERIVED APPLICABILITY (not PDF text): " + " ".join(notes)
         method = source.result.method
+        if "current-authority-span" in method:
+            header += " | CURRENT AUTHORITY SPAN: original PDF text inside an explicitly substituted/replaced section"
+        if "current-explicit-wording" in method:
+            header += " | CURRENT EXPLICIT WORDING: this text matches replacement wording stated by an authority anchor"
+        if "superseded-" in method:
+            header += " | SUPERSEDED CANDIDATE: do not present this as current when current authority evidence is supplied"
+        if "smart-structured-value" in method:
+            header += " | STRUCTURED VALUE EVIDENCE: semantically matched numeric/table row; neighboring chunks may supply its header/unit"
         if "current-amendment-context" in method:
             header += (
                 " | SYSTEM-DERIVED AUTHORITY PROXIMITY (not PDF text): this excerpt is within "
                 "the configured local chunk window after an explicit amendment/substitution "
                 "anchor in the same PDF; use the anchor source itself to establish precedence"
             )
-        if "amendment-authority-anchor" in method:
+        if "authority-anchor" in method:
+            header += " | AUTHORITY ANCHOR: original PDF text explicitly replacing/substituting/omitting prior wording or a section"
+        elif "amendment-authority-anchor" in method:
             header += " | AUTHORITY ANCHOR: inspect this PDF text for explicit amendment/substitution wording"
         if "terminology-definition" in method:
             header += " | TERMINOLOGY DEFINITION SOURCE: this original PDF chunk was selected for the requested acronym/full form"
@@ -521,6 +645,7 @@ def install_smart_rag_patch() -> None:
     service_module.filter_hard_context_candidates = smart_filter_hard_context
     service_module.RagService._select_context_chunks = staticmethod(smart_select)
     service_module.RagService.process_document = smart_process_document
+    service_module.synthesize_answer = smart_synthesize_answer
 
     # Planner instance was imported before app lifespan; patch the class method so
     # the existing singleton immediately uses scenario compilation.
@@ -528,6 +653,7 @@ def install_smart_rag_patch() -> None:
     query_module.QueryPlanner.plan = smart_plan
 
     synthesis_module._compact_source_header = smart_source_header
+    synthesis_module.synthesize_answer = smart_synthesize_answer
     if "SYSTEM-DERIVED APPLICABILITY" not in synthesis_module._ANSWER_SYSTEM_PROMPT:
         synthesis_module._ANSWER_SYSTEM_PROMPT += """
 
@@ -550,6 +676,27 @@ SMART-RAG AUTHORITY PRECEDENCE:
 - SYSTEM-DERIVED AUTHORITY PROXIMITY is only a navigation hint. It cannot establish precedence by
   itself; confirm precedence from the cited AUTHORITY ANCHOR PDF text. If the evidence does not
   explicitly establish which version controls, state the conflict rather than choosing one.
+"""
+
+    if "SMART-RAG EVIDENCE-SET RELIABILITY" not in synthesis_module._ANSWER_SYSTEM_PROMPT:
+        synthesis_module._ANSWER_SYSTEM_PROMPT += """
+
+SMART-RAG EVIDENCE-SET RELIABILITY:
+- Treat a table row together with its adjacent STRUCTURED VALUE EVIDENCE chunks as one local
+  evidence unit when the PDF parser split the row from its heading, unit or column label. Do not
+  reject a correct numeric row merely because the word used by the user appears only in a nearby
+  heading or because the manual uses a more formal term.
+- Semantic retrieval is navigation, not authority. A colloquial user description may route to a
+  formal source row, but answer only when the source row is clearly the same concept. If two source
+  categories could plausibly fit, state the alternatives or the missing distinction instead of
+  silently choosing one.
+- A source header marked SUPERSEDED CANDIDATE must never be presented as the current requirement
+  when CURRENT AUTHORITY SPAN or CURRENT EXPLICIT WORDING evidence for the same affected subject is
+  supplied. Cite the original authority anchor when precedence matters.
+- For multi-part requests, answer every supported requested target separately. Do not begin with
+  'the excerpts do not define/specify' and then immediately provide the supposedly missing fact.
+  If useful evidence exists, state the supported fact directly; mention a limitation only for the
+  genuinely unresolved part.
 """
 
     _INSTALLED = True

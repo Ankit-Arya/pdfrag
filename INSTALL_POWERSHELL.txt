@@ -1,0 +1,30 @@
+Run these commands from C:\...\pdfrag in PowerShell.
+
+1. Extract the hotfix over the existing repository root:
+   Expand-Archive -Path .\pdfrag-smart-rag-reliability-hotfix-v2-20260817.zip -DestinationPath . -Force
+
+2. Verify the overlay and effective compose config:
+   powershell -ExecutionPolicy Bypass -File .\verify-reliability-hotfix.ps1
+
+3. Stop without deleting volumes:
+   docker compose -f docker-compose.yml -f docker-compose.smart-rag.yml down
+
+4. Build and start backend:
+   docker compose -f docker-compose.yml -f docker-compose.smart-rag.yml build backend
+   docker compose -f docker-compose.yml -f docker-compose.smart-rag.yml up -d backend
+
+5. Mandatory one-time derived-index backfill:
+   docker compose -f docker-compose.yml -f docker-compose.smart-rag.yml exec backend python -m app.rag.smart_backfill
+
+6. Diagnostics:
+   docker compose -f docker-compose.yml -f docker-compose.smart-rag.yml exec backend python -m app.rag.smart_diagnostics
+
+7. Start the full stack:
+   docker compose -f docker-compose.yml -f docker-compose.smart-rag.yml up -d
+
+8. Status/logs:
+   docker compose -f docker-compose.yml -f docker-compose.smart-rag.yml ps
+   docker compose -f docker-compose.yml -f docker-compose.smart-rag.yml logs --tail=150 backend
+
+DO NOT run `down -v`.
+DO NOT use Reprocess All merely to initialize this hotfix.

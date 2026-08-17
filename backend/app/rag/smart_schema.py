@@ -104,6 +104,33 @@ def ensure_smart_schema() -> None:
         """,
         "CREATE INDEX IF NOT EXISTS ix_rag_rules_document ON rag_rules(document_id)",
         "CREATE INDEX IF NOT EXISTS ix_rag_rules_field_tokens ON rag_rules USING gin(field_tokens)",
+        """
+        CREATE TABLE IF NOT EXISTS rag_authority_directives (
+            id bigserial PRIMARY KEY,
+            document_id uuid NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+            anchor_chunk_id uuid NOT NULL REFERENCES document_chunks(id) ON DELETE CASCADE,
+            anchor_chunk_index integer NOT NULL,
+            page_number integer NOT NULL,
+            directive_type varchar(32) NOT NULL,
+            target text NOT NULL DEFAULT '',
+            target_norm text NOT NULL DEFAULT '',
+            old_text text NOT NULL DEFAULT '',
+            old_norm text NOT NULL DEFAULT '',
+            new_text text NOT NULL DEFAULT '',
+            new_norm text NOT NULL DEFAULT '',
+            effective_year integer NULL,
+            span_start_chunk integer NOT NULL,
+            span_end_chunk integer NOT NULL,
+            confidence double precision NOT NULL DEFAULT 0.99,
+            evidence text NOT NULL DEFAULT '',
+            created_at timestamptz NOT NULL DEFAULT now(),
+            UNIQUE(anchor_chunk_id, directive_type, target_norm, old_norm, new_norm)
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS ix_rag_authority_document ON rag_authority_directives(document_id)",
+        "CREATE INDEX IF NOT EXISTS ix_rag_authority_target ON rag_authority_directives(target_norm)",
+        "CREATE INDEX IF NOT EXISTS ix_rag_authority_old ON rag_authority_directives(old_norm)",
+        "CREATE INDEX IF NOT EXISTS ix_rag_authority_span ON rag_authority_directives(document_id, span_start_chunk, span_end_chunk)",
     ]
 
     with engine.begin() as conn:
@@ -155,7 +182,7 @@ def ensure_smart_schema() -> None:
 
     try:
         with engine.begin() as conn:
-            for table in ("document_chunks", "rag_terminology", "rag_procedure_cards", "rag_rules"):
+            for table in ("document_chunks", "rag_terminology", "rag_procedure_cards", "rag_rules", "rag_authority_directives"):
                 conn.execute(text(f"ANALYZE {table}"))
     except Exception:
         logger.exception("Smart RAG ANALYZE failed; continuing")
