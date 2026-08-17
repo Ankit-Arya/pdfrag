@@ -14,7 +14,6 @@ from app.config import get_settings
 from app.db import SessionLocal, initialize_database
 from app.document_processing import recover_interrupted_processing
 from app.rag.embeddings import embedding_service
-from app.rag.smart_runtime import install_smart_rag_patch
 
 settings = get_settings()
 logging.basicConfig(
@@ -27,11 +26,6 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     initialize_database()
-    # Additive smart-RAG upgrade: HNSW/GIN retrieval, organisation terminology,
-    # scenario-aware rule matching and bounded context. Existing broad RAG remains
-    # available as a low-confidence fallback.
-    install_smart_rag_patch()
-
     with SessionLocal() as db:
         bootstrap_admin(db)
 
@@ -68,7 +62,7 @@ class CustomORJSONResponse(ORJSONResponse):
 
 app = FastAPI(
     title=settings.app_name,
-    version="2.1.0-smart-rag",
+    version="2.0.2",
     default_response_class=CustomORJSONResponse,
     lifespan=lifespan,
     docs_url="/api/docs",

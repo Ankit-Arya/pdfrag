@@ -1,0 +1,7 @@
+Repository: Ankit-Arya/pdfrag
+Base branch: main
+Base commit: 89162d856c568141c5863def73377342be3c786c
+Base commit message: Filter docs and search
+
+This overlay was prepared against the files/signatures at that commit.
+If HEAD is newer, compare backend/app/main.py before overwriting.
