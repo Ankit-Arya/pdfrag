@@ -1,0 +1,17 @@
+QA performed in hotfix build workspace on 2026-08-17:
+
+Command:
+PYTHONPATH=. pytest -q tests/test_smart_terminology_extract.py tests/test_smart_reasoning.py tests/test_smart_query_shapes.py
+
+Result:
+32 passed in 0.22s
+
+Command:
+python -m compileall -q app tests
+
+Result:
+PASS
+
+Notes:
+- The existing test_smart_reasoning.py was executed from the prerequisite Smart RAG patch and passed.
+- Full repository CI was not run because outbound GitHub cloning is unavailable in the build environment.

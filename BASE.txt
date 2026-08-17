@@ -1,0 +1,4 @@
+Repository: Ankit-Arya/pdfrag
+Inspected base commit: 89162d856c568141c5863def73377342be3c786c
+Prerequisite overlay: pdfrag-smart-rag-patch-89162d8.zip
+Hotfix date: 2026-08-17

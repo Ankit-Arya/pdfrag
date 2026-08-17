@@ -2,6 +2,7 @@ from __future__ import annotations
 
 # ruff: noqa: E501
 
+import contextvars
 import logging
 import os
 import re
@@ -19,15 +20,29 @@ from app.rag.scenario_reasoning import (
 )
 from app.rag.smart_index import index_document
 from app.rag.smart_retrieval import (
+    definition_evidence_chunks,
     fast_corpus_scan,
     fast_search_chunks,
+    retrieval_answerable,
     rule_notes_for_chunk,
+    structured_lookup_request,
 )
 from app.rag.smart_schema import ensure_smart_schema
-from app.rag.terminology import terminology_hints
+from app.rag.terminology import (
+    definition_request_aliases,
+    explicit_definition_hints,
+    is_definition_request,
+    terminology_hints,
+)
 
 logger = logging.getLogger(__name__)
 _INSTALLED = False
+_CURRENT_ORIGINAL_QUESTION: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "pdfrag_smart_original_question", default=""
+)
+_CURRENT_DEFINITION_ALIASES: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
+    "pdfrag_smart_definition_aliases", default=()
+)
 
 
 def _bool_env(name: str, default: bool) -> bool:
@@ -78,6 +93,7 @@ def install_smart_rag_patch() -> None:
     original_filter_hard_context = service_module.filter_hard_context_candidates
     original_process_document = service_module.RagService.process_document
     original_plan = query_module.QueryPlanner.plan
+    original_search_mode = service_module.deterministic_search_mode
     original_source_header = synthesis_module._compact_source_header
 
     def smart_find_abbreviation_hints(db, text_value, *, max_terms=None, chunks_per_term=None):  # type: ignore[no-untyped-def]
@@ -85,38 +101,93 @@ def install_smart_rag_patch() -> None:
         try:
             indexed = terminology_hints(db, text_value)
         except Exception:
-            logger.exception("Global terminology lookup failed; using legacy abbreviation scan")
+            logger.exception("Global terminology lookup failed; trying definition-aware fallback")
             indexed = []
         if indexed:
-            logger.info("smart_rag stage=terminology ms=%.1f hints=%d", (time.perf_counter() - started) * 1000, len(indexed))
+            logger.info(
+                "smart_rag stage=terminology ms=%.1f hints=%d",
+                (time.perf_counter() - started) * 1000,
+                len(indexed),
+            )
             return indexed
+
+        # Definition queries need a different fallback from ordinary abbreviation
+        # use. Scan explicitly definition-shaped occurrences so repeated phrases
+        # such as "BIC isolation" cannot consume the small legacy occurrence limit
+        # before "Brake Isolating Cock (BIC)" is reached.
+        if is_definition_request(text_value):
+            try:
+                definitions = explicit_definition_hints(db, text_value)
+            except Exception:
+                logger.exception("Definition-specific abbreviation scan failed")
+                definitions = []
+            if definitions:
+                logger.info(
+                    "smart_rag stage=terminology_definition_fallback ms=%.1f hints=%d",
+                    (time.perf_counter() - started) * 1000,
+                    len(definitions),
+                )
+                return definitions
+
         result = original_find_abbreviations(
             db,
             text_value,
             max_terms=max_terms,
             chunks_per_term=chunks_per_term,
         )
-        logger.info("smart_rag stage=terminology_legacy ms=%.1f hints=%d", (time.perf_counter() - started) * 1000, len(result))
+        logger.info(
+            "smart_rag stage=terminology_legacy ms=%.1f hints=%d",
+            (time.perf_counter() - started) * 1000,
+            len(result),
+        )
         return result
 
     def smart_plan(self, question, enabled=None, *, conversation_context=None, abbreviation_hints=None, routing_hints=None):  # type: ignore[no-untyped-def]
         started = time.perf_counter()
+        hints = abbreviation_hints or []
+        definition_aliases = tuple(definition_request_aliases(question, hints))
+        _CURRENT_ORIGINAL_QUESTION.set(question)
+        _CURRENT_DEFINITION_ALIASES.set(definition_aliases)
+
         plan = original_plan(
             self,
             question,
             enabled,
             conversation_context=conversation_context,
-            abbreviation_hints=abbreviation_hints,
+            abbreviation_hints=hints,
             routing_hints=routing_hints,
         )
+
+        # Bare acronyms and explicit "full form / what does X mean" requests are
+        # answer requests, not corpus-navigation requests. The source definition
+        # chunk is still retrieved and cited; the terminology index is navigation.
+        if definition_aliases:
+            plan = replace(
+                plan,
+                intent="definition",
+                search_mode="answer",
+                response_mode="concise",
+                focus_terms=list(dict.fromkeys([*definition_aliases, *plan.focus_terms]))[:48],
+            )
+        elif structured_lookup_request(question):
+            # "compensation amount for different injuries" is a category/value
+            # lookup, not one scalar fact. Let the existing list synthesizer retain
+            # the relevant schedule rows instead of collapsing them to one sentence.
+            plan = replace(plan, intent="list", search_mode="answer", response_mode="concise")
+
         scenario = compile_scenario(
             plan.contextual_question or plan.rewritten_question or plan.original_question,
-            abbreviation_hints or [],
+            hints,
         )
         set_current_scenario(scenario)
         max_variants = _int_env("SMART_RAG_QUERY_VARIANTS", 3, 1, 6)
         queries: list[str] = []
-        candidate_queries = [scenario.canonical_question]
+        candidate_queries: list[str] = []
+        if definition_aliases:
+            # Put the exact acronym first; canonical expansion from document-grounded
+            # hints follows naturally in scenario.canonical_question.
+            candidate_queries.extend(definition_aliases)
+        candidate_queries.append(scenario.canonical_question)
         if scenario.is_situational:
             candidate_queries.append(scenario_relaxed_query(scenario))
         candidate_queries.extend(plan.search_queries)
@@ -128,10 +199,11 @@ def install_smart_rag_patch() -> None:
             if len(queries) >= max_variants:
                 break
         logger.info(
-            "smart_rag stage=planner ms=%.1f intent=%s situational=%s variants=%d numeric_facts=%d states=%d",
+            "smart_rag stage=planner ms=%.1f intent=%s situational=%s definition=%s variants=%d numeric_facts=%d states=%d",
             (time.perf_counter() - started) * 1000,
             plan.intent,
             scenario.is_situational,
+            bool(definition_aliases),
             len(queries),
             len(scenario.numeric_facts),
             len(scenario.states) + len(scenario.inferred_states),
@@ -141,26 +213,78 @@ def install_smart_rag_patch() -> None:
     def smart_search(db, query_vector, query_text, limit):  # type: ignore[no-untyped-def]
         started = time.perf_counter()
         result = fast_search_chunks(db, query_vector, query_text, limit)
+
+        definition_aliases = _CURRENT_DEFINITION_ALIASES.get()
+        if definition_aliases:
+            try:
+                definition_rows = definition_evidence_chunks(
+                    db,
+                    _CURRENT_ORIGINAL_QUESTION.get() or query_text,
+                    aliases=definition_aliases,
+                    limit=min(8, max(2, limit)),
+                )
+            except Exception:
+                logger.exception("Definition evidence retrieval failed")
+                definition_rows = []
+            if definition_rows:
+                merged: dict[str, object] = {}
+                ordered = [*definition_rows, *result]
+                deduped = []
+                for item in ordered:
+                    if item.chunk.chunk_id in merged:
+                        continue
+                    merged[item.chunk.chunk_id] = item
+                    deduped.append(item)
+                    if len(deduped) >= limit:
+                        break
+                result = deduped
+
         fallback_score = _float_env("SMART_RAG_BROAD_FALLBACK_SCORE", 0.12)
-        if (
-            _bool_env("SMART_RAG_ALLOW_BROAD_FALLBACK", True)
-            and (not result or float(result[0].score) < fallback_score)
-        ):
+        answerable = retrieval_answerable(_CURRENT_ORIGINAL_QUESTION.get() or query_text, result)
+        needs_fallback = (
+            not result
+            or float(result[0].score) < fallback_score
+            or not answerable
+            or (bool(definition_aliases) and not any("terminology-definition" in item.method for item in result))
+        )
+        if _bool_env("SMART_RAG_ALLOW_BROAD_FALLBACK", True) and needs_fallback:
             logger.warning(
-                "Smart retrieval confidence low (top=%.3f); using bounded legacy fallback",
+                "Smart retrieval fallback: top=%.3f answerable=%s definition=%s",
                 float(result[0].score) if result else 0.0,
+                answerable,
+                bool(definition_aliases),
             )
-            result = original_search_chunks(
+            legacy = original_search_chunks(
                 db,
                 query_vector,
                 query_text,
                 min(limit, _int_env("SMART_RAG_LEGACY_FALLBACK_LIMIT", 160, 40, 500)),
             )
+            # Merge instead of replacing the smart set. Otherwise a fallback can
+            # discard the amendment anchor or exact acronym definition that caused
+            # the smart path to be more trustworthy than the broad legacy ranking.
+            by_id = {item.chunk.chunk_id: item for item in result}
+            for item in legacy:
+                current = by_id.get(item.chunk.chunk_id)
+                if current is None or item.score > current.score:
+                    by_id[item.chunk.chunk_id] = item
+            result = sorted(
+                by_id.values(),
+                key=lambda item: (
+                    0 if "terminology-definition" in item.method else 1,
+                    0 if "current-amendment-context" in item.method else 1,
+                    0 if "amendment-authority-anchor" in item.method else 1,
+                    -float(item.score),
+                    item.chunk.filename.casefold(),
+                    item.chunk.page_number,
+                ),
+            )[:limit]
         logger.info(
-            "smart_rag stage=hybrid_retrieval ms=%.1f candidates=%d top=%.3f",
+            "smart_rag stage=hybrid_retrieval ms=%.1f candidates=%d top=%.3f answerable=%s",
             (time.perf_counter() - started) * 1000,
             len(result),
             float(result[0].score) if result else 0.0,
+            retrieval_answerable(_CURRENT_ORIGINAL_QUESTION.get() or query_text, result),
         )
         return result
 
@@ -285,6 +409,9 @@ def install_smart_rag_patch() -> None:
 
     def smart_select(plan, candidates, max_chunks=None, *, preferred_document_ids=None):  # type: ignore[no-untyped-def]
         cap = _int_env("SMART_RAG_FINAL_CONTEXT_CHUNKS", 48, 12, 120)
+        definition_aliases = _CURRENT_DEFINITION_ALIASES.get()
+        effective_cap = min(cap, 12) if definition_aliases else cap
+        requested_cap = min(max_chunks or effective_cap, effective_cap)
         scenario = current_scenario()
         adjusted = []
         for item in candidates:
@@ -298,15 +425,48 @@ def install_smart_rag_patch() -> None:
                 adjusted.append(replace(item, score=max(0.0, min(1.0, item.score + boost)), method=method))
             else:
                 adjusted.append(item)
-        adjusted.sort(key=lambda item: -item.score)
+        adjusted.sort(
+            key=lambda item: (
+                0 if "terminology-definition" in item.method else 1,
+                0 if "current-amendment-context" in item.method else 1,
+                0 if "amendment-authority-anchor" in item.method else 1,
+                -item.score,
+            )
+        )
         enriched, originals = relevance_enriched_candidates(adjusted)
         selected = original_select(
             relevance_plan(plan),
             enriched,
-            max_chunks=min(max_chunks or cap, cap),
+            max_chunks=requested_cap,
             preferred_document_ids=preferred_document_ids,
         )
-        return restore_original_chunks(selected, originals)
+        restored = restore_original_chunks(selected, originals)
+
+        # Some evidence is navigationally essential even if its wording has low
+        # lexical overlap with the user question. Keep the exact acronym-definition
+        # chunk and the explicit amendment/substitution anchor in the final context.
+        definition_forced = [
+            item
+            for item in adjusted
+            if definition_aliases and "terminology-definition" in item.method
+        ]
+        current_amendment_forced = [
+            item for item in adjusted if "current-amendment-context" in item.method
+        ][:_int_env("SMART_RAG_CURRENT_AMENDMENT_CONTEXT_CHUNKS", 12, 2, 24)]
+        authority_forced = [
+            item for item in adjusted if "amendment-authority-anchor" in item.method
+        ][:4]
+        forced = [*definition_forced, *current_amendment_forced, *authority_forced]
+        merged = []
+        seen_ids: set[str] = set()
+        for item in [*forced, *restored]:
+            if item.chunk.chunk_id in seen_ids:
+                continue
+            seen_ids.add(item.chunk.chunk_id)
+            merged.append(item)
+            if len(merged) >= requested_cap:
+                break
+        return merged
 
     def smart_process_document(self, db, document):  # type: ignore[no-untyped-def]
         result = original_process_document(self, db, document)
@@ -327,10 +487,29 @@ def install_smart_rag_patch() -> None:
             # This is explicitly marked as derived. It helps the answer model apply
             # e.g. user=4 to a source threshold of >=2 without pretending the PDF said 4.
             header += " | SYSTEM-DERIVED APPLICABILITY (not PDF text): " + " ".join(notes)
+        method = source.result.method
+        if "current-amendment-context" in method:
+            header += (
+                " | SYSTEM-DERIVED AUTHORITY PROXIMITY (not PDF text): this excerpt is within "
+                "the configured local chunk window after an explicit amendment/substitution "
+                "anchor in the same PDF; use the anchor source itself to establish precedence"
+            )
+        if "amendment-authority-anchor" in method:
+            header += " | AUTHORITY ANCHOR: inspect this PDF text for explicit amendment/substitution wording"
+        if "terminology-definition" in method:
+            header += " | TERMINOLOGY DEFINITION SOURCE: this original PDF chunk was selected for the requested acronym/full form"
         return header
+
+    def smart_deterministic_search_mode(original, contextual=None, intent=None):  # type: ignore[no-untyped-def]
+        current_question = _CURRENT_ORIGINAL_QUESTION.get()
+        active_aliases = _CURRENT_DEFINITION_ALIASES.get()
+        if (current_question and original.strip() == current_question.strip() and active_aliases) or is_definition_request(original):
+            return "answer"
+        return original_search_mode(original, contextual, intent)
 
     # Patch module globals actually referenced by RagService._ask_impl.
     service_module.find_abbreviation_hints = smart_find_abbreviation_hints
+    service_module.deterministic_search_mode = smart_deterministic_search_mode
     service_module.search_chunks = smart_search
     service_module.search_stemmed_chunks = smart_stemmed_search
     service_module.scan_matching_chunks = smart_scan
@@ -345,6 +524,7 @@ def install_smart_rag_patch() -> None:
 
     # Planner instance was imported before app lifespan; patch the class method so
     # the existing singleton immediately uses scenario compilation.
+    query_module.deterministic_search_mode = smart_deterministic_search_mode
     query_module.QueryPlanner.plan = smart_plan
 
     synthesis_module._compact_source_header = smart_source_header
@@ -356,6 +536,20 @@ comparisons of facts stated by the user against explicit numeric conditions foun
 excerpt (for example, user reports 4 affected brakes and the source says 2 or more). You may use a
 TRUE derived comparison to decide that the cited rule applies, but cite the underlying PDF source,
 state the comparison briefly when material, and never turn an uncertain semantic inference into a fact.
+"""
+
+    if "SMART-RAG AUTHORITY PRECEDENCE" not in synthesis_module._ANSWER_SYSTEM_PROMPT:
+        synthesis_module._ANSWER_SYSTEM_PROMPT += """
+
+SMART-RAG AUTHORITY PRECEDENCE:
+- A TERMINOLOGY DEFINITION SOURCE is original PDF evidence. For acronym/full-form questions, answer
+  from that definition instead of treating usage-only occurrences as a definition.
+- AUTHORITY ANCHOR source text may explicitly state that a rule, amount, provision or schedule is
+  amended or substituted. When the PDF explicitly establishes that replacement relationship, use the
+  amended/substituted text for the affected subject and do not report the superseded value as current.
+- SYSTEM-DERIVED AUTHORITY PROXIMITY is only a navigation hint. It cannot establish precedence by
+  itself; confirm precedence from the cited AUTHORITY ANCHOR PDF text. If the evidence does not
+  explicitly establish which version controls, state the conflict rather than choosing one.
 """
 
     _INSTALLED = True

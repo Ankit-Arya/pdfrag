@@ -1,63 +1,11 @@
-pdfrag Smart Scenario RAG patch manifest
-========================================
-
-Base repository
----------------
-Ankit-Arya/pdfrag
-main @ 89162d856c568141c5863def73377342be3c786c
-
-Existing application file replaced
-----------------------------------
-backend/app/main.py
-
-Original copy included for code rollback
-----------------------------------------
-ROLLBACK/backend/app/main.py
-
-New backend modules
--------------------
-backend/app/rag/scenario_reasoning.py
-backend/app/rag/smart_backfill.py
-backend/app/rag/smart_diagnostics.py
-backend/app/rag/smart_index.py
+HOTFIX_README.md
+HOTFIX.patch
+BASE.txt
+QA_RESULTS.txt
+PATCH_MANIFEST.txt
+CHECKSUMS.sha256
+backend/app/rag/terminology.py
 backend/app/rag/smart_retrieval.py
 backend/app/rag/smart_runtime.py
-backend/app/rag/smart_schema.py
-backend/app/rag/terminology.py
-
-New focused tests
------------------
-backend/tests/test_smart_reasoning.py
 backend/tests/test_smart_terminology_extract.py
-
-Deployment/config additions
----------------------------
-docker-compose.smart-rag.yml
-.env.smart-rag.example
-INSTALL.txt
-SMART_RAG_PATCH_README.md
-BASE_COMMIT.txt
-
-Additive PostgreSQL objects created at runtime
-----------------------------------------------
-rag_terminology
-rag_procedure_cards
-rag_rules
-HNSW indexes for chunk/procedure-card embeddings when supported
-GIN indexes for simple/English full-text search
-
-Validation performed while building this ZIP
---------------------------------------------
-- Python compileall passed for supplied app/test files.
-- 19 focused smart-RAG tests passed.
-- Static unused-import/trailing-whitespace checks passed.
-- The patch was built against current GitHub file signatures at the base commit.
-
-Important
----------
-The complete upstream repository test suite was not executed in the build container because
-that container could not clone the repository over the network. Run your normal CI/backend
-suite after overlaying this patch and before production deployment.
-
-This patch does not re-OCR or rechunk existing PDFs. Run the supplied smart_backfill command
-after deployment to build derived terminology/procedure/rule indexes from existing chunks.
+backend/tests/test_smart_query_shapes.py

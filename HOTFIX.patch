@@ -1,0 +1,1176 @@
+# pdfrag Smart RAG hotfix diff
+# Base: pdfrag-smart-rag-patch-89162d8.zip
+
+--- a/backend/app/rag/terminology.py
++++ b/backend/app/rag/terminology.py
+@@ -3,6 +3,7 @@
+ # ruff: noqa: E501
+ 
+ import re
++from collections.abc import Iterable
+ from dataclasses import dataclass
+ 
+ from sqlalchemy import text
+@@ -10,10 +11,24 @@
+ 
+ _TOKEN_RE = re.compile(r"(?<![A-Za-z0-9])([A-Za-z][A-Za-z0-9]{1,9})(?![A-Za-z0-9])")
+ _DOC_CODE_RE = re.compile(r"\b(?:SC|SM|SOP|JPO|INST(?:RUCTION)?|MRGR)(?:\s*[-_/]\s*|\s+)\d+[A-Z]?\b", re.IGNORECASE)
++_BARE_ACRONYM_RE = re.compile(r"^[A-Z][A-Z0-9]{1,9}$")
++_DEFINITION_CUE_RE = re.compile(
++    r"\b(?:full\s+form|stands?\s+for|meaning|means|define|definition|expand|expansion)\b",
++    re.IGNORECASE,
++)
++_DEFINITION_TARGET_PATTERNS = (
++    re.compile(r"\bfull\s+form\s+(?:of\s+)?(?P<alias>[A-Za-z][A-Za-z0-9]{1,9})\b", re.IGNORECASE),
++    re.compile(r"\b(?P<alias>[A-Za-z][A-Za-z0-9]{1,9})\s+(?:full\s+form|meaning|means|stands?\s+for)\b", re.IGNORECASE),
++    re.compile(r"^\s*what\s+is\s+(?P<alias>[A-Za-z][A-Za-z0-9]{1,9})\s*[?.!]*\s*$", re.IGNORECASE),
++    re.compile(r"\bwhat\s+is\s+the\s+full\s+form\s+of\s+(?P<alias>[A-Za-z][A-Za-z0-9]{1,9})\b", re.IGNORECASE),
++    re.compile(r"\bwhat\s+does\s+(?P<alias>[A-Za-z][A-Za-z0-9]{1,9})\s+mean\b", re.IGNORECASE),
++    re.compile(r"\b(?:define|expand)\s+(?P<alias>[A-Za-z][A-Za-z0-9]{1,9})\b", re.IGNORECASE),
++)
+ _STOP = {
+     "if", "in", "is", "it", "of", "on", "or", "to", "do", "go", "no", "so", "up",
+     "and", "are", "can", "for", "from", "has", "have", "how", "the", "this", "what",
+     "when", "where", "which", "with", "would", "should", "train", "line", "status",
++    "full", "form", "meaning", "means", "define", "definition", "expand", "expansion",
+ }
+ 
+ 
+@@ -31,6 +46,23 @@
+     return " ".join(re.findall(r"[A-Za-z0-9]+", value.casefold()))
+ 
+ 
++def _hint_aliases(hints: Iterable[str]) -> list[str]:
++    result: list[str] = []
++    seen: set[str] = set()
++    for hint in hints:
++        if "=" not in hint:
++            continue
++        alias = " ".join(hint.split("=", 1)[0].split()).strip()
++        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9]{1,9}", alias):
++            continue
++        key = alias.casefold()
++        if key in seen:
++            continue
++        seen.add(key)
++        result.append(alias)
++    return result
++
++
+ def candidate_aliases(value: str) -> list[str]:
+     without_codes = _DOC_CODE_RE.sub(" ", value)
+     result: list[str] = []
+@@ -43,7 +75,7 @@
+         if lowered in _STOP and not token.isupper():
+             continue
+         # Prefer explicit uppercase acronyms, while still allowing users to type
+-        # known short aliases in lowercase ("sc", "occ").  Database lookup is the
++        # known short aliases in lowercase ("sc", "occ"). Database lookup is the
+         # authority; unknown ordinary words simply return no rows.
+         if not (token.isupper() or 2 <= len(token) <= 5):
+             continue
+@@ -52,6 +84,59 @@
+     return result[:12]
+ 
+ 
++def definition_request_aliases(value: str, hints: Iterable[str] = ()) -> list[str]:
++    """Return acronym/short-term targets when the user is asking for a definition.
++
++    Bare uppercase acronyms are treated as definition requests. Lowercase bare terms
++    are only promoted when corpus-derived abbreviation hints already establish that
++    the token is an organisation abbreviation. Explicit cues such as ``full form``
++    work in either case.
++    """
++    normalized = " ".join(value.split()).strip()
++    if not normalized or _DOC_CODE_RE.fullmatch(normalized):
++        return []
++
++    targets: list[str] = []
++    seen: set[str] = set()
++
++    def add(raw: str) -> None:
++        token = raw.strip()
++        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9]{1,9}", token):
++            return
++        lowered = token.casefold()
++        if lowered in _STOP or lowered in seen:
++            return
++        seen.add(lowered)
++        targets.append(token.upper() if token.isalpha() else token)
++
++    for pattern in _DEFINITION_TARGET_PATTERNS:
++        for match in pattern.finditer(normalized):
++            add(match.group("alias"))
++
++    if _BARE_ACRONYM_RE.fullmatch(normalized):
++        add(normalized)
++
++    hinted = _hint_aliases(hints)
++    if len(normalized.split()) == 1:
++        for alias in hinted:
++            if alias.casefold() == normalized.casefold():
++                add(alias)
++
++    # For phrasing such as ``BIC full form`` the regex above catches the target.
++    # If a definition cue is present but unusual word order is used, fall back to
++    # explicit uppercase candidates rather than treating "full"/"form" as aliases.
++    if _DEFINITION_CUE_RE.search(normalized):
++        for token in candidate_aliases(normalized):
++            if token.isupper():
++                add(token)
++
++    return targets[:6]
++
++
++def is_definition_request(value: str, hints: Iterable[str] = ()) -> bool:
++    return bool(definition_request_aliases(value, hints))
++
++
+ def resolve_terms(db: Session, value: str) -> list[ResolvedTerm]:
+     aliases = candidate_aliases(value)
+     if not aliases:
+@@ -175,6 +260,99 @@
+     return result[:16]
+ 
+ 
++def _definition_for_token(text_value: str, token: str) -> str:
++    escaped = re.escape(token)
++    word = r"[A-Za-z][A-Za-z0-9/&.'-]*"
++    before = re.compile(
++        rf"((?:{word}[ \t]+){{1,7}}{word})[ \t]*\([ \t]*{escaped}[ \t]*\)",
++        re.IGNORECASE,
++    )
++    after = re.compile(
++        rf"(?<![A-Za-z0-9]){escaped}[ \t]*\([ \t]*((?:{word}[ \t]+){{0,7}}{word})[ \t]*\)",
++        re.IGNORECASE,
++    )
++    direct = re.compile(
++        rf"(?im)(?<![A-Za-z0-9]){escaped}[ \t]*(?:[-:–—]|means\b|stands\s+for\b)[ \t]*"
++        rf"((?:{word}[ \t]+){{0,7}}{word})"
++    )
++    table = re.compile(
++        rf"(?im)^\s*\|?\s*{escaped}\s*\|\s*((?:{word}[ \t]+){{0,7}}{word})\s*\|?\s*$"
++    )
++    for pattern in (before, after, direct, table):
++        match = pattern.search(text_value[:16000])
++        if not match:
++            continue
++        expansion = re.sub(r"\s+", " ", match.group(1)).strip(" -,:;|")
++        if 3 <= len(expansion) <= 120 and expansion.casefold() != token.casefold():
++            return expansion
++    return ""
++
++
++def explicit_definition_hints(
++    db: Session,
++    value: str,
++    *,
++    existing_hints: Iterable[str] = (),
++    max_chunks_per_alias: int = 120,
++) -> list[str]:
++    """Definition-specific corpus fallback for incomplete terminology backfills.
++
++    The legacy abbreviation scan orders by filename/page and can exhaust its small
++    limit on usage-only occurrences (``BIC isolation``) before reaching a definition.
++    This path explicitly prioritises parenthetical/definition-shaped occurrences.
++    """
++    aliases = definition_request_aliases(value, existing_hints)
++    if not aliases:
++        aliases = [token for token in candidate_aliases(value) if token.isupper()]
++    result: list[str] = []
++    seen: set[tuple[str, str]] = set()
++
++    sql = text(
++        """
++        SELECT c.text, c.page_number, d.filename
++        FROM document_chunks c
++        JOIN documents d ON d.id = c.document_id
++        WHERE d.status = 'ready'
++          AND c.text ~* :token_pattern
++        ORDER BY
++          CASE
++            WHEN c.text ~* :paren_pattern THEN 0
++            WHEN c.text ~* :leading_pattern THEN 1
++            WHEN c.text ~* :direct_pattern THEN 2
++            ELSE 3
++          END,
++          lower(d.filename), c.page_number, c.chunk_index
++        LIMIT :chunk_limit
++        """
++    )
++
++    for alias in aliases[:6]:
++        escaped = re.escape(alias)
++        token_pattern = rf"(^|[^A-Za-z0-9]){escaped}([^A-Za-z0-9]|$)"
++        params = {
++            "token_pattern": token_pattern,
++            "paren_pattern": rf"\([[:space:]]*{escaped}[[:space:]]*\)",
++            "leading_pattern": rf"(^|[^A-Za-z0-9]){escaped}[[:space:]]*\(",
++            "direct_pattern": rf"(^|[^A-Za-z0-9]){escaped}[[:space:]]*([-:–—]|means|stands[[:space:]]+for)",
++            "chunk_limit": max_chunks_per_alias,
++        }
++        for row in db.execute(sql, params).mappings():
++            canonical = _definition_for_token(str(row["text"]), alias)
++            if not canonical:
++                continue
++            pair = (_norm(alias), _norm(canonical))
++            if pair in seen:
++                continue
++            seen.add(pair)
++            result.append(
++                f"{alias.upper()} = {canonical} — explicit PDF definition in "
++                f"{row['filename']} p.{int(row['page_number'])}"
++            )
++            if len(result) >= 12:
++                return result
++    return result
++
++
+ def canonicalize_query(db: Session, value: str) -> tuple[str, list[ResolvedTerm]]:
+     terms = resolve_terms(db, value)
+     dominant: list[ResolvedTerm] = []
+--- a/backend/app/rag/smart_retrieval.py
++++ b/backend/app/rag/smart_retrieval.py
+@@ -6,11 +6,13 @@
+ import re
+ from collections import defaultdict
+ from dataclasses import replace
++from collections.abc import Iterable
+ 
+ from sqlalchemy import text
+ from sqlalchemy.orm import Session
+ 
+ from app.rag.scenario_reasoning import current_scenario, logical_match_score
++from app.rag.terminology import definition_request_aliases
+ from app.rag.types import RetrievedChunk, TextChunk
+ 
+ _STOP = {
+@@ -19,6 +21,16 @@
+     "should", "that", "the", "this", "to", "was", "were", "what", "when", "where",
+     "which", "who", "why", "with", "would",
+ }
++_LOW_SIGNAL = {
++    "amount", "case", "different", "various", "accident", "metro", "system", "person",
++    "people", "given", "give", "much", "applicable", "detail", "details", "information",
++    "full", "form", "meaning", "mean", "define", "definition", "expand", "expansion",
++}
++_MONEY_TERMS = {"compensation", "claim", "payable", "payment"}
++_VERSION_SENSITIVE_TERMS = {
++    "compensation", "claim", "payable", "amount", "rate", "fee", "penalty", "allowance",
++    "schedule", "limit", "current", "latest", "revised", "revision", "amendment", "amended",
++}
+ _TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
+ 
+ 
+@@ -48,11 +60,26 @@
+     return result
+ 
+ 
++def _priority_terms(value: str) -> set[str]:
++    terms = _terms(value)
++    priority = {
++        term
++        for term in terms
++        if term not in _LOW_SIGNAL and not term.isdigit() and len(term) > 2
++    }
++    return priority or {term for term in terms if not term.isdigit()}
++
++
+ def _tsquery(value: str) -> str:
+     safe = sorted(term for term in _terms(value) if re.fullmatch(r"[a-z0-9]+", term))
+     return " | ".join(term if len(term) <= 3 or term.isdigit() else f"{term}:*" for term in safe[:48]) or "pdfrag_no_match"
+ 
+ 
++def _and_tsquery(terms: Iterable[str], *, limit: int = 5) -> str:
++    safe = sorted({term for term in terms if re.fullmatch(r"[a-z0-9]+", term)})[:limit]
++    return " & ".join(term if len(term) <= 3 else f"{term}:*" for term in safe) or "pdfrag_no_match"
++
++
+ def _lexical(query: str, source: str) -> float:
+     query_terms = _terms(query)
+     if not query_terms:
+@@ -61,6 +88,72 @@
+     return min(1.0, len(query_terms & source_terms) / max(1, len(query_terms)))
+ 
+ 
++def _weighted_lexical(query: str, source: str) -> float:
++    all_score = _lexical(query, source)
++    priority = _priority_terms(query)
++    if not priority:
++        return all_score
++    source_terms = _terms(source[:12000])
++    priority_score = len(priority & source_terms) / max(1, len(priority))
++    return min(1.0, priority_score * 0.74 + all_score * 0.26)
++
++
++def _money_lookup_query(value: str) -> bool:
++    terms = _terms(value)
++    return bool(terms & _MONEY_TERMS)
++
++
++def _version_sensitive_query(value: str) -> bool:
++    terms = _terms(value)
++    return bool(terms & _VERSION_SENSITIVE_TERMS)
++
++
++def is_amendment_anchor_text(value: str) -> bool:
++    folded = " ".join(value.casefold().split())
++    return (
++        "shall be substituted" in folded
++        or "amendment rules" in folded
++        or ("rules, 2025" in folded and "amendment" in folded)
++    )
++
++
++def structured_lookup_request(value: str) -> bool:
++    """Detect category-to-value/list requests such as compensation by injury type."""
++    lowered = value.casefold()
++    terms = _terms(value)
++    if not (terms & _MONEY_TERMS):
++        return False
++    return bool(
++        {"different", "various", "each", "type", "category", "injury", "injuries"}
++        & set(_TOKEN_RE.findall(lowered))
++    )
++
++
++def retrieval_answerable(query_text: str, results: list[RetrievedChunk]) -> bool:
++    """Check whether retrieved evidence has the shape required by the question.
++
++    Similar accident/injury prose is not enough for a monetary compensation lookup;
++    at least one candidate must actually contain a compensation/claim cue and a
++    monetary-looking number. Other query types retain the normal top-score logic.
++    """
++    if not results:
++        return False
++    if not _money_lookup_query(query_text):
++        return True
++    priority = _priority_terms(query_text)
++    for item in results[:80]:
++        body = item.chunk.text
++        folded = body.casefold()
++        if not re.search(r"\b(?:compensation|payable|claim)\b", folded):
++            continue
++        if not re.search(r"\b\d[\d,]{3,}\b", body):
++            continue
++        source_terms = _terms(body[:12000])
++        if not priority or len(priority & source_terms) >= min(2, len(priority)):
++            return True
++    return False
++
++
+ def _row_result(row: object, *, score: float, method: str, vector_score: float, keyword_score: float) -> RetrievedChunk:
+     return RetrievedChunk(
+         chunk=TextChunk(
+@@ -79,6 +172,107 @@
+     )
+ 
+ 
++def definition_evidence_chunks(
++    db: Session,
++    query_text: str,
++    *,
++    aliases: Iterable[str] = (),
++    limit: int = 8,
++) -> list[RetrievedChunk]:
++    """Fetch original PDF chunks that explicitly define requested abbreviations."""
++    requested = list(aliases) or definition_request_aliases(query_text)
++    normalized: list[str] = []
++    seen: set[str] = set()
++    for alias in requested:
++        norm = " ".join(re.findall(r"[A-Za-z0-9]+", str(alias).casefold()))
++        if not norm or norm in seen:
++            continue
++        seen.add(norm)
++        normalized.append(norm)
++    if not normalized:
++        return []
++
++    params: dict[str, object] = {"limit": max(1, min(30, limit))}
++    placeholders: list[str] = []
++    for index, norm in enumerate(normalized[:8]):
++        key = f"alias{index}"
++        params[key] = norm
++        placeholders.append(f":{key}")
++
++    rows = list(
++        db.execute(
++            text(
++                f"""
++                SELECT c.id, c.document_id, c.chunk_index, c.page_number, c.content_type,
++                       c.text, d.filename, t.alias, t.canonical_name, t.confidence, t.verified
++                FROM rag_terminology t
++                JOIN document_chunks c ON c.id = t.chunk_id
++                JOIN documents d ON d.id = c.document_id
++                WHERE d.status = 'ready'
++                  AND t.alias_norm IN ({', '.join(placeholders)})
++                ORDER BY t.verified DESC, t.confidence DESC, lower(d.filename), c.page_number, c.chunk_index
++                LIMIT :limit
++                """
++            ),
++            params,
++        ).mappings()
++    )
++    results = [
++        _row_result(
++            row,
++            score=1.0 if bool(row["verified"]) else 0.995,
++            method="direct-terminology-definition",
++            vector_score=0.0,
++            keyword_score=0.99,
++        )
++        for row in rows
++    ]
++    if results:
++        return _diverse(results, limit)
++
++    # Backfill may be missing or stale. Search definition-shaped occurrences
++    # directly rather than accepting the first arbitrary BIC/SC/OCC usages.
++    fallback: list[RetrievedChunk] = []
++    for alias in requested[:6]:
++        escaped = re.escape(str(alias))
++        sql = text(
++            """
++            SELECT c.id, c.document_id, c.chunk_index, c.page_number, c.content_type,
++                   c.text, d.filename
++            FROM document_chunks c
++            JOIN documents d ON d.id = c.document_id
++            WHERE d.status = 'ready'
++              AND (
++                c.text ~* :paren_pattern
++                OR c.text ~* :leading_pattern
++                OR c.text ~* :direct_pattern
++              )
++            ORDER BY lower(d.filename), c.page_number, c.chunk_index
++            LIMIT :limit
++            """
++        )
++        fallback_rows = db.execute(
++            sql,
++            {
++                "paren_pattern": rf"\([[:space:]]*{escaped}[[:space:]]*\)",
++                "leading_pattern": rf"(^|[^A-Za-z0-9]){escaped}[[:space:]]*\(",
++                "direct_pattern": rf"(^|[^A-Za-z0-9]){escaped}[[:space:]]*([-:–—]|means|stands[[:space:]]+for)",
++                "limit": max(8, limit * 4),
++            },
++        ).mappings()
++        for row in fallback_rows:
++            fallback.append(
++                _row_result(
++                    row,
++                    score=0.99,
++                    method="direct-terminology-definition-fallback",
++                    vector_score=0.0,
++                    keyword_score=0.96,
++                )
++            )
++    return _diverse(fallback, limit)
++
++
+ def route_procedure_documents(
+     db: Session,
+     query_vector: list[float],
+@@ -131,6 +325,68 @@
+     return dict(sorted(scores.items(), key=lambda item: (-item[1], item[0]))[:max_docs])
+ 
+ 
++def _mark_current_amendment_context(
++    db: Session,
++    collected: dict[str, dict[str, object]],
++    merge_row: object,
++) -> None:
++    """Mark candidates that sit immediately under an explicit amendment/substitution.
++
++    This does not invent revision precedence. It only tags a candidate when the same
++    source document contains a nearby preceding chunk that explicitly says amendment
++    or that a provision/schedule shall be substituted. The anchor chunk is also added
++    so the answer model can cite the actual replacement instruction.
++    """
++    if not collected:
++        return
++    chunk_ids = list(collected)[:600]
++    params: dict[str, object] = {"window": _int_env("SMART_RAG_AMENDMENT_WINDOW_CHUNKS", 12, 2, 40)}
++    placeholders: list[str] = []
++    for index, chunk_id in enumerate(chunk_ids):
++        key = f"cid{index}"
++        params[key] = chunk_id
++        placeholders.append(f"CAST(:{key} AS uuid)")
++    rows = list(
++        db.execute(
++            text(
++                f"""
++                SELECT candidate.id AS candidate_id,
++                       anchor.id, anchor.document_id, anchor.chunk_index, anchor.page_number,
++                       anchor.content_type, anchor.text, d.filename
++                FROM document_chunks candidate
++                JOIN documents d ON d.id = candidate.document_id
++                JOIN LATERAL (
++                    SELECT a.*
++                    FROM document_chunks a
++                    WHERE a.document_id = candidate.document_id
++                      AND a.chunk_index BETWEEN GREATEST(0, candidate.chunk_index - :window) AND candidate.chunk_index
++                      AND (
++                        lower(a.text) LIKE '%shall be substituted%'
++                        OR lower(a.text) LIKE '%amendment rules%'
++                        OR lower(a.text) LIKE '%rules, 2025%amendment%'
++                      )
++                    ORDER BY candidate.chunk_index - a.chunk_index, a.chunk_index DESC
++                    LIMIT 1
++                ) anchor ON true
++                WHERE candidate.id IN ({', '.join(placeholders)})
++                """
++            ),
++            params,
++        ).mappings()
++    )
++    for row in rows:
++        candidate_id = str(row["candidate_id"])
++        entry = collected.get(candidate_id)
++        if entry is None:
++            continue
++        methods = entry["methods"]
++        assert isinstance(methods, set)
++        methods.add("current-amendment-context")
++        # ``merge_row`` is a local function in fast_search_chunks. Type is kept
++        # generic here to avoid introducing a callable protocol only for runtime QA.
++        merge_row(row, "smart-amendment-authority-anchor", keyword_score=0.99)  # type: ignore[operator]
++
++
+ def fast_search_chunks(
+     db: Session,
+     query_vector: list[float],
+@@ -139,14 +395,18 @@
+ ) -> list[RetrievedChunk]:
+     """Bounded hybrid retrieval designed for ~50k+ chunks.
+ 
+-    Unlike the original search, this never asks every document to contribute rows.
+-    It uses global HNSW/GIN retrieval, then a small procedure-card-routed document set.
++    Global ANN/GIN retrieval is supplemented by a high-signal AND query and by
++    amendment-context anchors for version-sensitive lookups. This protects recall
++    without restoring the old per-document exhaustive scans.
+     """
+     vector_k = _int_env("SMART_RAG_VECTOR_K", 90, 10, 500)
+     fts_k = _int_env("SMART_RAG_FTS_K", 90, 10, 500)
+     scoped_k = _int_env("SMART_RAG_SCOPED_K", 70, 10, 500)
++    priority_k = _int_env("SMART_RAG_PRIORITY_FTS_K", 80, 10, 300)
+     return_k = min(_int_env("SMART_RAG_MAX_CANDIDATES", 180, 20, 1000), max(20, limit))
+     tsq = _tsquery(query_text)
++    priority_terms = _priority_terms(query_text)
++    priority_tsq = _and_tsquery(priority_terms)
+     scenario = current_scenario()
+ 
+     routed_docs = route_procedure_documents(db, query_vector, query_text)
+@@ -170,7 +430,7 @@
+         entry["keyword"] = max(float(entry["keyword"]), keyword_score)
+ 
+     # Deterministic rule routing is the bridge for queries such as "4 brakes failed"
+-    # when the source says "2 or more brakes failed".  It does not depend on the
++    # when the source says "2 or more brakes failed". It does not depend on the
+     # exact user number being present in the source text.
+     if scenario is not None and scenario.numeric_facts:
+         rule_tokens = sorted({token for fact in scenario.numeric_facts for token in fact.tokens})[:32]
+@@ -241,6 +501,56 @@
+         for row in rows:
+             merge_row(row, f"smart-fts-{config}", keyword_score=float(row["keyword_score"] or 0.0))
+ 
++    # High-signal conjunction: generic words such as "accident" cannot swamp a
++    # rare subject such as "compensation" merely because the broad FTS query is OR.
++    if priority_terms:
++        rows = db.execute(
++            text(
++                """
++                WITH q AS (SELECT to_tsquery('simple', :tsq) AS query)
++                SELECT c.id, c.document_id, c.chunk_index, c.page_number, c.content_type, c.text, d.filename,
++                       LEAST(1.0, ts_rank_cd(to_tsvector('simple', c.text), q.query) * 5.0) AS keyword_score
++                FROM document_chunks c
++                JOIN documents d ON d.id = c.document_id
++                CROSS JOIN q
++                WHERE d.status = 'ready'
++                  AND to_tsvector('simple', c.text) @@ q.query
++                ORDER BY keyword_score DESC, c.id
++                LIMIT :limit
++                """
++            ),
++            {"tsq": priority_tsq, "limit": priority_k},
++        ).mappings()
++        for row in rows:
++            merge_row(row, "smart-priority-fts", keyword_score=max(0.70, float(row["keyword_score"] or 0.0)))
++            routed_docs[str(row["document_id"])] = max(0.92, routed_docs.get(str(row["document_id"]), 0.0))
++
++    # Monetary/table-shaped evidence is explicitly preferred for compensation
++    # questions. This is answer-shape retrieval, not an inferred amount.
++    if _money_lookup_query(query_text):
++        rows = db.execute(
++            text(
++                """
++                WITH q AS (SELECT to_tsquery('simple', :tsq) AS query)
++                SELECT c.id, c.document_id, c.chunk_index, c.page_number, c.content_type, c.text, d.filename,
++                       LEAST(1.0, ts_rank_cd(to_tsvector('simple', c.text), q.query) * 5.0) AS keyword_score
++                FROM document_chunks c
++                JOIN documents d ON d.id = c.document_id
++                CROSS JOIN q
++                WHERE d.status = 'ready'
++                  AND to_tsvector('simple', c.text) @@ q.query
++                  AND lower(c.text) ~ '(compensation|payable|claim)'
++                  AND c.text ~ '[0-9][0-9,]{3,}'
++                ORDER BY keyword_score DESC, c.id
++                LIMIT :limit
++                """
++            ),
++            {"tsq": _tsquery(query_text), "limit": _int_env("SMART_RAG_AMOUNT_TABLE_K", 80, 10, 250)},
++        ).mappings()
++        for row in rows:
++            merge_row(row, "smart-answer-shape-money", keyword_score=max(0.82, float(row["keyword_score"] or 0.0)))
++            routed_docs[str(row["document_id"])] = max(0.96, routed_docs.get(str(row["document_id"]), 0.0))
++
+     if routed_docs:
+         doc_params: dict[str, object] = {"embedding": str(query_vector), "tsq": tsq, "limit": scoped_k}
+         doc_placeholders: list[str] = []
+@@ -287,19 +597,38 @@
+         for row in rows:
+             merge_row(row, "smart-routed-fts", keyword_score=float(row["keyword_score"] or 0.0))
+ 
++    if _version_sensitive_query(query_text):
++        _mark_current_amendment_context(db, collected, merge_row)
++
+     results: list[RetrievedChunk] = []
+     for entry in collected.values():
+         row = entry["row"]
+         vector_score = float(entry["vector"])
+         keyword_score = float(entry["keyword"])
+-        lexical = _lexical(query_text, str(row["text"]))  # type: ignore[index]
++        lexical = _weighted_lexical(query_text, str(row["text"]))  # type: ignore[index]
+         document_boost = min(0.15, routed_docs.get(str(row["document_id"]), 0.0) * 0.15)  # type: ignore[index]
+         logical_boost = 0.0
+         if scenario is not None:
+             logical_boost, _ = logical_match_score(scenario, str(row["text"]))  # type: ignore[index]
+-        base = vector_score * 0.50 + keyword_score * 0.31 + lexical * 0.19
+-        score = max(0.0, min(1.0, base + document_boost + logical_boost))
+         methods = sorted(str(value) for value in entry["methods"])
++        priority_boost = 0.10 if "smart-priority-fts" in methods else 0.0
++        answer_shape_boost = 0.12 if "smart-answer-shape-money" in methods else 0.0
++        amendment_boost = 0.18 if "current-amendment-context" in methods else 0.0
++        anchor_boost = 0.18 if "smart-amendment-authority-anchor" in methods else 0.0
++        base = vector_score * 0.46 + keyword_score * 0.30 + lexical * 0.24
++        score = max(
++            0.0,
++            min(
++                1.0,
++                base
++                + document_boost
++                + logical_boost
++                + priority_boost
++                + answer_shape_boost
++                + amendment_boost
++                + anchor_boost,
++            ),
++        )
+         if logical_boost > 0:
+             methods.append("deterministic-rule-match")
+         elif logical_boost < 0:
+@@ -338,33 +667,67 @@
+     cap = _int_env("SMART_RAG_CORPUS_FALLBACK_K", 160 if not reference_mode else 300, 20, 1000)
+     combined = " ".join([*query_texts[:3], *(focus_terms or [])[:24]])
+     tsq = _tsquery(combined)
+-    rows = db.execute(
+-        text(
+-            """
+-            WITH q AS (SELECT to_tsquery('simple', :tsq) AS query)
+-            SELECT c.id, c.document_id, c.chunk_index, c.page_number, c.content_type, c.text, d.filename,
+-                   LEAST(1.0, ts_rank_cd(to_tsvector('simple', c.text), q.query) * 4.0) AS keyword_score
+-            FROM document_chunks c
+-            JOIN documents d ON d.id = c.document_id
+-            CROSS JOIN q
+-            WHERE d.status = 'ready'
+-              AND to_tsvector('simple', c.text) @@ q.query
+-            ORDER BY keyword_score DESC, c.id
+-            LIMIT :limit
+-            """
+-        ),
+-        {"tsq": tsq, "limit": min(cap, max(20, limit))},
+-    ).mappings()
++    rows = list(
++        db.execute(
++            text(
++                """
++                WITH q AS (SELECT to_tsquery('simple', :tsq) AS query)
++                SELECT c.id, c.document_id, c.chunk_index, c.page_number, c.content_type, c.text, d.filename,
++                       LEAST(1.0, ts_rank_cd(to_tsvector('simple', c.text), q.query) * 4.0) AS keyword_score
++                FROM document_chunks c
++                JOIN documents d ON d.id = c.document_id
++                CROSS JOIN q
++                WHERE d.status = 'ready'
++                  AND to_tsvector('simple', c.text) @@ q.query
++                ORDER BY keyword_score DESC, c.id
++                LIMIT :limit
++                """
++            ),
++            {"tsq": tsq, "limit": min(cap, max(20, limit))},
++        ).mappings()
++    )
+     results = [
+         _row_result(
+             row,
+-            score=min(1.0, 0.45 + float(row["keyword_score"] or 0.0) * 0.45),
++            score=min(1.0, 0.42 + float(row["keyword_score"] or 0.0) * 0.38 + _weighted_lexical(combined, str(row["text"])) * 0.20),
+             method="smart-indexed-corpus-fts",
+             vector_score=0.0,
+             keyword_score=float(row["keyword_score"] or 0.0),
+         )
+         for row in rows
+     ]
++
++    # Guarantee a small high-signal conjunction set before diversity/capping.
++    priority = _priority_terms(combined)
++    if priority and not reference_mode:
++        priority_rows = db.execute(
++            text(
++                """
++                WITH q AS (SELECT to_tsquery('simple', :tsq) AS query)
++                SELECT c.id, c.document_id, c.chunk_index, c.page_number, c.content_type, c.text, d.filename,
++                       LEAST(1.0, ts_rank_cd(to_tsvector('simple', c.text), q.query) * 5.0) AS keyword_score
++                FROM document_chunks c
++                JOIN documents d ON d.id = c.document_id
++                CROSS JOIN q
++                WHERE d.status = 'ready'
++                  AND to_tsvector('simple', c.text) @@ q.query
++                ORDER BY keyword_score DESC, c.id
++                LIMIT :limit
++                """
++            ),
++            {"tsq": _and_tsquery(priority), "limit": min(80, cap)},
++        ).mappings()
++        for row in priority_rows:
++            results.append(
++                _row_result(
++                    row,
++                    score=min(1.0, 0.82 + float(row["keyword_score"] or 0.0) * 0.16),
++                    method="smart-indexed-corpus-priority-fts",
++                    vector_score=0.0,
++                    keyword_score=float(row["keyword_score"] or 0.0),
++                )
++            )
++
+     scenario = current_scenario()
+     if scenario is not None:
+         adjusted: list[RetrievedChunk] = []
+--- a/backend/app/rag/smart_runtime.py
++++ b/backend/app/rag/smart_runtime.py
+@@ -2,6 +2,7 @@
+ 
+ # ruff: noqa: E501
+ 
++import contextvars
+ import logging
+ import os
+ import re
+@@ -19,15 +20,29 @@
+ )
+ from app.rag.smart_index import index_document
+ from app.rag.smart_retrieval import (
++    definition_evidence_chunks,
+     fast_corpus_scan,
+     fast_search_chunks,
++    retrieval_answerable,
+     rule_notes_for_chunk,
++    structured_lookup_request,
+ )
+ from app.rag.smart_schema import ensure_smart_schema
+-from app.rag.terminology import terminology_hints
++from app.rag.terminology import (
++    definition_request_aliases,
++    explicit_definition_hints,
++    is_definition_request,
++    terminology_hints,
++)
+ 
+ logger = logging.getLogger(__name__)
+ _INSTALLED = False
++_CURRENT_ORIGINAL_QUESTION: contextvars.ContextVar[str] = contextvars.ContextVar(
++    "pdfrag_smart_original_question", default=""
++)
++_CURRENT_DEFINITION_ALIASES: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
++    "pdfrag_smart_definition_aliases", default=()
++)
+ 
+ 
+ def _bool_env(name: str, default: bool) -> bool:
+@@ -78,6 +93,7 @@
+     original_filter_hard_context = service_module.filter_hard_context_candidates
+     original_process_document = service_module.RagService.process_document
+     original_plan = query_module.QueryPlanner.plan
++    original_search_mode = service_module.deterministic_search_mode
+     original_source_header = synthesis_module._compact_source_header
+ 
+     def smart_find_abbreviation_hints(db, text_value, *, max_terms=None, chunks_per_term=None):  # type: ignore[no-untyped-def]
+@@ -85,38 +101,93 @@
+         try:
+             indexed = terminology_hints(db, text_value)
+         except Exception:
+-            logger.exception("Global terminology lookup failed; using legacy abbreviation scan")
++            logger.exception("Global terminology lookup failed; trying definition-aware fallback")
+             indexed = []
+         if indexed:
+-            logger.info("smart_rag stage=terminology ms=%.1f hints=%d", (time.perf_counter() - started) * 1000, len(indexed))
++            logger.info(
++                "smart_rag stage=terminology ms=%.1f hints=%d",
++                (time.perf_counter() - started) * 1000,
++                len(indexed),
++            )
+             return indexed
++
++        # Definition queries need a different fallback from ordinary abbreviation
++        # use. Scan explicitly definition-shaped occurrences so repeated phrases
++        # such as "BIC isolation" cannot consume the small legacy occurrence limit
++        # before "Brake Isolating Cock (BIC)" is reached.
++        if is_definition_request(text_value):
++            try:
++                definitions = explicit_definition_hints(db, text_value)
++            except Exception:
++                logger.exception("Definition-specific abbreviation scan failed")
++                definitions = []
++            if definitions:
++                logger.info(
++                    "smart_rag stage=terminology_definition_fallback ms=%.1f hints=%d",
++                    (time.perf_counter() - started) * 1000,
++                    len(definitions),
++                )
++                return definitions
++
+         result = original_find_abbreviations(
+             db,
+             text_value,
+             max_terms=max_terms,
+             chunks_per_term=chunks_per_term,
+         )
+-        logger.info("smart_rag stage=terminology_legacy ms=%.1f hints=%d", (time.perf_counter() - started) * 1000, len(result))
++        logger.info(
++            "smart_rag stage=terminology_legacy ms=%.1f hints=%d",
++            (time.perf_counter() - started) * 1000,
++            len(result),
++        )
+         return result
+ 
+     def smart_plan(self, question, enabled=None, *, conversation_context=None, abbreviation_hints=None, routing_hints=None):  # type: ignore[no-untyped-def]
+         started = time.perf_counter()
++        hints = abbreviation_hints or []
++        definition_aliases = tuple(definition_request_aliases(question, hints))
++        _CURRENT_ORIGINAL_QUESTION.set(question)
++        _CURRENT_DEFINITION_ALIASES.set(definition_aliases)
++
+         plan = original_plan(
+             self,
+             question,
+             enabled,
+             conversation_context=conversation_context,
+-            abbreviation_hints=abbreviation_hints,
++            abbreviation_hints=hints,
+             routing_hints=routing_hints,
+         )
++
++        # Bare acronyms and explicit "full form / what does X mean" requests are
++        # answer requests, not corpus-navigation requests. The source definition
++        # chunk is still retrieved and cited; the terminology index is navigation.
++        if definition_aliases:
++            plan = replace(
++                plan,
++                intent="definition",
++                search_mode="answer",
++                response_mode="concise",
++                focus_terms=list(dict.fromkeys([*definition_aliases, *plan.focus_terms]))[:48],
++            )
++        elif structured_lookup_request(question):
++            # "compensation amount for different injuries" is a category/value
++            # lookup, not one scalar fact. Let the existing list synthesizer retain
++            # the relevant schedule rows instead of collapsing them to one sentence.
++            plan = replace(plan, intent="list", search_mode="answer", response_mode="concise")
++
+         scenario = compile_scenario(
+             plan.contextual_question or plan.rewritten_question or plan.original_question,
+-            abbreviation_hints or [],
++            hints,
+         )
+         set_current_scenario(scenario)
+         max_variants = _int_env("SMART_RAG_QUERY_VARIANTS", 3, 1, 6)
+         queries: list[str] = []
+-        candidate_queries = [scenario.canonical_question]
++        candidate_queries: list[str] = []
++        if definition_aliases:
++            # Put the exact acronym first; canonical expansion from document-grounded
++            # hints follows naturally in scenario.canonical_question.
++            candidate_queries.extend(definition_aliases)
++        candidate_queries.append(scenario.canonical_question)
+         if scenario.is_situational:
+             candidate_queries.append(scenario_relaxed_query(scenario))
+         candidate_queries.extend(plan.search_queries)
+@@ -128,10 +199,11 @@
+             if len(queries) >= max_variants:
+                 break
+         logger.info(
+-            "smart_rag stage=planner ms=%.1f intent=%s situational=%s variants=%d numeric_facts=%d states=%d",
++            "smart_rag stage=planner ms=%.1f intent=%s situational=%s definition=%s variants=%d numeric_facts=%d states=%d",
+             (time.perf_counter() - started) * 1000,
+             plan.intent,
+             scenario.is_situational,
++            bool(definition_aliases),
+             len(queries),
+             len(scenario.numeric_facts),
+             len(scenario.states) + len(scenario.inferred_states),
+@@ -141,26 +213,78 @@
+     def smart_search(db, query_vector, query_text, limit):  # type: ignore[no-untyped-def]
+         started = time.perf_counter()
+         result = fast_search_chunks(db, query_vector, query_text, limit)
++
++        definition_aliases = _CURRENT_DEFINITION_ALIASES.get()
++        if definition_aliases:
++            try:
++                definition_rows = definition_evidence_chunks(
++                    db,
++                    _CURRENT_ORIGINAL_QUESTION.get() or query_text,
++                    aliases=definition_aliases,
++                    limit=min(8, max(2, limit)),
++                )
++            except Exception:
++                logger.exception("Definition evidence retrieval failed")
++                definition_rows = []
++            if definition_rows:
++                merged: dict[str, object] = {}
++                ordered = [*definition_rows, *result]
++                deduped = []
++                for item in ordered:
++                    if item.chunk.chunk_id in merged:
++                        continue
++                    merged[item.chunk.chunk_id] = item
++                    deduped.append(item)
++                    if len(deduped) >= limit:
++                        break
++                result = deduped
++
+         fallback_score = _float_env("SMART_RAG_BROAD_FALLBACK_SCORE", 0.12)
+-        if (
+-            _bool_env("SMART_RAG_ALLOW_BROAD_FALLBACK", True)
+-            and (not result or float(result[0].score) < fallback_score)
+-        ):
++        answerable = retrieval_answerable(_CURRENT_ORIGINAL_QUESTION.get() or query_text, result)
++        needs_fallback = (
++            not result
++            or float(result[0].score) < fallback_score
++            or not answerable
++            or (bool(definition_aliases) and not any("terminology-definition" in item.method for item in result))
++        )
++        if _bool_env("SMART_RAG_ALLOW_BROAD_FALLBACK", True) and needs_fallback:
+             logger.warning(
+-                "Smart retrieval confidence low (top=%.3f); using bounded legacy fallback",
++                "Smart retrieval fallback: top=%.3f answerable=%s definition=%s",
+                 float(result[0].score) if result else 0.0,
++                answerable,
++                bool(definition_aliases),
+             )
+-            result = original_search_chunks(
++            legacy = original_search_chunks(
+                 db,
+                 query_vector,
+                 query_text,
+                 min(limit, _int_env("SMART_RAG_LEGACY_FALLBACK_LIMIT", 160, 40, 500)),
+             )
++            # Merge instead of replacing the smart set. Otherwise a fallback can
++            # discard the amendment anchor or exact acronym definition that caused
++            # the smart path to be more trustworthy than the broad legacy ranking.
++            by_id = {item.chunk.chunk_id: item for item in result}
++            for item in legacy:
++                current = by_id.get(item.chunk.chunk_id)
++                if current is None or item.score > current.score:
++                    by_id[item.chunk.chunk_id] = item
++            result = sorted(
++                by_id.values(),
++                key=lambda item: (
++                    0 if "terminology-definition" in item.method else 1,
++                    0 if "current-amendment-context" in item.method else 1,
++                    0 if "amendment-authority-anchor" in item.method else 1,
++                    -float(item.score),
++                    item.chunk.filename.casefold(),
++                    item.chunk.page_number,
++                ),
++            )[:limit]
+         logger.info(
+-            "smart_rag stage=hybrid_retrieval ms=%.1f candidates=%d top=%.3f",
++            "smart_rag stage=hybrid_retrieval ms=%.1f candidates=%d top=%.3f answerable=%s",
+             (time.perf_counter() - started) * 1000,
+             len(result),
+             float(result[0].score) if result else 0.0,
++            retrieval_answerable(_CURRENT_ORIGINAL_QUESTION.get() or query_text, result),
+         )
+         return result
+ 
+@@ -285,6 +409,9 @@
+ 
+     def smart_select(plan, candidates, max_chunks=None, *, preferred_document_ids=None):  # type: ignore[no-untyped-def]
+         cap = _int_env("SMART_RAG_FINAL_CONTEXT_CHUNKS", 48, 12, 120)
++        definition_aliases = _CURRENT_DEFINITION_ALIASES.get()
++        effective_cap = min(cap, 12) if definition_aliases else cap
++        requested_cap = min(max_chunks or effective_cap, effective_cap)
+         scenario = current_scenario()
+         adjusted = []
+         for item in candidates:
+@@ -298,15 +425,48 @@
+                 adjusted.append(replace(item, score=max(0.0, min(1.0, item.score + boost)), method=method))
+             else:
+                 adjusted.append(item)
+-        adjusted.sort(key=lambda item: -item.score)
++        adjusted.sort(
++            key=lambda item: (
++                0 if "terminology-definition" in item.method else 1,
++                0 if "current-amendment-context" in item.method else 1,
++                0 if "amendment-authority-anchor" in item.method else 1,
++                -item.score,
++            )
++        )
+         enriched, originals = relevance_enriched_candidates(adjusted)
+         selected = original_select(
+             relevance_plan(plan),
+             enriched,
+-            max_chunks=min(max_chunks or cap, cap),
++            max_chunks=requested_cap,
+             preferred_document_ids=preferred_document_ids,
+         )
+-        return restore_original_chunks(selected, originals)
++        restored = restore_original_chunks(selected, originals)
++
++        # Some evidence is navigationally essential even if its wording has low
++        # lexical overlap with the user question. Keep the exact acronym-definition
++        # chunk and the explicit amendment/substitution anchor in the final context.
++        definition_forced = [
++            item
++            for item in adjusted
++            if definition_aliases and "terminology-definition" in item.method
++        ]
++        current_amendment_forced = [
++            item for item in adjusted if "current-amendment-context" in item.method
++        ][:_int_env("SMART_RAG_CURRENT_AMENDMENT_CONTEXT_CHUNKS", 12, 2, 24)]
++        authority_forced = [
++            item for item in adjusted if "amendment-authority-anchor" in item.method
++        ][:4]
++        forced = [*definition_forced, *current_amendment_forced, *authority_forced]
++        merged = []
++        seen_ids: set[str] = set()
++        for item in [*forced, *restored]:
++            if item.chunk.chunk_id in seen_ids:
++                continue
++            seen_ids.add(item.chunk.chunk_id)
++            merged.append(item)
++            if len(merged) >= requested_cap:
++                break
++        return merged
+ 
+     def smart_process_document(self, db, document):  # type: ignore[no-untyped-def]
+         result = original_process_document(self, db, document)
+@@ -327,10 +487,29 @@
+             # This is explicitly marked as derived. It helps the answer model apply
+             # e.g. user=4 to a source threshold of >=2 without pretending the PDF said 4.
+             header += " | SYSTEM-DERIVED APPLICABILITY (not PDF text): " + " ".join(notes)
++        method = source.result.method
++        if "current-amendment-context" in method:
++            header += (
++                " | SYSTEM-DERIVED AUTHORITY PROXIMITY (not PDF text): this excerpt is within "
++                "the configured local chunk window after an explicit amendment/substitution "
++                "anchor in the same PDF; use the anchor source itself to establish precedence"
++            )
++        if "amendment-authority-anchor" in method:
++            header += " | AUTHORITY ANCHOR: inspect this PDF text for explicit amendment/substitution wording"
++        if "terminology-definition" in method:
++            header += " | TERMINOLOGY DEFINITION SOURCE: this original PDF chunk was selected for the requested acronym/full form"
+         return header
+ 
++    def smart_deterministic_search_mode(original, contextual=None, intent=None):  # type: ignore[no-untyped-def]
++        current_question = _CURRENT_ORIGINAL_QUESTION.get()
++        active_aliases = _CURRENT_DEFINITION_ALIASES.get()
++        if (current_question and original.strip() == current_question.strip() and active_aliases) or is_definition_request(original):
++            return "answer"
++        return original_search_mode(original, contextual, intent)
++
+     # Patch module globals actually referenced by RagService._ask_impl.
+     service_module.find_abbreviation_hints = smart_find_abbreviation_hints
++    service_module.deterministic_search_mode = smart_deterministic_search_mode
+     service_module.search_chunks = smart_search
+     service_module.search_stemmed_chunks = smart_stemmed_search
+     service_module.scan_matching_chunks = smart_scan
+@@ -345,6 +524,7 @@
+ 
+     # Planner instance was imported before app lifespan; patch the class method so
+     # the existing singleton immediately uses scenario compilation.
++    query_module.deterministic_search_mode = smart_deterministic_search_mode
+     query_module.QueryPlanner.plan = smart_plan
+ 
+     synthesis_module._compact_source_header = smart_source_header
+@@ -358,5 +538,19 @@
+ state the comparison briefly when material, and never turn an uncertain semantic inference into a fact.
+ """
+ 
++    if "SMART-RAG AUTHORITY PRECEDENCE" not in synthesis_module._ANSWER_SYSTEM_PROMPT:
++        synthesis_module._ANSWER_SYSTEM_PROMPT += """
++
++SMART-RAG AUTHORITY PRECEDENCE:
++- A TERMINOLOGY DEFINITION SOURCE is original PDF evidence. For acronym/full-form questions, answer
++  from that definition instead of treating usage-only occurrences as a definition.
++- AUTHORITY ANCHOR source text may explicitly state that a rule, amount, provision or schedule is
++  amended or substituted. When the PDF explicitly establishes that replacement relationship, use the
++  amended/substituted text for the affected subject and do not report the superseded value as current.
++- SYSTEM-DERIVED AUTHORITY PROXIMITY is only a navigation hint. It cannot establish precedence by
++  itself; confirm precedence from the cited AUTHORITY ANCHOR PDF text. If the evidence does not
++  explicitly establish which version controls, state the conflict rather than choosing one.
++"""
++
+     _INSTALLED = True
+     logger.info("Smart RAG runtime patch installed")
+--- a/backend/tests/test_smart_terminology_extract.py
++++ b/backend/tests/test_smart_terminology_extract.py
+@@ -34,3 +34,49 @@
+ 
+     aliases = candidate_aliases("What should the operator do to proceed?")
+     assert "to" not in aliases
++
++
++def test_bic_definition_is_extracted_from_manual_style_text() -> None:
++    assert ("BIC", "Brake Isolating cock") in _pairs(
++        "Brake Isolating cock(BIC)- Saloon (B05)"
++    )
++
++
++def test_bare_uppercase_acronym_is_definition_request() -> None:
++    from app.rag.terminology import definition_request_aliases, is_definition_request
++
++    assert is_definition_request("BIC")
++    assert definition_request_aliases("BIC") == ["BIC"]
++
++
++def test_full_form_wording_targets_the_acronym_only() -> None:
++    from app.rag.terminology import definition_request_aliases, is_definition_request
++
++    assert is_definition_request("BIC full form")
++    assert definition_request_aliases("BIC full form") == ["BIC"]
++    assert definition_request_aliases("full form of BIC") == ["BIC"]
++
++
++def test_explicit_reference_request_is_not_definition_request() -> None:
++    from app.rag.terminology import is_definition_request
++
++    assert not is_definition_request("find BIC")
++    assert not is_definition_request("show references to BIC")
++
++
++def test_document_code_is_not_treated_as_acronym_definition() -> None:
++    from app.rag.terminology import is_definition_request
++
++    assert not is_definition_request("SC-06")
++
++
++def test_bic_procedure_question_is_not_reclassified_as_definition() -> None:
++    from app.rag.terminology import is_definition_request
++
++    assert not is_definition_request("what is BIC procedure")
++
++
++def test_what_is_bic_is_definition_request() -> None:
++    from app.rag.terminology import is_definition_request
++
++    assert is_definition_request("what is BIC")

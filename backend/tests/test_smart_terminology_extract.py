@@ -34,3 +34,49 @@ def test_lowercase_to_remains_a_stopword() -> None:
 
     aliases = candidate_aliases("What should the operator do to proceed?")
     assert "to" not in aliases
+
+
+def test_bic_definition_is_extracted_from_manual_style_text() -> None:
+    assert ("BIC", "Brake Isolating cock") in _pairs(
+        "Brake Isolating cock(BIC)- Saloon (B05)"
+    )
+
+
+def test_bare_uppercase_acronym_is_definition_request() -> None:
+    from app.rag.terminology import definition_request_aliases, is_definition_request
+
+    assert is_definition_request("BIC")
+    assert definition_request_aliases("BIC") == ["BIC"]
+
+
+def test_full_form_wording_targets_the_acronym_only() -> None:
+    from app.rag.terminology import definition_request_aliases, is_definition_request
+
+    assert is_definition_request("BIC full form")
+    assert definition_request_aliases("BIC full form") == ["BIC"]
+    assert definition_request_aliases("full form of BIC") == ["BIC"]
+
+
+def test_explicit_reference_request_is_not_definition_request() -> None:
+    from app.rag.terminology import is_definition_request
+
+    assert not is_definition_request("find BIC")
+    assert not is_definition_request("show references to BIC")
+
+
+def test_document_code_is_not_treated_as_acronym_definition() -> None:
+    from app.rag.terminology import is_definition_request
+
+    assert not is_definition_request("SC-06")
+
+
+def test_bic_procedure_question_is_not_reclassified_as_definition() -> None:
+    from app.rag.terminology import is_definition_request
+
+    assert not is_definition_request("what is BIC procedure")
+
+
+def test_what_is_bic_is_definition_request() -> None:
+    from app.rag.terminology import is_definition_request
+
+    assert is_definition_request("what is BIC")
