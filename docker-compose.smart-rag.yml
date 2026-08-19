@@ -12,7 +12,7 @@ services:
       SMART_RAG_ENABLED: ${SMART_RAG_ENABLED:-1}
       SMART_RAG_AUTO_SCHEMA: ${SMART_RAG_AUTO_SCHEMA:-1}
       SMART_RAG_BUILD_INDEXES: ${SMART_RAG_BUILD_INDEXES:-1}
-      SMART_RAG_QUERY_VARIANTS: ${SMART_RAG_QUERY_VARIANTS:-3}
+      SMART_RAG_QUERY_VARIANTS: ${SMART_RAG_QUERY_VARIANTS:-4}
       SMART_RAG_VECTOR_K: ${SMART_RAG_VECTOR_K:-90}
       SMART_RAG_FTS_K: ${SMART_RAG_FTS_K:-90}
       SMART_RAG_SCOPED_K: ${SMART_RAG_SCOPED_K:-70}
@@ -40,6 +40,19 @@ services:
       # Explicit amendment/replacement authority context. The derived index stores
       # source directives, but final answers still cite original PDF chunks.
       SMART_RAG_CURRENT_AUTHORITY_CONTEXT_CHUNKS: ${SMART_RAG_CURRENT_AUTHORITY_CONTEXT_CHUNKS:-16}
+
+      # AI-first language understanding. The query model interprets noisy natural
+      # language and plans evidence needs; it is never a factual metro source.
+      SMART_RAG_AI_INTERPRETATION: ${SMART_RAG_AI_INTERPRETATION:-1}
+      SMART_RAG_AI_SEARCH_QUERIES: ${SMART_RAG_AI_SEARCH_QUERIES:-4}
+      SMART_RAG_AI_INTERPRET_MAX_TOKENS: ${SMART_RAG_AI_INTERPRET_MAX_TOKENS:-950}
+      SMART_RAG_AI_EVIDENCE_REVIEW: ${SMART_RAG_AI_EVIDENCE_REVIEW:-1}
+      SMART_RAG_AI_REVIEW_MAX_TOKENS: ${SMART_RAG_AI_REVIEW_MAX_TOKENS:-500}
+      SMART_RAG_AI_RETRY_QUERIES: ${SMART_RAG_AI_RETRY_QUERIES:-2}
+      SMART_RAG_AI_RETRY_CANDIDATES: ${SMART_RAG_AI_RETRY_CANDIDATES:-120}
+      SMART_RAG_AI_ANSWER_VERIFY: ${SMART_RAG_AI_ANSWER_VERIFY:-1}
+      SMART_RAG_AI_VERIFY_SOURCES: ${SMART_RAG_AI_VERIFY_SOURCES:-24}
+      SMART_RAG_AI_VERIFY_MAX_TOKENS: ${SMART_RAG_AI_VERIFY_MAX_TOKENS:-1800}
 
       # Previous hotfix knobs retained for compatibility; current authority logic
       # no longer relies on a fixed local window as its primary precedence rule.

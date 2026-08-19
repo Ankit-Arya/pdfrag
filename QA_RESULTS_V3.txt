@@ -1,0 +1,35 @@
+PDFrag Smart RAG AI-First Reliability Hotfix v3
+
+Target current commit checked before packaging:
+  caac7d44af721d6b1cc1c127d064917658f32650 (Updated queries v2)
+
+Overlay simulation:
+  Original Smart RAG patch + Reliability Hotfix v2 + v3 changed files
+
+Focused regression suite:
+  tests/test_smart_reasoning.py
+  tests/test_smart_reliability.py
+  tests/test_smart_terminology_extract.py
+  tests/test_smart_ai_understanding.py
+
+Result:
+  48 passed
+
+Additional checks:
+  Python compile: PASS
+  docker-compose.smart-rag.yml YAML parse: PASS
+
+Coverage added by v3 tests includes:
+  - noisy spelling/grammar converted into a semantic responsibility request;
+  - evidence-needs planning rather than same-sentence paraphrase only;
+  - material ambiguity preservation;
+  - explicit AI-controlled follow-up/history use;
+  - pasted/corrective evidence distinguished from acronym definition lookup;
+  - unrelated terminology hints filtered from the resolved question;
+  - simple definitions skip the expensive evidence critic;
+  - current/authority-sensitive facts request evidence review;
+  - the interpretation function consumes the single AI JSON contract.
+
+The complete production database / 500-PDF corpus was not available inside this packaging container,
+so these are focused unit/static overlay tests, not a claim of full production-corpus acceptance.
+  HOTFIX_V3.patch dry-run against clean v2 overlay: PASS

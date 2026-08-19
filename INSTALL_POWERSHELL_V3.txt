@@ -1,0 +1,30 @@
+PDFrag Smart RAG AI-First v3 - PowerShell install
+
+1. Put the ZIP in the pdfrag repository folder.
+
+2. Extract over the EXISTING repository (do not create a repo from the ZIP):
+   Expand-Archive -Path .\pdfrag-smart-rag-ai-first-hotfix-v3-20260819.zip -DestinationPath . -Force
+
+3. Verify files/markers:
+   powershell -ExecutionPolicy Bypass -File .\verify-ai-first-hotfix.ps1
+
+4. Stop without deleting volumes:
+   docker compose -f docker-compose.yml -f docker-compose.smart-rag.yml down
+
+5. Rebuild backend:
+   docker compose -f docker-compose.yml -f docker-compose.smart-rag.yml build backend
+
+6. Start:
+   docker compose -f docker-compose.yml -f docker-compose.smart-rag.yml up -d
+
+7. Check:
+   docker compose -f docker-compose.yml -f docker-compose.smart-rag.yml ps
+   docker compose -f docker-compose.yml -f docker-compose.smart-rag.yml logs --tail=150 backend
+
+8. Diagnostics after backend becomes healthy:
+   docker compose -f docker-compose.yml -f docker-compose.smart-rag.yml exec backend python -m app.rag.smart_diagnostics
+
+No new DB migration or PDF reprocessing is required by v3 itself.
+If v2 authority/derived indexes were never backfilled, run the existing smart_backfill once.
+
+Never use: docker compose down -v

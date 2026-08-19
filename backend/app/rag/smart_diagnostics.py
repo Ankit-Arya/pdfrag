@@ -2,6 +2,8 @@ from __future__ import annotations
 
 # ruff: noqa: E501
 
+import os
+
 from sqlalchemy import text
 
 from app.db import SessionLocal, initialize_database
@@ -72,6 +74,17 @@ def main() -> None:
             )
         ).scalar_one()
         print(f"Terminology aliases with multiple corpus meanings: {conflicts}")
+
+        print("AI-first understanding")
+        for name, default in (
+            ("SMART_RAG_AI_INTERPRETATION", "1"),
+            ("SMART_RAG_AI_SEARCH_QUERIES", "4"),
+            ("SMART_RAG_AI_EVIDENCE_REVIEW", "1"),
+            ("SMART_RAG_AI_RETRY_QUERIES", "2"),
+            ("SMART_RAG_AI_ANSWER_VERIFY", "1"),
+            ("SMART_RAG_AI_VERIFY_SOURCES", "24"),
+        ):
+            print(f"  {name}: {os.getenv(name, default)}")
 
 
 if __name__ == "__main__":

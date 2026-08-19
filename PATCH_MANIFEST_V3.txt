@@ -1,0 +1,22 @@
+AI-FIRST V3 OVERLAY FILES
+
+Production:
+  backend/app/rag/smart_understanding.py   NEW
+  backend/app/rag/smart_runtime.py        UPDATED
+  backend/app/rag/smart_diagnostics.py    UPDATED
+  docker-compose.smart-rag.yml            UPDATED
+  .env.smart-rag.example                  UPDATED
+
+Tests/docs:
+  backend/tests/test_smart_ai_understanding.py NEW
+  HOTFIX_V3_README.md
+  INSTALL_POWERSHELL_V3.txt
+  verify-ai-first-hotfix.ps1
+  HOTFIX_V3.patch
+  QA_RESULTS_V3.txt
+  BASE_CURRENT_COMMIT.txt
+  CHECKSUMS.sha256
+
+No frontend files.
+No database schema migration.
+No OCR/rechunk/re-embedding requirement.
