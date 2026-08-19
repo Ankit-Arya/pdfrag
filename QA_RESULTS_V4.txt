@@ -1,0 +1,33 @@
+pdfrag Smart RAG v4 QA
+Date: 2026-08-19
+
+Overlay simulation base:
+- original Smart RAG patch
+- reliability hotfix v2
+- AI-first hotfix v3
+- v4 changed files
+
+Focused tests:
+PYTHONPATH=. pytest -q \
+  tests/test_smart_terminology_extract.py \
+  tests/test_smart_reasoning.py \
+  tests/test_smart_reliability.py \
+  tests/test_smart_ai_understanding.py
+
+Result:
+52 passed in 0.21-0.43s across repeated local runs.
+
+Additional checks:
+- python -m compileall -q app tests : PASS
+- v3->v4 patch generated successfully
+- package checksums: generated after packaging
+
+New v4 tests include:
+- self-contained new compensation question does not expose previous monkey-bite turn to interpreter
+- genuine unresolved follow-up triggers a second history-assisted interpretation pass
+- ordinary factual responsibility lookup is evidence-reviewed
+- runtime source verifies evidence review is post-merge, not inside per-query smart_search
+
+Known limitation:
+- Full repository CI and a live PostgreSQL corpus acceptance run were not available in this packaging environment.
+- Production acceptance should verify several paraphrases per scenario and inspect logs for ai_postmerge evidence review.

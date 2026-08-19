@@ -58,6 +58,12 @@ _CURRENT_INTERPRETATION: contextvars.ContextVar[object | None] = contextvars.Con
 _CURRENT_AI_EVIDENCE_REVIEWED: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "pdfrag_smart_ai_evidence_reviewed", default=False
 )
+_CURRENT_DB: contextvars.ContextVar[object | None] = contextvars.ContextVar(
+    "pdfrag_smart_db", default=None
+)
+_CURRENT_COVERAGE_STATUS: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "pdfrag_smart_coverage_status", default="not_reviewed"
+)
 
 
 def _bool_env(name: str, default: bool) -> bool:
@@ -107,6 +113,7 @@ def install_smart_rag_patch() -> None:
     original_rank_scenario_documents = service_module.rank_scenario_documents
     original_filter_hard_context = service_module.filter_hard_context_candidates
     original_process_document = service_module.RagService.process_document
+    original_ask_impl = service_module.RagService._ask_impl
     original_plan = query_module.QueryPlanner.plan
     original_search_mode = service_module.deterministic_search_mode
     original_needs_conversation_context = service_module.needs_conversation_context
@@ -177,6 +184,7 @@ def install_smart_rag_patch() -> None:
         )
         _CURRENT_INTERPRETATION.set(interpretation)
         _CURRENT_AI_EVIDENCE_REVIEWED.set(False)
+        _CURRENT_COVERAGE_STATUS.set("not_reviewed")
         _CURRENT_ORIGINAL_QUESTION.set(question)
 
         # An unrelated previous turn must not bleed into retrieval merely because we made
@@ -231,8 +239,16 @@ def install_smart_rag_patch() -> None:
         candidates: list[str] = []
         if definition_aliases:
             candidates.extend(definition_aliases)
-        candidates.extend(interpretation.search_queries)
+        # Put the resolved question first, then force one generic authority-oriented
+        # formulation when revision/currentness can change the answer. This does not
+        # invent a document or value; it simply makes amendment/replacement evidence
+        # discoverable before an older cleanly-OCR'd provision can dominate ranking.
         candidates.append(resolved)
+        if interpretation.authority_sensitive:
+            candidates.append(
+                f"{resolved} current amended amendment revised substituted replacement schedule effective"
+            )
+        candidates.extend(interpretation.search_queries)
         if scenario.is_situational:
             candidates.append(scenario_relaxed_query(scenario))
         # Keep the raw wording only as a late exact-token fallback for identifiers/codes.
@@ -301,56 +317,11 @@ def install_smart_rag_patch() -> None:
                         break
                 result = deduped
 
-        # One bounded AI evidence-coverage review per user turn. Unlike similarity
-        # thresholds, this checks whether the retrieved excerpts actually satisfy the
-        # interpreted evidence needs (responsibility, requirement, current value, branch,
-        # etc.). If not, run at most a few targeted semantic retries and merge them.
-        interpretation = _CURRENT_INTERPRETATION.get()
-        if (
-            interpretation is not None
-            and not _CURRENT_AI_EVIDENCE_REVIEWED.get()
-            and should_review_evidence(interpretation)
-        ):
-            _CURRENT_AI_EVIDENCE_REVIEWED.set(True)
-            review = review_retrieved_evidence(interpretation, result)
-            logger.info(
-                "smart_rag stage=ai_evidence_review sufficient=%s ai=%s missing=%d retry=%d reason=%s",
-                review.sufficient,
-                review.ai_used,
-                len(review.missing_evidence),
-                len(review.retry_queries),
-                review.reason[:240],
-            )
-            if not review.sufficient and review.retry_queries:
-                try:
-                    from app.rag.embeddings import embedding_service
-
-                    retry_vectors = embedding_service.encode(list(review.retry_queries))
-                    retry_items = []
-                    retry_limit = min(limit, _int_env("SMART_RAG_AI_RETRY_CANDIDATES", 120, 30, 240))
-                    for retry_query, retry_vector in zip(review.retry_queries, retry_vectors, strict=True):
-                        for item in fast_search_chunks(db, retry_vector.tolist(), retry_query, retry_limit):
-                            retry_items.append(replace(item, method=item.method + "+ai-evidence-retry"))
-                    by_id = {item.chunk.chunk_id: item for item in result}
-                    for item in retry_items:
-                        current = by_id.get(item.chunk.chunk_id)
-                        if current is None or float(item.score) > float(current.score):
-                            by_id[item.chunk.chunk_id] = item
-                        elif "ai-evidence-retry" not in current.method:
-                            by_id[item.chunk.chunk_id] = replace(current, method=current.method + "+ai-evidence-retry")
-                    result = sorted(
-                        by_id.values(),
-                        key=lambda item: (
-                            0 if "terminology-definition" in item.method else 1,
-                            0 if "current-authority-span" in item.method else 1,
-                            0 if "authority-anchor" in item.method else 1,
-                            -float(item.score),
-                            item.chunk.filename.casefold(),
-                            item.chunk.page_number,
-                        ),
-                    )[:limit]
-                except Exception:
-                    logger.exception("AI evidence retry failed; continuing with existing retrieval candidates")
+        # v4 deliberately does NOT run the AI evidence critic here. This function is
+        # called once per semantic query, before the service has merged other query
+        # variants, corpus-wide lexical matches, routed procedures, reference hops and
+        # neighbor chunks. Coverage is reviewed later in smart_select against the fully
+        # assembled candidate set.
 
         fallback_score = _float_env("SMART_RAG_BROAD_FALLBACK_SCORE", 0.12)
         answerable = retrieval_answerable(_CURRENT_ORIGINAL_QUESTION.get() or query_text, result)
@@ -533,7 +504,127 @@ def install_smart_rag_patch() -> None:
         allowed = original_filter_hard_context(relevance_plan(plan), enriched)
         return [originals.get(item.chunk.chunk_id, item) for item in allowed]
 
+    def _postmerge_evidence_review(plan, candidates):  # type: ignore[no-untyped-def]
+        """Review coverage only after all normal retrieval arms have been merged.
+
+        v3 reviewed the first per-query result set and then permanently marked the turn
+        reviewed. That could miss the governing procedure even when later retrieval arms
+        would have found it. v4 reviews the complete candidate set and performs at most
+        one bounded semantic+lexical retry using the current request DB session.
+        """
+        interpretation = _CURRENT_INTERPRETATION.get()
+        if (
+            interpretation is None
+            or _CURRENT_AI_EVIDENCE_REVIEWED.get()
+            or not should_review_evidence(interpretation)
+        ):
+            return list(candidates)
+
+        _CURRENT_AI_EVIDENCE_REVIEWED.set(True)
+        ranked = sorted(
+            list(candidates),
+            key=lambda item: (
+                0 if "current-authority-span" in item.method else 1,
+                0 if "current-explicit-wording" in item.method else 1,
+                0 if "authority-anchor" in item.method else 1,
+                0 if "smart-structured-value" in item.method else 1,
+                -float(item.score),
+                item.chunk.filename.casefold(),
+                item.chunk.page_number,
+            ),
+        )
+        review = review_retrieved_evidence(interpretation, ranked)
+        logger.info(
+            "smart_rag stage=ai_postmerge_evidence_review sufficient=%s ai=%s missing=%d retry=%d reason=%s",
+            review.sufficient,
+            review.ai_used,
+            len(review.missing_evidence),
+            len(review.retry_queries),
+            review.reason[:240],
+        )
+        if review.sufficient:
+            _CURRENT_COVERAGE_STATUS.set("sufficient")
+            return ranked
+
+        db = _CURRENT_DB.get()
+        if db is None or not review.retry_queries:
+            _CURRENT_COVERAGE_STATUS.set("insufficient_after_review")
+            return ranked
+
+        try:
+            from app.rag.embeddings import embedding_service
+
+            retry_queries = list(review.retry_queries)[:_int_env("SMART_RAG_AI_RETRY_QUERIES", 2, 1, 3)]
+            retry_vectors = embedding_service.encode(retry_queries)
+            retry_limit = _int_env("SMART_RAG_AI_RETRY_CANDIDATES", 120, 30, 240)
+            retry_items = []
+            for retry_query, retry_vector in zip(retry_queries, retry_vectors, strict=True):
+                for item in fast_search_chunks(db, retry_vector.tolist(), retry_query, retry_limit):
+                    retry_items.append(replace(item, method=item.method + "+ai-postmerge-retry"))
+
+            # Add a bounded corpus-wide lexical arm as well. Semantic similarity is not
+            # enough for role assignments, explicit counts, table rows or amendment text.
+            focus_terms = list(dict.fromkeys([*interpretation.concepts, *plan.focus_terms, *plan.context_terms]))[:48]
+            for item in fast_corpus_scan(
+                db,
+                retry_queries,
+                focus_terms=focus_terms,
+                reference_mode=False,
+                limit=min(retry_limit * 2, 300),
+            ):
+                retry_items.append(replace(item, method=item.method + "+ai-postmerge-retry"))
+
+            if retry_items:
+                try:
+                    neighbor_seeds = sorted(retry_items, key=lambda item: -float(item.score))[:24]
+                    for item in original_fetch_neighbors(db, neighbor_seeds, window=1):
+                        retry_items.append(replace(item, method=item.method + "+ai-postmerge-neighbor"))
+                except Exception:
+                    logger.exception("Post-merge AI retry neighbor expansion failed")
+
+            by_id = {item.chunk.chunk_id: item for item in ranked}
+            for item in retry_items:
+                current = by_id.get(item.chunk.chunk_id)
+                if current is None or float(item.score) > float(current.score):
+                    by_id[item.chunk.chunk_id] = item
+                elif "ai-postmerge" not in current.method:
+                    by_id[item.chunk.chunk_id] = replace(current, method=current.method + "+ai-postmerge-retry")
+
+            merged = sorted(
+                by_id.values(),
+                key=lambda item: (
+                    0 if "current-authority-span" in item.method else 1,
+                    0 if "current-explicit-wording" in item.method else 1,
+                    0 if "authority-anchor" in item.method else 1,
+                    0 if "smart-structured-value" in item.method else 1,
+                    0 if "ai-postmerge-retry" in item.method else 1,
+                    -float(item.score),
+                    item.chunk.filename.casefold(),
+                    item.chunk.page_number,
+                ),
+            )
+
+            # A second small critic call is used only after an actual retry. It does not
+            # generate another retry, so the loop remains strictly bounded.
+            final_review = review_retrieved_evidence(interpretation, merged)
+            logger.info(
+                "smart_rag stage=ai_postmerge_final_review sufficient=%s ai=%s missing=%d reason=%s",
+                final_review.sufficient,
+                final_review.ai_used,
+                len(final_review.missing_evidence),
+                final_review.reason[:240],
+            )
+            _CURRENT_COVERAGE_STATUS.set(
+                "sufficient_after_retry" if final_review.sufficient else "insufficient_after_retry"
+            )
+            return merged
+        except Exception:
+            logger.exception("Post-merge AI evidence retry failed; continuing with assembled candidates")
+            _CURRENT_COVERAGE_STATUS.set("insufficient_after_retry_error")
+            return ranked
+
     def smart_select(plan, candidates, max_chunks=None, *, preferred_document_ids=None):  # type: ignore[no-untyped-def]
+        candidates = _postmerge_evidence_review(plan, candidates)
         cap = _int_env("SMART_RAG_FINAL_CONTEXT_CHUNKS", 48, 12, 120)
         definition_aliases = _CURRENT_DEFINITION_ALIASES.get()
         current_question = _CURRENT_ORIGINAL_QUESTION.get() or plan.original_question
@@ -620,6 +711,34 @@ def install_smart_rag_patch() -> None:
                 break
         return merged
 
+    def smart_ask_impl(
+        self,
+        db,
+        question,
+        top_k=None,
+        rewrite_question=None,
+        conversation_context=None,
+    ):  # type: ignore[no-untyped-def]
+        # Make the active request DB session available to the post-merge evidence
+        # reviewer without changing the baseline service method signatures. ContextVar
+        # keeps concurrent async/threaded requests isolated.
+        db_token = _CURRENT_DB.set(db)
+        coverage_token = _CURRENT_COVERAGE_STATUS.set("not_reviewed")
+        reviewed_token = _CURRENT_AI_EVIDENCE_REVIEWED.set(False)
+        try:
+            return original_ask_impl(
+                self,
+                db,
+                question,
+                top_k,
+                rewrite_question,
+                conversation_context,
+            )
+        finally:
+            _CURRENT_DB.reset(db_token)
+            _CURRENT_COVERAGE_STATUS.reset(coverage_token)
+            _CURRENT_AI_EVIDENCE_REVIEWED.reset(reviewed_token)
+
     def smart_process_document(self, db, document):  # type: ignore[no-untyped-def]
         result = original_process_document(self, db, document)
         try:
@@ -705,7 +824,12 @@ def install_smart_rag_patch() -> None:
         )
         interpretation = _CURRENT_INTERPRETATION.get()
         if interpretation is not None:
-            corrected = verify_answer(interpretation, bundle.raw_answer, bundle.sources)
+            corrected = verify_answer(
+                interpretation,
+                bundle.raw_answer,
+                bundle.sources,
+                coverage_status=_CURRENT_COVERAGE_STATUS.get(),
+            )
             if corrected and corrected != bundle.raw_answer:
                 bundle = replace(bundle, raw_answer=corrected)
         return bundle
@@ -751,10 +875,9 @@ def install_smart_rag_patch() -> None:
         return original_search_mode(original, contextual, intent)
 
     def smart_needs_conversation_context(question):  # type: ignore[no-untyped-def]
-        # Make recent USER turns available to the AI interpreter on every request.
-        # The interpreter itself must explicitly set uses_history=true before any
-        # previous routing hint is allowed into the final plan. This matches chat
-        # behavior without the old phrase-list gate deciding whether context exists.
+        # Make recent USER turns available to the v4 two-pass interpreter. The first
+        # interpretation is always performed without history; only a genuinely
+        # context-dependent current message gets a second history-assisted pass.
         if _bool_env("SMART_RAG_AI_INTERPRETATION", True):
             return True
         return original_needs_conversation_context(question)
@@ -789,6 +912,7 @@ def install_smart_rag_patch() -> None:
     service_module.rank_scenario_documents = smart_rank_scenario_documents
     service_module.filter_hard_context_candidates = smart_filter_hard_context
     service_module.RagService._select_context_chunks = staticmethod(smart_select)
+    service_module.RagService._ask_impl = smart_ask_impl
     service_module.RagService.process_document = smart_process_document
     service_module.synthesize_answer = smart_synthesize_answer
 
@@ -864,5 +988,23 @@ SMART-RAG AI-RESOLVED INTENT:
   correctness, not optional context.
 """
 
+    if "SMART-RAG ANSWER-FIRST USER STYLE V4" not in synthesis_module._ANSWER_SYSTEM_PROMPT:
+        synthesis_module._ANSWER_SYSTEM_PROMPT += """
+
+SMART-RAG ANSWER-FIRST USER STYLE V4:
+- The user is asking the knowledge assistant, not inspecting the retrieval engine. Never begin with
+  phrases such as 'The supplied excerpts...', 'The retrieved excerpts...', or 'The evidence does not...'
+  unless the user explicitly asks about retrieval/evidence quality.
+- Start with the most useful supported answer: Yes/No, the responsible role, the current amount, the
+  required action, or the applicable procedure. Give source citations immediately with that answer.
+- When only part of a multi-part question is unresolved, answer the supported parts first and mention
+  the unresolved part afterward in one short sentence.
+- A retrieval miss is not proof of corpus absence. Never say the documents do not state/specify/provide
+  something unless the system has actually reviewed the governing evidence and the available sources
+  establish that absence. Otherwise use a narrow phrase such as 'I could not verify X from the
+  retrieved governing evidence' rather than making a corpus-wide claim.
+- Do not repeat internal retrieval status, excerpt counts or search limitations in a normal answer.
+"""
+
     _INSTALLED = True
-    logger.info("Smart RAG runtime patch installed (AI-first understanding v3)")
+    logger.info("Smart RAG runtime patch installed (AI-first understanding v4; post-merge evidence coverage)")

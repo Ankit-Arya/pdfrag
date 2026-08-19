@@ -1,0 +1,673 @@
+--- a/backend/app/rag/smart_understanding.py
++++ b/backend/app/rag/smart_understanding.py
+@@ -69,12 +69,16 @@
+ - infer the user's conversational act and requested output;
+ - infer semantic concepts that should be searched for;
+ - use recent USER turns to resolve a genuine follow-up.
++- interpret the CURRENT message by itself first; history may only fill information the current message leaves unresolved.
++- preserve explicit origin, route/intermediate location, destination, actor, object and requested outcome as separate concepts when they matter.
+ 
+ You MUST NOT:
+ - invent a metro procedure, rule, amount, speed, role assignment, document number, revision, line applicability or equipment behavior;
+ - invent an expansion for an internal acronym. Use an expansion only if supplied in DOCUMENT-GROUNDED TERMINOLOGY HINTS;
+ - assume two technical states are equivalent merely because they sound similar;
+ - silently choose between materially different operational scopes. Preserve the ambiguity when it could change the answer.
++- treat a shared topic word with the previous turn as proof of a follow-up. A complete current question remains independent even if both turns discuss compensation, evacuation, brakes, etc.
++- overwrite an explicit subject/scope in the current message with a subject/scope inherited from history.
+ 
+ Treat the user's wording as noisy natural language, not a bag of search keywords. A phrase such as a misspelled or colloquial condition should be converted into a faithful, clear question and several useful semantic search formulations. Do not overfit to the literal words if their intended meaning is clear.
+ 
+@@ -88,7 +92,7 @@
+ - scope: object containing only explicitly stated or safely resolved applicability constraints (for example line, rolling_stock, mode, location, person_type, equipment). Unknown values should be omitted;
+ - material_ambiguity: true only when unresolved ambiguity could materially change the answer;
+ - ambiguity_note: short explanation, or empty string;
+-- uses_history: true only if recent USER context is actually needed to understand this turn;
++- uses_history: true only if the CURRENT message contains an unresolved referent/ellipsis and recent USER context is actually needed to understand it; a self-contained current question MUST set false even when recent turns are topically related;
+ - authority_sensitive: true when current revision/amendment/authoritative version can change the requested answer;
+ - route_strategy: one of dedicated_procedure, authoritative_rule, structured_lookup, broad_corpus;
+ - corrections: short list of meaningful spelling/wording corrections made, excluding trivial grammar.
+@@ -99,6 +103,7 @@
+ - If the user asks who is responsible, whether something is necessary/allowed, or what happens under a condition, understand the underlying responsibility/requirement/procedure even when they do not use words like 'procedure' or 'shall'.
+ - If a request asks for a value tied to a category, include both the category and the value dimension in evidence_needs.
+ - For an operational scenario, evidence_needs should include applicability/branch conditions when they matter.
++- For evacuation/movement wording, keep the starting point, intermediate route (for example track/walkway), and destination (for example station/platform/safe point) distinct. Do not collapse an intermediate route into the final destination.
+ """
+ 
+ _EVIDENCE_REVIEW_SYSTEM = """You are an evidence-coverage critic for a CLOSED-BOOK RAG system.
+@@ -111,7 +116,9 @@
+ - the question asks whether something is required but the excerpts only describe nearby equipment/location;
+ - the question asks for a current value but the evidence lacks the governing/current schedule or contains conflicting versions without authority;
+ - the question asks for a procedure but the excerpts contain only generic background or a different failure/scenario;
+-- important applicability/branch information requested by the interpretation is absent.
++- important applicability/branch information requested by the interpretation is absent;
++- a current/amended answer is requested but only an older/base provision is present;
++- the evidence would only justify saying 'not found/not specified' because the governing document family or expected procedure section has not actually been checked.
+ 
+ If insufficient, propose 1-3 targeted retry queries that search for the missing evidence using concepts or terminology already present in the resolved question, evidence requirements, terminology hints, or retrieved excerpts. Do not invent document codes, factual answers or unsupported acronym expansions.
+ 
+@@ -138,6 +145,9 @@
+ - For a vague colloquial category that can map to multiple formal source categories, state the supported conditional match or alternatives rather than silently choosing one.
+ - Preserve valid source numbers; never create a source number that is not supplied.
+ - Keep a correct draft unchanged except for improvements needed by these rules.
++- Do not mention 'supplied excerpts', 'retrieved excerpts' or similar retrieval-internal language in the user-facing answer unless the user explicitly asks about retrieval.
++- Lead with the supported answer (Yes/No, role, amount, action, definition, or procedure). Put any genuine limitation after the supported facts.
++- A retrieval miss is NOT proof that the corpus lacks the answer. If coverage status is not sufficient, never state that the documents do not contain/specify a fact; say only that the answer could not be verified from the retrieved governing evidence.
+ 
+ Return only the final answer text, with citations.
+ """
+@@ -300,6 +310,38 @@
+     )
+ 
+ 
++def _current_message_hints(question: str, hints: list[str] | None) -> list[str]:
++    if not hints:
++        return []
++    question_folded = question.casefold()
++    tokens = {token.casefold() for token in _TOKEN_RE.findall(question)}
++    selected: list[str] = []
++    for hint in hints:
++        alias = str(hint).split("=", 1)[0].strip()
++        alias_folded = alias.casefold()
++        if alias_folded and (alias_folded in tokens or alias_folded in question_folded):
++            selected.append(hint)
++    return selected[:20]
++
++
++def _run_interpretation_call(
++    question: str,
++    *,
++    history: list[dict[str, str]] | None,
++    abbreviation_hints: list[str] | None,
++    routing_hints: list[str] | None,
++) -> SmartInterpretation:
++    settings = get_settings()
++    raw = llm_service.generate(
++        _INTERPRET_SYSTEM,
++        _interpret_prompt(question, history, abbreviation_hints, routing_hints),
++        max_output_tokens=_int_env("SMART_RAG_AI_INTERPRET_MAX_TOKENS", 950, 500, 1600),
++        model=settings.query_model,
++        reasoning_effort=settings.query_reasoning_effort,
++    )
++    return _parse_interpretation(question, _json_object(raw))
++
++
+ def interpret_user_message(
+     question: str,
+     *,
+@@ -309,21 +351,41 @@
+ ) -> SmartInterpretation:
+     if not _bool_env("SMART_RAG_AI_INTERPRETATION", True):
+         return _fallback(question)
+-    settings = get_settings()
++
++    # v4 context isolation: interpret the current message WITHOUT history first.
++    # This prevents a complete new question from inheriting the previous topic merely
++    # because both mention the same domain word. Only a message the model itself marks
++    # as context-dependent gets a second, history-assisted resolution pass.
+     try:
+-        raw = llm_service.generate(
+-            _INTERPRET_SYSTEM,
+-            _interpret_prompt(question, history, abbreviation_hints, routing_hints),
+-            max_output_tokens=_int_env("SMART_RAG_AI_INTERPRET_MAX_TOKENS", 950, 500, 1600),
+-            model=settings.query_model,
+-            reasoning_effort=settings.query_reasoning_effort,
++        standalone = _run_interpretation_call(
++            question,
++            history=None,
++            abbreviation_hints=_current_message_hints(question, abbreviation_hints),
++            routing_hints=None,
+         )
+-        return _parse_interpretation(question, _json_object(raw))
+     except (LlmConfigurationError, ValueError, TypeError, json.JSONDecodeError):
+         return _fallback(question)
+     except Exception:
+         return _fallback(question)
+ 
++    if not history or not standalone.uses_history:
++        return standalone
++
++    try:
++        contextual = _run_interpretation_call(
++            question,
++            history=history,
++            abbreviation_hints=abbreviation_hints,
++            routing_hints=routing_hints,
++        )
++        # The second pass is allowed to fill a missing referent, but the prompt
++        # explicitly forbids replacing facts/scope stated in the current message.
++        return contextual
++    except Exception:
++        # A context-resolution failure should degrade to the safe standalone reading,
++        # not make the whole request fall back to keyword-first behavior.
++        return standalone
++
+ 
+ def relevant_terminology_hints(
+     interpretation: SmartInterpretation,
+@@ -348,17 +410,15 @@
+         return False
+     if interpretation.conversation_act == "navigation" or interpretation.intent == "definition":
+         return False
+-    return bool(
+-        interpretation.authority_sensitive
+-        or interpretation.material_ambiguity
+-        or interpretation.intent in {"procedure", "requirement", "troubleshooting", "comparison", "list"}
+-        or len(interpretation.evidence_needs) >= 2
+-    )
++    # v4 reviews coverage for every normal answer request. A cheap query-model call is
++    # preferable to turning a weak retrieval into a confident false-negative. Definitions
++    # remain deterministic and navigation requests do not need answerability review.
++    return bool(interpretation.evidence_needs)
+ 
+ 
+ def _evidence_prompt(interpretation: SmartInterpretation, results: list[object]) -> str:
+     blocks: list[str] = []
+-    for index, item in enumerate(results[:12], 1):
++    for index, item in enumerate(results[:24], 1):
+         chunk = getattr(item, "chunk", None)
+         if chunk is None:
+             continue
+@@ -410,8 +470,15 @@
+             ai_used=True,
+         )
+     except Exception:
+-        # Failure of the critic must never block the existing deterministic RAG path.
+-        return EvidenceReview(sufficient=True, ai_used=False)
++        # Critic failure must not be mistaken for proof that evidence is sufficient.
++        # Retrieval can continue, but negative/corpus-absence claims remain unverified.
++        return EvidenceReview(
++            sufficient=False,
++            missing_evidence=interpretation.evidence_needs,
++            retry_queries=(),
++            reason="AI evidence critic unavailable; coverage not verified",
++            ai_used=False,
++        )
+ 
+ 
+ def should_verify_answer(interpretation: SmartInterpretation, draft: str) -> bool:
+@@ -431,6 +498,8 @@
+     interpretation: SmartInterpretation,
+     draft: str,
+     sources: list[object],
++    *,
++    coverage_status: str = "not_reviewed",
+ ) -> str:
+     if not draft or not should_verify_answer(interpretation, draft) or not sources:
+         return draft
+@@ -467,6 +536,9 @@
+ REQUESTED EVIDENCE COVERAGE:
+ {chr(10).join(f'- {value}' for value in interpretation.evidence_needs)}
+ 
++SYSTEM EVIDENCE-COVERAGE STATUS:
++{coverage_status}
++
+ SCOPE:
+ {json.dumps(interpretation.scope, ensure_ascii=False)}
+ 
+--- a/backend/app/rag/smart_runtime.py
++++ b/backend/app/rag/smart_runtime.py
+@@ -58,6 +58,12 @@
+ _CURRENT_AI_EVIDENCE_REVIEWED: contextvars.ContextVar[bool] = contextvars.ContextVar(
+     "pdfrag_smart_ai_evidence_reviewed", default=False
+ )
++_CURRENT_DB: contextvars.ContextVar[object | None] = contextvars.ContextVar(
++    "pdfrag_smart_db", default=None
++)
++_CURRENT_COVERAGE_STATUS: contextvars.ContextVar[str] = contextvars.ContextVar(
++    "pdfrag_smart_coverage_status", default="not_reviewed"
++)
+ 
+ 
+ def _bool_env(name: str, default: bool) -> bool:
+@@ -107,6 +113,7 @@
+     original_rank_scenario_documents = service_module.rank_scenario_documents
+     original_filter_hard_context = service_module.filter_hard_context_candidates
+     original_process_document = service_module.RagService.process_document
++    original_ask_impl = service_module.RagService._ask_impl
+     original_plan = query_module.QueryPlanner.plan
+     original_search_mode = service_module.deterministic_search_mode
+     original_needs_conversation_context = service_module.needs_conversation_context
+@@ -177,6 +184,7 @@
+         )
+         _CURRENT_INTERPRETATION.set(interpretation)
+         _CURRENT_AI_EVIDENCE_REVIEWED.set(False)
++        _CURRENT_COVERAGE_STATUS.set("not_reviewed")
+         _CURRENT_ORIGINAL_QUESTION.set(question)
+ 
+         # An unrelated previous turn must not bleed into retrieval merely because we made
+@@ -231,8 +239,16 @@
+         candidates: list[str] = []
+         if definition_aliases:
+             candidates.extend(definition_aliases)
+-        candidates.extend(interpretation.search_queries)
++        # Put the resolved question first, then force one generic authority-oriented
++        # formulation when revision/currentness can change the answer. This does not
++        # invent a document or value; it simply makes amendment/replacement evidence
++        # discoverable before an older cleanly-OCR'd provision can dominate ranking.
+         candidates.append(resolved)
++        if interpretation.authority_sensitive:
++            candidates.append(
++                f"{resolved} current amended amendment revised substituted replacement schedule effective"
++            )
++        candidates.extend(interpretation.search_queries)
+         if scenario.is_situational:
+             candidates.append(scenario_relaxed_query(scenario))
+         # Keep the raw wording only as a late exact-token fallback for identifiers/codes.
+@@ -301,56 +317,11 @@
+                         break
+                 result = deduped
+ 
+-        # One bounded AI evidence-coverage review per user turn. Unlike similarity
+-        # thresholds, this checks whether the retrieved excerpts actually satisfy the
+-        # interpreted evidence needs (responsibility, requirement, current value, branch,
+-        # etc.). If not, run at most a few targeted semantic retries and merge them.
+-        interpretation = _CURRENT_INTERPRETATION.get()
+-        if (
+-            interpretation is not None
+-            and not _CURRENT_AI_EVIDENCE_REVIEWED.get()
+-            and should_review_evidence(interpretation)
+-        ):
+-            _CURRENT_AI_EVIDENCE_REVIEWED.set(True)
+-            review = review_retrieved_evidence(interpretation, result)
+-            logger.info(
+-                "smart_rag stage=ai_evidence_review sufficient=%s ai=%s missing=%d retry=%d reason=%s",
+-                review.sufficient,
+-                review.ai_used,
+-                len(review.missing_evidence),
+-                len(review.retry_queries),
+-                review.reason[:240],
+-            )
+-            if not review.sufficient and review.retry_queries:
+-                try:
+-                    from app.rag.embeddings import embedding_service
+-
+-                    retry_vectors = embedding_service.encode(list(review.retry_queries))
+-                    retry_items = []
+-                    retry_limit = min(limit, _int_env("SMART_RAG_AI_RETRY_CANDIDATES", 120, 30, 240))
+-                    for retry_query, retry_vector in zip(review.retry_queries, retry_vectors, strict=True):
+-                        for item in fast_search_chunks(db, retry_vector.tolist(), retry_query, retry_limit):
+-                            retry_items.append(replace(item, method=item.method + "+ai-evidence-retry"))
+-                    by_id = {item.chunk.chunk_id: item for item in result}
+-                    for item in retry_items:
+-                        current = by_id.get(item.chunk.chunk_id)
+-                        if current is None or float(item.score) > float(current.score):
+-                            by_id[item.chunk.chunk_id] = item
+-                        elif "ai-evidence-retry" not in current.method:
+-                            by_id[item.chunk.chunk_id] = replace(current, method=current.method + "+ai-evidence-retry")
+-                    result = sorted(
+-                        by_id.values(),
+-                        key=lambda item: (
+-                            0 if "terminology-definition" in item.method else 1,
+-                            0 if "current-authority-span" in item.method else 1,
+-                            0 if "authority-anchor" in item.method else 1,
+-                            -float(item.score),
+-                            item.chunk.filename.casefold(),
+-                            item.chunk.page_number,
+-                        ),
+-                    )[:limit]
+-                except Exception:
+-                    logger.exception("AI evidence retry failed; continuing with existing retrieval candidates")
++        # v4 deliberately does NOT run the AI evidence critic here. This function is
++        # called once per semantic query, before the service has merged other query
++        # variants, corpus-wide lexical matches, routed procedures, reference hops and
++        # neighbor chunks. Coverage is reviewed later in smart_select against the fully
++        # assembled candidate set.
+ 
+         fallback_score = _float_env("SMART_RAG_BROAD_FALLBACK_SCORE", 0.12)
+         answerable = retrieval_answerable(_CURRENT_ORIGINAL_QUESTION.get() or query_text, result)
+@@ -533,7 +504,127 @@
+         allowed = original_filter_hard_context(relevance_plan(plan), enriched)
+         return [originals.get(item.chunk.chunk_id, item) for item in allowed]
+ 
++    def _postmerge_evidence_review(plan, candidates):  # type: ignore[no-untyped-def]
++        """Review coverage only after all normal retrieval arms have been merged.
++
++        v3 reviewed the first per-query result set and then permanently marked the turn
++        reviewed. That could miss the governing procedure even when later retrieval arms
++        would have found it. v4 reviews the complete candidate set and performs at most
++        one bounded semantic+lexical retry using the current request DB session.
++        """
++        interpretation = _CURRENT_INTERPRETATION.get()
++        if (
++            interpretation is None
++            or _CURRENT_AI_EVIDENCE_REVIEWED.get()
++            or not should_review_evidence(interpretation)
++        ):
++            return list(candidates)
++
++        _CURRENT_AI_EVIDENCE_REVIEWED.set(True)
++        ranked = sorted(
++            list(candidates),
++            key=lambda item: (
++                0 if "current-authority-span" in item.method else 1,
++                0 if "current-explicit-wording" in item.method else 1,
++                0 if "authority-anchor" in item.method else 1,
++                0 if "smart-structured-value" in item.method else 1,
++                -float(item.score),
++                item.chunk.filename.casefold(),
++                item.chunk.page_number,
++            ),
++        )
++        review = review_retrieved_evidence(interpretation, ranked)
++        logger.info(
++            "smart_rag stage=ai_postmerge_evidence_review sufficient=%s ai=%s missing=%d retry=%d reason=%s",
++            review.sufficient,
++            review.ai_used,
++            len(review.missing_evidence),
++            len(review.retry_queries),
++            review.reason[:240],
++        )
++        if review.sufficient:
++            _CURRENT_COVERAGE_STATUS.set("sufficient")
++            return ranked
++
++        db = _CURRENT_DB.get()
++        if db is None or not review.retry_queries:
++            _CURRENT_COVERAGE_STATUS.set("insufficient_after_review")
++            return ranked
++
++        try:
++            from app.rag.embeddings import embedding_service
++
++            retry_queries = list(review.retry_queries)[:_int_env("SMART_RAG_AI_RETRY_QUERIES", 2, 1, 3)]
++            retry_vectors = embedding_service.encode(retry_queries)
++            retry_limit = _int_env("SMART_RAG_AI_RETRY_CANDIDATES", 120, 30, 240)
++            retry_items = []
++            for retry_query, retry_vector in zip(retry_queries, retry_vectors, strict=True):
++                for item in fast_search_chunks(db, retry_vector.tolist(), retry_query, retry_limit):
++                    retry_items.append(replace(item, method=item.method + "+ai-postmerge-retry"))
++
++            # Add a bounded corpus-wide lexical arm as well. Semantic similarity is not
++            # enough for role assignments, explicit counts, table rows or amendment text.
++            focus_terms = list(dict.fromkeys([*interpretation.concepts, *plan.focus_terms, *plan.context_terms]))[:48]
++            for item in fast_corpus_scan(
++                db,
++                retry_queries,
++                focus_terms=focus_terms,
++                reference_mode=False,
++                limit=min(retry_limit * 2, 300),
++            ):
++                retry_items.append(replace(item, method=item.method + "+ai-postmerge-retry"))
++
++            if retry_items:
++                try:
++                    neighbor_seeds = sorted(retry_items, key=lambda item: -float(item.score))[:24]
++                    for item in original_fetch_neighbors(db, neighbor_seeds, window=1):
++                        retry_items.append(replace(item, method=item.method + "+ai-postmerge-neighbor"))
++                except Exception:
++                    logger.exception("Post-merge AI retry neighbor expansion failed")
++
++            by_id = {item.chunk.chunk_id: item for item in ranked}
++            for item in retry_items:
++                current = by_id.get(item.chunk.chunk_id)
++                if current is None or float(item.score) > float(current.score):
++                    by_id[item.chunk.chunk_id] = item
++                elif "ai-postmerge" not in current.method:
++                    by_id[item.chunk.chunk_id] = replace(current, method=current.method + "+ai-postmerge-retry")
++
++            merged = sorted(
++                by_id.values(),
++                key=lambda item: (
++                    0 if "current-authority-span" in item.method else 1,
++                    0 if "current-explicit-wording" in item.method else 1,
++                    0 if "authority-anchor" in item.method else 1,
++                    0 if "smart-structured-value" in item.method else 1,
++                    0 if "ai-postmerge-retry" in item.method else 1,
++                    -float(item.score),
++                    item.chunk.filename.casefold(),
++                    item.chunk.page_number,
++                ),
++            )
++
++            # A second small critic call is used only after an actual retry. It does not
++            # generate another retry, so the loop remains strictly bounded.
++            final_review = review_retrieved_evidence(interpretation, merged)
++            logger.info(
++                "smart_rag stage=ai_postmerge_final_review sufficient=%s ai=%s missing=%d reason=%s",
++                final_review.sufficient,
++                final_review.ai_used,
++                len(final_review.missing_evidence),
++                final_review.reason[:240],
++            )
++            _CURRENT_COVERAGE_STATUS.set(
++                "sufficient_after_retry" if final_review.sufficient else "insufficient_after_retry"
++            )
++            return merged
++        except Exception:
++            logger.exception("Post-merge AI evidence retry failed; continuing with assembled candidates")
++            _CURRENT_COVERAGE_STATUS.set("insufficient_after_retry_error")
++            return ranked
++
+     def smart_select(plan, candidates, max_chunks=None, *, preferred_document_ids=None):  # type: ignore[no-untyped-def]
++        candidates = _postmerge_evidence_review(plan, candidates)
+         cap = _int_env("SMART_RAG_FINAL_CONTEXT_CHUNKS", 48, 12, 120)
+         definition_aliases = _CURRENT_DEFINITION_ALIASES.get()
+         current_question = _CURRENT_ORIGINAL_QUESTION.get() or plan.original_question
+@@ -620,6 +711,34 @@
+                 break
+         return merged
+ 
++    def smart_ask_impl(
++        self,
++        db,
++        question,
++        top_k=None,
++        rewrite_question=None,
++        conversation_context=None,
++    ):  # type: ignore[no-untyped-def]
++        # Make the active request DB session available to the post-merge evidence
++        # reviewer without changing the baseline service method signatures. ContextVar
++        # keeps concurrent async/threaded requests isolated.
++        db_token = _CURRENT_DB.set(db)
++        coverage_token = _CURRENT_COVERAGE_STATUS.set("not_reviewed")
++        reviewed_token = _CURRENT_AI_EVIDENCE_REVIEWED.set(False)
++        try:
++            return original_ask_impl(
++                self,
++                db,
++                question,
++                top_k,
++                rewrite_question,
++                conversation_context,
++            )
++        finally:
++            _CURRENT_DB.reset(db_token)
++            _CURRENT_COVERAGE_STATUS.reset(coverage_token)
++            _CURRENT_AI_EVIDENCE_REVIEWED.reset(reviewed_token)
++
+     def smart_process_document(self, db, document):  # type: ignore[no-untyped-def]
+         result = original_process_document(self, db, document)
+         try:
+@@ -705,7 +824,12 @@
+         )
+         interpretation = _CURRENT_INTERPRETATION.get()
+         if interpretation is not None:
+-            corrected = verify_answer(interpretation, bundle.raw_answer, bundle.sources)
++            corrected = verify_answer(
++                interpretation,
++                bundle.raw_answer,
++                bundle.sources,
++                coverage_status=_CURRENT_COVERAGE_STATUS.get(),
++            )
+             if corrected and corrected != bundle.raw_answer:
+                 bundle = replace(bundle, raw_answer=corrected)
+         return bundle
+@@ -751,10 +875,9 @@
+         return original_search_mode(original, contextual, intent)
+ 
+     def smart_needs_conversation_context(question):  # type: ignore[no-untyped-def]
+-        # Make recent USER turns available to the AI interpreter on every request.
+-        # The interpreter itself must explicitly set uses_history=true before any
+-        # previous routing hint is allowed into the final plan. This matches chat
+-        # behavior without the old phrase-list gate deciding whether context exists.
++        # Make recent USER turns available to the v4 two-pass interpreter. The first
++        # interpretation is always performed without history; only a genuinely
++        # context-dependent current message gets a second history-assisted pass.
+         if _bool_env("SMART_RAG_AI_INTERPRETATION", True):
+             return True
+         return original_needs_conversation_context(question)
+@@ -789,6 +912,7 @@
+     service_module.rank_scenario_documents = smart_rank_scenario_documents
+     service_module.filter_hard_context_candidates = smart_filter_hard_context
+     service_module.RagService._select_context_chunks = staticmethod(smart_select)
++    service_module.RagService._ask_impl = smart_ask_impl
+     service_module.RagService.process_document = smart_process_document
+     service_module.synthesize_answer = smart_synthesize_answer
+ 
+@@ -864,5 +988,23 @@
+   correctness, not optional context.
+ """
+ 
++    if "SMART-RAG ANSWER-FIRST USER STYLE V4" not in synthesis_module._ANSWER_SYSTEM_PROMPT:
++        synthesis_module._ANSWER_SYSTEM_PROMPT += """
++
++SMART-RAG ANSWER-FIRST USER STYLE V4:
++- The user is asking the knowledge assistant, not inspecting the retrieval engine. Never begin with
++  phrases such as 'The supplied excerpts...', 'The retrieved excerpts...', or 'The evidence does not...'
++  unless the user explicitly asks about retrieval/evidence quality.
++- Start with the most useful supported answer: Yes/No, the responsible role, the current amount, the
++  required action, or the applicable procedure. Give source citations immediately with that answer.
++- When only part of a multi-part question is unresolved, answer the supported parts first and mention
++  the unresolved part afterward in one short sentence.
++- A retrieval miss is not proof of corpus absence. Never say the documents do not state/specify/provide
++  something unless the system has actually reviewed the governing evidence and the available sources
++  establish that absence. Otherwise use a narrow phrase such as 'I could not verify X from the
++  retrieved governing evidence' rather than making a corpus-wide claim.
++- Do not repeat internal retrieval status, excerpt counts or search limitations in a normal answer.
++"""
++
+     _INSTALLED = True
+-    logger.info("Smart RAG runtime patch installed (AI-first understanding v3)")
++    logger.info("Smart RAG runtime patch installed (AI-first understanding v4; post-merge evidence coverage)")
+--- a/backend/tests/test_smart_ai_understanding.py
++++ b/backend/tests/test_smart_ai_understanding.py
+@@ -202,3 +202,129 @@
+     assert interpretation.intent == "requirement"
+     assert interpretation.resolved_question == "Who authorizes movement after the stated equipment failure?"
+     assert interpretation.search_queries[0] == interpretation.resolved_question
++
++
++def _payload(*, resolved: str, uses_history: bool, intent: str = "fact_lookup", route: str = "broad_corpus") -> str:
++    import json
++    return json.dumps(
++        {
++            "resolved_question": resolved,
++            "intent": intent,
++            "conversation_act": "question",
++            "concepts": ["compensation", "death", "injuries"],
++            "evidence_needs": ["governing current compensation for death and injuries"],
++            "search_queries": [resolved, "current compensation death injuries schedule"],
++            "scope": {},
++            "material_ambiguity": False,
++            "ambiguity_note": "",
++            "uses_history": uses_history,
++            "authority_sensitive": True,
++            "route_strategy": route,
++            "corrections": [],
++        }
++    )
++
++
++def test_self_contained_question_is_interpreted_without_history(monkeypatch) -> None:
++    import app.rag.smart_understanding as module
++
++    prompts: list[str] = []
++
++    def fake_generate(system, user, **kwargs):
++        prompts.append(user)
++        return _payload(
++            resolved="What compensation is payable for death and injuries under the current rules?",
++            uses_history=False,
++            route="structured_lookup",
++        )
++
++    monkeypatch.setattr(module.llm_service, "generate", fake_generate)
++    interpretation = module.interpret_user_message(
++        "what is the compensation payable for death and injuries",
++        history=[{"role": "user", "content": "what is monkey bite compensation amount"}],
++    )
++    assert interpretation.ai_used
++    assert interpretation.uses_history is False
++    assert "monkey bite" not in interpretation.resolved_question.casefold()
++    assert len(prompts) == 1
++    assert "RECENT USER CONTEXT (intent resolution only; never factual evidence):\nNone" in prompts[0]
++
++
++def test_context_is_loaded_only_after_standalone_pass_requests_it(monkeypatch) -> None:
++    import app.rag.smart_understanding as module
++    import json
++
++    prompts: list[str] = []
++
++    first = json.dumps(
++        {
++            "resolved_question": "What amount applies to that case?",
++            "intent": "fact_lookup",
++            "conversation_act": "question",
++            "concepts": ["amount", "unresolved prior case"],
++            "evidence_needs": ["amount for the previously referenced case"],
++            "search_queries": ["amount for previous case"],
++            "scope": {},
++            "material_ambiguity": False,
++            "ambiguity_note": "",
++            "uses_history": True,
++            "authority_sensitive": True,
++            "route_strategy": "structured_lookup",
++            "corrections": [],
++        }
++    )
++    second = json.dumps(
++        {
++            "resolved_question": "What is the compensation amount for the previously discussed injury?",
++            "intent": "fact_lookup",
++            "conversation_act": "question",
++            "concepts": ["compensation", "injury"],
++            "evidence_needs": ["current compensation amount for the previously discussed injury"],
++            "search_queries": ["current compensation injury amount schedule"],
++            "scope": {},
++            "material_ambiguity": False,
++            "ambiguity_note": "",
++            "uses_history": True,
++            "authority_sensitive": True,
++            "route_strategy": "structured_lookup",
++            "corrections": [],
++        }
++    )
++
++    def fake_generate(system, user, **kwargs):
++        prompts.append(user)
++        return first if len(prompts) == 1 else second
++
++    monkeypatch.setattr(module.llm_service, "generate", fake_generate)
++    interpretation = module.interpret_user_message(
++        "what amount for that case",
++        history=[{"role": "user", "content": "if femur is fractured what compensation applies"}],
++    )
++    assert len(prompts) == 2
++    assert "RECENT USER CONTEXT (intent resolution only; never factual evidence):\nNone" in prompts[0]
++    assert "if femur is fractured" in prompts[1]
++    assert interpretation.uses_history is True
++    assert "previously discussed injury" in interpretation.resolved_question
++
++
++def test_normal_fact_lookups_get_evidence_coverage_review() -> None:
++    interpretation = SmartInterpretation(
++        raw_question="Who counts passengers?",
++        resolved_question="Who counts passengers during the described evacuation?",
++        intent="fact_lookup",
++        concepts=("passenger count", "evacuation"),
++        evidence_needs=("explicit role responsible for passenger counting",),
++    )
++    assert should_review_evidence(interpretation)
++
++
++def test_v4_runtime_reviews_after_candidate_merge() -> None:
++    from pathlib import Path
++
++    runtime = (Path(__file__).parents[1] / "app" / "rag" / "smart_runtime.py").read_text(encoding="utf-8")
++    assert "def _postmerge_evidence_review" in runtime
++    assert "candidates = _postmerge_evidence_review(plan, candidates)" in runtime
++    search_start = runtime.index("def smart_search")
++    select_start = runtime.index("def smart_select")
++    search_body = runtime[search_start:select_start]
++    assert "review_retrieved_evidence(interpretation, result)" not in search_body

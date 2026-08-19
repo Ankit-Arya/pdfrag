@@ -69,12 +69,16 @@ You MAY use general language ability to:
 - infer the user's conversational act and requested output;
 - infer semantic concepts that should be searched for;
 - use recent USER turns to resolve a genuine follow-up.
+- interpret the CURRENT message by itself first; history may only fill information the current message leaves unresolved.
+- preserve explicit origin, route/intermediate location, destination, actor, object and requested outcome as separate concepts when they matter.
 
 You MUST NOT:
 - invent a metro procedure, rule, amount, speed, role assignment, document number, revision, line applicability or equipment behavior;
 - invent an expansion for an internal acronym. Use an expansion only if supplied in DOCUMENT-GROUNDED TERMINOLOGY HINTS;
 - assume two technical states are equivalent merely because they sound similar;
 - silently choose between materially different operational scopes. Preserve the ambiguity when it could change the answer.
+- treat a shared topic word with the previous turn as proof of a follow-up. A complete current question remains independent even if both turns discuss compensation, evacuation, brakes, etc.
+- overwrite an explicit subject/scope in the current message with a subject/scope inherited from history.
 
 Treat the user's wording as noisy natural language, not a bag of search keywords. A phrase such as a misspelled or colloquial condition should be converted into a faithful, clear question and several useful semantic search formulations. Do not overfit to the literal words if their intended meaning is clear.
 
@@ -88,7 +92,7 @@ Return JSON only with exactly these keys:
 - scope: object containing only explicitly stated or safely resolved applicability constraints (for example line, rolling_stock, mode, location, person_type, equipment). Unknown values should be omitted;
 - material_ambiguity: true only when unresolved ambiguity could materially change the answer;
 - ambiguity_note: short explanation, or empty string;
-- uses_history: true only if recent USER context is actually needed to understand this turn;
+- uses_history: true only if the CURRENT message contains an unresolved referent/ellipsis and recent USER context is actually needed to understand it; a self-contained current question MUST set false even when recent turns are topically related;
 - authority_sensitive: true when current revision/amendment/authoritative version can change the requested answer;
 - route_strategy: one of dedicated_procedure, authoritative_rule, structured_lookup, broad_corpus;
 - corrections: short list of meaningful spelling/wording corrections made, excluding trivial grammar.
@@ -99,6 +103,7 @@ Special conversational behavior:
 - If the user asks who is responsible, whether something is necessary/allowed, or what happens under a condition, understand the underlying responsibility/requirement/procedure even when they do not use words like 'procedure' or 'shall'.
 - If a request asks for a value tied to a category, include both the category and the value dimension in evidence_needs.
 - For an operational scenario, evidence_needs should include applicability/branch conditions when they matter.
+- For evacuation/movement wording, keep the starting point, intermediate route (for example track/walkway), and destination (for example station/platform/safe point) distinct. Do not collapse an intermediate route into the final destination.
 """
 
 _EVIDENCE_REVIEW_SYSTEM = """You are an evidence-coverage critic for a CLOSED-BOOK RAG system.
@@ -111,7 +116,9 @@ Mark insufficient when, for example:
 - the question asks whether something is required but the excerpts only describe nearby equipment/location;
 - the question asks for a current value but the evidence lacks the governing/current schedule or contains conflicting versions without authority;
 - the question asks for a procedure but the excerpts contain only generic background or a different failure/scenario;
-- important applicability/branch information requested by the interpretation is absent.
+- important applicability/branch information requested by the interpretation is absent;
+- a current/amended answer is requested but only an older/base provision is present;
+- the evidence would only justify saying 'not found/not specified' because the governing document family or expected procedure section has not actually been checked.
 
 If insufficient, propose 1-3 targeted retry queries that search for the missing evidence using concepts or terminology already present in the resolved question, evidence requirements, terminology hints, or retrieved excerpts. Do not invent document codes, factual answers or unsupported acronym expansions.
 
@@ -138,6 +145,9 @@ Rules:
 - For a vague colloquial category that can map to multiple formal source categories, state the supported conditional match or alternatives rather than silently choosing one.
 - Preserve valid source numbers; never create a source number that is not supplied.
 - Keep a correct draft unchanged except for improvements needed by these rules.
+- Do not mention 'supplied excerpts', 'retrieved excerpts' or similar retrieval-internal language in the user-facing answer unless the user explicitly asks about retrieval.
+- Lead with the supported answer (Yes/No, role, amount, action, definition, or procedure). Put any genuine limitation after the supported facts.
+- A retrieval miss is NOT proof that the corpus lacks the answer. If coverage status is not sufficient, never state that the documents do not contain/specify a fact; say only that the answer could not be verified from the retrieved governing evidence.
 
 Return only the final answer text, with citations.
 """
@@ -300,6 +310,38 @@ def _parse_interpretation(question: str, payload: dict[str, Any]) -> SmartInterp
     )
 
 
+def _current_message_hints(question: str, hints: list[str] | None) -> list[str]:
+    if not hints:
+        return []
+    question_folded = question.casefold()
+    tokens = {token.casefold() for token in _TOKEN_RE.findall(question)}
+    selected: list[str] = []
+    for hint in hints:
+        alias = str(hint).split("=", 1)[0].strip()
+        alias_folded = alias.casefold()
+        if alias_folded and (alias_folded in tokens or alias_folded in question_folded):
+            selected.append(hint)
+    return selected[:20]
+
+
+def _run_interpretation_call(
+    question: str,
+    *,
+    history: list[dict[str, str]] | None,
+    abbreviation_hints: list[str] | None,
+    routing_hints: list[str] | None,
+) -> SmartInterpretation:
+    settings = get_settings()
+    raw = llm_service.generate(
+        _INTERPRET_SYSTEM,
+        _interpret_prompt(question, history, abbreviation_hints, routing_hints),
+        max_output_tokens=_int_env("SMART_RAG_AI_INTERPRET_MAX_TOKENS", 950, 500, 1600),
+        model=settings.query_model,
+        reasoning_effort=settings.query_reasoning_effort,
+    )
+    return _parse_interpretation(question, _json_object(raw))
+
+
 def interpret_user_message(
     question: str,
     *,
@@ -309,20 +351,40 @@ def interpret_user_message(
 ) -> SmartInterpretation:
     if not _bool_env("SMART_RAG_AI_INTERPRETATION", True):
         return _fallback(question)
-    settings = get_settings()
+
+    # v4 context isolation: interpret the current message WITHOUT history first.
+    # This prevents a complete new question from inheriting the previous topic merely
+    # because both mention the same domain word. Only a message the model itself marks
+    # as context-dependent gets a second, history-assisted resolution pass.
     try:
-        raw = llm_service.generate(
-            _INTERPRET_SYSTEM,
-            _interpret_prompt(question, history, abbreviation_hints, routing_hints),
-            max_output_tokens=_int_env("SMART_RAG_AI_INTERPRET_MAX_TOKENS", 950, 500, 1600),
-            model=settings.query_model,
-            reasoning_effort=settings.query_reasoning_effort,
+        standalone = _run_interpretation_call(
+            question,
+            history=None,
+            abbreviation_hints=_current_message_hints(question, abbreviation_hints),
+            routing_hints=None,
         )
-        return _parse_interpretation(question, _json_object(raw))
     except (LlmConfigurationError, ValueError, TypeError, json.JSONDecodeError):
         return _fallback(question)
     except Exception:
         return _fallback(question)
+
+    if not history or not standalone.uses_history:
+        return standalone
+
+    try:
+        contextual = _run_interpretation_call(
+            question,
+            history=history,
+            abbreviation_hints=abbreviation_hints,
+            routing_hints=routing_hints,
+        )
+        # The second pass is allowed to fill a missing referent, but the prompt
+        # explicitly forbids replacing facts/scope stated in the current message.
+        return contextual
+    except Exception:
+        # A context-resolution failure should degrade to the safe standalone reading,
+        # not make the whole request fall back to keyword-first behavior.
+        return standalone
 
 
 def relevant_terminology_hints(
@@ -348,17 +410,15 @@ def should_review_evidence(interpretation: SmartInterpretation) -> bool:
         return False
     if interpretation.conversation_act == "navigation" or interpretation.intent == "definition":
         return False
-    return bool(
-        interpretation.authority_sensitive
-        or interpretation.material_ambiguity
-        or interpretation.intent in {"procedure", "requirement", "troubleshooting", "comparison", "list"}
-        or len(interpretation.evidence_needs) >= 2
-    )
+    # v4 reviews coverage for every normal answer request. A cheap query-model call is
+    # preferable to turning a weak retrieval into a confident false-negative. Definitions
+    # remain deterministic and navigation requests do not need answerability review.
+    return bool(interpretation.evidence_needs)
 
 
 def _evidence_prompt(interpretation: SmartInterpretation, results: list[object]) -> str:
     blocks: list[str] = []
-    for index, item in enumerate(results[:12], 1):
+    for index, item in enumerate(results[:24], 1):
         chunk = getattr(item, "chunk", None)
         if chunk is None:
             continue
@@ -410,8 +470,15 @@ def review_retrieved_evidence(
             ai_used=True,
         )
     except Exception:
-        # Failure of the critic must never block the existing deterministic RAG path.
-        return EvidenceReview(sufficient=True, ai_used=False)
+        # Critic failure must not be mistaken for proof that evidence is sufficient.
+        # Retrieval can continue, but negative/corpus-absence claims remain unverified.
+        return EvidenceReview(
+            sufficient=False,
+            missing_evidence=interpretation.evidence_needs,
+            retry_queries=(),
+            reason="AI evidence critic unavailable; coverage not verified",
+            ai_used=False,
+        )
 
 
 def should_verify_answer(interpretation: SmartInterpretation, draft: str) -> bool:
@@ -431,6 +498,8 @@ def verify_answer(
     interpretation: SmartInterpretation,
     draft: str,
     sources: list[object],
+    *,
+    coverage_status: str = "not_reviewed",
 ) -> str:
     if not draft or not should_verify_answer(interpretation, draft) or not sources:
         return draft
@@ -466,6 +535,9 @@ RESOLVED QUESTION:
 
 REQUESTED EVIDENCE COVERAGE:
 {chr(10).join(f'- {value}' for value in interpretation.evidence_needs)}
+
+SYSTEM EVIDENCE-COVERAGE STATUS:
+{coverage_status}
 
 SCOPE:
 {json.dumps(interpretation.scope, ensure_ascii=False)}

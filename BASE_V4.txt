@@ -1,0 +1,4 @@
+Incremental overlay target:
+- Repository family: Ankit-Arya/pdfrag
+- Current known Smart RAG repo commit: caac7d44af721d6b1cc1c127d064917658f32650
+- Requires Smart RAG reliability v2 + AI-first v3 files already present.

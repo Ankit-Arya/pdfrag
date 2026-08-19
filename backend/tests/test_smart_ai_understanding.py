@@ -202,3 +202,129 @@ def test_interpret_user_message_uses_single_ai_contract(monkeypatch) -> None:
     assert interpretation.intent == "requirement"
     assert interpretation.resolved_question == "Who authorizes movement after the stated equipment failure?"
     assert interpretation.search_queries[0] == interpretation.resolved_question
+
+
+def _payload(*, resolved: str, uses_history: bool, intent: str = "fact_lookup", route: str = "broad_corpus") -> str:
+    import json
+    return json.dumps(
+        {
+            "resolved_question": resolved,
+            "intent": intent,
+            "conversation_act": "question",
+            "concepts": ["compensation", "death", "injuries"],
+            "evidence_needs": ["governing current compensation for death and injuries"],
+            "search_queries": [resolved, "current compensation death injuries schedule"],
+            "scope": {},
+            "material_ambiguity": False,
+            "ambiguity_note": "",
+            "uses_history": uses_history,
+            "authority_sensitive": True,
+            "route_strategy": route,
+            "corrections": [],
+        }
+    )
+
+
+def test_self_contained_question_is_interpreted_without_history(monkeypatch) -> None:
+    import app.rag.smart_understanding as module
+
+    prompts: list[str] = []
+
+    def fake_generate(system, user, **kwargs):
+        prompts.append(user)
+        return _payload(
+            resolved="What compensation is payable for death and injuries under the current rules?",
+            uses_history=False,
+            route="structured_lookup",
+        )
+
+    monkeypatch.setattr(module.llm_service, "generate", fake_generate)
+    interpretation = module.interpret_user_message(
+        "what is the compensation payable for death and injuries",
+        history=[{"role": "user", "content": "what is monkey bite compensation amount"}],
+    )
+    assert interpretation.ai_used
+    assert interpretation.uses_history is False
+    assert "monkey bite" not in interpretation.resolved_question.casefold()
+    assert len(prompts) == 1
+    assert "RECENT USER CONTEXT (intent resolution only; never factual evidence):\nNone" in prompts[0]
+
+
+def test_context_is_loaded_only_after_standalone_pass_requests_it(monkeypatch) -> None:
+    import app.rag.smart_understanding as module
+    import json
+
+    prompts: list[str] = []
+
+    first = json.dumps(
+        {
+            "resolved_question": "What amount applies to that case?",
+            "intent": "fact_lookup",
+            "conversation_act": "question",
+            "concepts": ["amount", "unresolved prior case"],
+            "evidence_needs": ["amount for the previously referenced case"],
+            "search_queries": ["amount for previous case"],
+            "scope": {},
+            "material_ambiguity": False,
+            "ambiguity_note": "",
+            "uses_history": True,
+            "authority_sensitive": True,
+            "route_strategy": "structured_lookup",
+            "corrections": [],
+        }
+    )
+    second = json.dumps(
+        {
+            "resolved_question": "What is the compensation amount for the previously discussed injury?",
+            "intent": "fact_lookup",
+            "conversation_act": "question",
+            "concepts": ["compensation", "injury"],
+            "evidence_needs": ["current compensation amount for the previously discussed injury"],
+            "search_queries": ["current compensation injury amount schedule"],
+            "scope": {},
+            "material_ambiguity": False,
+            "ambiguity_note": "",
+            "uses_history": True,
+            "authority_sensitive": True,
+            "route_strategy": "structured_lookup",
+            "corrections": [],
+        }
+    )
+
+    def fake_generate(system, user, **kwargs):
+        prompts.append(user)
+        return first if len(prompts) == 1 else second
+
+    monkeypatch.setattr(module.llm_service, "generate", fake_generate)
+    interpretation = module.interpret_user_message(
+        "what amount for that case",
+        history=[{"role": "user", "content": "if femur is fractured what compensation applies"}],
+    )
+    assert len(prompts) == 2
+    assert "RECENT USER CONTEXT (intent resolution only; never factual evidence):\nNone" in prompts[0]
+    assert "if femur is fractured" in prompts[1]
+    assert interpretation.uses_history is True
+    assert "previously discussed injury" in interpretation.resolved_question
+
+
+def test_normal_fact_lookups_get_evidence_coverage_review() -> None:
+    interpretation = SmartInterpretation(
+        raw_question="Who counts passengers?",
+        resolved_question="Who counts passengers during the described evacuation?",
+        intent="fact_lookup",
+        concepts=("passenger count", "evacuation"),
+        evidence_needs=("explicit role responsible for passenger counting",),
+    )
+    assert should_review_evidence(interpretation)
+
+
+def test_v4_runtime_reviews_after_candidate_merge() -> None:
+    from pathlib import Path
+
+    runtime = (Path(__file__).parents[1] / "app" / "rag" / "smart_runtime.py").read_text(encoding="utf-8")
+    assert "def _postmerge_evidence_review" in runtime
+    assert "candidates = _postmerge_evidence_review(plan, candidates)" in runtime
+    search_start = runtime.index("def smart_search")
+    select_start = runtime.index("def smart_select")
+    search_body = runtime[search_start:select_start]
+    assert "review_retrieved_evidence(interpretation, result)" not in search_body

@@ -1,0 +1,23 @@
+From C:\Users\Alienware\pdfrag (or your pdfrag repository directory):
+
+1. Extract overlay
+
+Expand-Archive -Path .\pdfrag-smart-rag-context-evidence-hotfix-v4-20260819.zip -DestinationPath . -Force
+
+2. Verify packaged files
+
+powershell -ExecutionPolicy Bypass -File .\verify-v4-hotfix.ps1
+
+3. Rebuild backend
+
+docker compose -f docker-compose.yml -f docker-compose.smart-rag.yml down
+docker compose -f docker-compose.yml -f docker-compose.smart-rag.yml build --no-cache backend
+docker compose -f docker-compose.yml -f docker-compose.smart-rag.yml up -d
+
+DO NOT add -v to down.
+DO NOT Reprocess All PDFs.
+No new backfill is required if v2 derived indexes already exist.
+
+4. Confirm v4
+
+docker compose -f docker-compose.yml -f docker-compose.smart-rag.yml logs backend --since 10m | Select-String "AI-first understanding v4|ai_postmerge|stage=ai_interpret"

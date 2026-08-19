@@ -1,0 +1,20 @@
+Changed production files:
+backend/app/rag/smart_understanding.py
+backend/app/rag/smart_runtime.py
+
+Regression test file:
+backend/tests/test_smart_ai_understanding.py
+
+Documentation/support:
+HOTFIX_V4_README.md
+INSTALL_POWERSHELL_V4.txt
+QA_RESULTS_V4.txt
+BASE_V4.txt
+HOTFIX_V4.patch
+verify-v4-hotfix.ps1
+CHECKSUMS.sha256
+
+No frontend files.
+No database schema changes.
+No embedding dimension/model changes.
+No PDF reprocessing requirement.
