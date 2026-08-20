@@ -1,0 +1,61 @@
+pdfrag RAG v5 migration package manifest
+=======================================
+
+Validated target:
+  Ankit-Arya/pdfrag @ 665655ecb1011bad2f08497f879e07403c508f56
+
+NEW V5 BACKEND MODULES
+  backend/app/rag/v5/__init__.py
+  backend/app/rag/v5/types.py
+  backend/app/rag/v5/layout.py
+  backend/app/rag/v5/chunking.py
+  backend/app/rag/v5/schema.py
+  backend/app/rag/v5/ingestion.py
+  backend/app/rag/v5/terminology.py
+  backend/app/rag/v5/retrieval.py
+  backend/app/rag/v5/service.py
+  backend/app/rag/v5/reprocess.py
+  backend/app/rag/v5/diagnostics.py
+  backend/app/rag/v5/audit_document.py
+
+NEW TESTS
+  backend/tests/test_v5_layout_tables.py
+  backend/tests/test_v5_semantic_chunking.py
+  backend/tests/test_v5_authority.py
+  backend/tests/test_v5_terminology.py
+  backend/tests/test_v5_retrieval_policy.py
+
+DEPLOYMENT / MIGRATION
+  apply_v5_patch.py
+  docker-compose.v5.yml
+  .env.v5.example
+  merge-v5-env.ps1
+  verify-v5-install.ps1
+  INSTALL_POWERSHELL_V5.txt
+  RAG_V5_MIGRATION_README.md
+  QA_RESULTS_V5.txt
+  BASE_COMMIT.txt
+  CHECKSUMS.sha256
+
+EXISTING FILES MODIFIED BY apply_v5_patch.py
+  backend/app/config.py
+    - adds v5 feature/settings fields; query cutover defaults OFF
+
+  backend/app/main.py
+    - ensures additive v5 schema
+    - skips v4 runtime monkeypatch only after RAG_V5_QUERY_ENABLED=1
+
+  backend/app/rag/service.py
+    - explicit singleton selection: RagService vs V5RagService
+
+  backend/Dockerfile
+    - installs/verifies Tesseract Hindi language pack in addition to English
+
+SAFETY MODEL
+  - One-time migration writes only rag_v5_* tables.
+  - Existing v4 document_chunks are untouched while RAG_V5_QUERY_ENABLED=0.
+  - Query cutover is explicit after `app.rag.v5.diagnostics --strict`.
+  - New/reprocessed PDFs after cutover can mirror v5 semantic chunks into legacy
+    document_chunks for rollback safety without re-parsing/re-embedding twice.
+  - `ROLLBACK_V5/` backups of modified existing source files are created by the installer.
+  - Never use `docker compose down -v` for this migration.

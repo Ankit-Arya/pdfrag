@@ -1,0 +1,80 @@
+pdfrag RAG v5 QA results
+========================
+
+Validated target repository/commit
+----------------------------------
+Repository: Ankit-Arya/pdfrag
+Commit: 665655ecb1011bad2f08497f879e07403c508f56
+Message: AI patch
+
+Static/focused tests
+--------------------
+- Python compileall for backend/app/rag/v5, v5 tests and apply_v5_patch.py: PASS
+- Focused v5 unit suite: 13 passed
+  Coverage includes:
+  * aligned geometry table reconstruction
+  * multi-page table continuation
+  * numbered procedure paragraphs rejected as false tables
+  * standalone rule-number + heading reconstruction
+  * semantic table-row/prose chunking
+  * section-substitution/current-vs-historical authority metadata
+  * structural-heading authority extraction
+  * acronym initials validation / OCR terminology-pollution rejection
+  * default current-authority ranking and explicit historical-query handling
+- Patch-anchor installer simulation: PASS
+- Docker Compose v5 YAML parse: PASS (syntax-level validation)
+
+Real PDF smoke test: Claims Rules + 2025 Amendment
+--------------------------------------------------
+Input used locally (not included in package):
+The Metro Railways _Procedure Of Claims_ Rules_ 2017 _ Amendment Rules_ 2025.pdf
+
+V5 layout metrics from the real PDF:
+- pages: 25
+- OCR pages: 15, 16, 17
+- headings: 59
+- accepted tables: 20
+- structured table rows: 298
+- table candidate pages: 3,4,6,7,8,9,10,11,12,13,14,18,23,24,25
+- rejected-table pages: none in this smoke run
+
+Ground-truth row recovery:
+- current page 10 row was recovered as content_type=table_row
+- inherited schema includes: Nature of Injury | Amount of Compensation
+- recovered row contains:
+  Fracture of Major Bone-Femur, Tibia of one limb | Amount of Compensation: 80,000
+- authority status: current_replacement
+- later old/base copy containing the old 32,000 row remains separate and was marked historical_appended
+- explicit Second Schedule replacement directive was detected with effective year 2025
+
+Result: PASS
+
+Real PDF smoke test: MRGR 2020
+------------------------------
+Input used locally (not included in package):
+02. MRGR 2020.pdf
+
+V5 layout metrics with OCR disabled for this native-text document:
+- pages: 133
+- headings: 322
+- accepted tables: 17
+- structured table rows: 57
+- low-quality pages: none
+
+Important structural regression:
+- Rule 51 is reconstructed as heading: "51. Train divided --"
+- Rule 52 is reconstructed as heading: "52. Unusual occurrences --"
+- numbered Rule 52 paragraphs are NOT misclassified as a table
+- Rule 52 smoke/fire text is not left under the Rule 51 Train-divided section
+
+Result: PASS
+
+Limitations of this QA
+----------------------
+- The full production PostgreSQL corpus (~500 PDFs) was not available inside this execution environment,
+  so full-database retrieval/answer acceptance testing could not be run here.
+- Direct git clone from GitHub was blocked by container DNS; repository source was inspected through the
+  connected GitHub tool and the package is pinned to the exact current main commit listed above.
+- No parser can guarantee perfect interpretation of every visual diagram. V5 preserves figure/image regions,
+  captions and extraction warnings but does not invent visual semantics.
+- Full-corpus reprocessing and `app.rag.v5.diagnostics --strict` are mandatory before query cutover.

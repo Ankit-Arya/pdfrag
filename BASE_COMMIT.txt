@@ -1,7 +1,4 @@
 Repository: Ankit-Arya/pdfrag
-Base branch: main
-Base commit: 89162d856c568141c5863def73377342be3c786c
-Base commit message: Filter docs and search
-
-This overlay was prepared against the files/signatures at that commit.
-If HEAD is newer, compare backend/app/main.py before overwriting.
+Validated main commit: 665655ecb1011bad2f08497f879e07403c508f56
+Commit message: AI patch
+Patch type: additive RAG v5 migration; v4 remains query path until explicit cutover.

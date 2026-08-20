@@ -1,0 +1,59 @@
+services:
+  backend:
+    image: pdfrag-backend:v5
+    environment:
+      # Stage 1 migration: schema on, query cutover off. Reprocess all PDFs into rag_v5_* tables.
+      RAG_V5_SCHEMA_ENABLED: ${RAG_V5_SCHEMA_ENABLED:-1}
+      RAG_V5_QUERY_ENABLED: ${RAG_V5_QUERY_ENABLED:-0}
+      RAG_V5_PROCESSING_VERSION: ${RAG_V5_PROCESSING_VERSION:-rag-v5.0.0}
+      RAG_V5_CHUNK_TARGET_CHARS: ${RAG_V5_CHUNK_TARGET_CHARS:-1000}
+      RAG_V5_CHUNK_OVERLAP_CHARS: ${RAG_V5_CHUNK_OVERLAP_CHARS:-120}
+      RAG_V5_RETRIEVAL_PER_ARM: ${RAG_V5_RETRIEVAL_PER_ARM:-48}
+      RAG_V5_FINAL_EVIDENCE: ${RAG_V5_FINAL_EVIDENCE:-32}
+      RAG_V5_PARENT_WINDOW: ${RAG_V5_PARENT_WINDOW:-2}
+      RAG_V5_MIN_TABLE_CONFIDENCE: ${RAG_V5_MIN_TABLE_CONFIDENCE:-0.62}
+      RAG_V5_OCR_IMAGE_COVERAGE: ${RAG_V5_OCR_IMAGE_COVERAGE:-0.45}
+      RAG_V5_LEGACY_CHUNK_MIRROR: ${RAG_V5_LEGACY_CHUNK_MIRROR:-1}
+      # Image installs English + Hindi Tesseract packs. Extend Dockerfile only if the corpus needs more scripts.
+      OCR_LANGUAGES: ${OCR_LANGUAGES:-eng+hin}
+    healthcheck:
+      start_period: 300s
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # Run heavy one-time extraction independently from the API process:
+  # docker compose ... --profile v5-migration run --rm v5-worker
+  v5-worker:
+    image: pdfrag-backend:v5
+    profiles: ["v5-migration"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-pdfrag}:${POSTGRES_PASSWORD:-pdfrag}@postgres:5432/${POSTGRES_DB:-pdfrag}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
+      EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-384}
+      EMBEDDING_LOCAL_FILES_ONLY: ${EMBEDDING_LOCAL_FILES_ONLY:-1}
+      EMBEDDING_DOWNLOAD_ENABLED: ${EMBEDDING_DOWNLOAD_ENABLED:-0}
+      EMBEDDING_FALLBACK_MODE: ${EMBEDDING_FALLBACK_MODE:-disabled}
+      REQUIRE_EMBEDDING_AT_STARTUP: ${REQUIRE_EMBEDDING_AT_STARTUP:-1}
+      ALLOW_INSECURE_HF_DOWNLOAD: ${ALLOW_INSECURE_HF_DOWNLOAD:-0}
+      HF_HUB_OFFLINE: ${HF_HUB_OFFLINE:-0}
+      TRANSFORMERS_OFFLINE: ${TRANSFORMERS_OFFLINE:-0}
+      OCR_MODE: ${OCR_MODE:-auto}
+      OCR_DPI: ${OCR_DPI:-300}
+      OCR_LANGUAGES: ${OCR_LANGUAGES:-eng+hin}
+      OCR_MIN_NATIVE_CHARS: ${OCR_MIN_NATIVE_CHARS:-80}
+      RAG_V5_SCHEMA_ENABLED: ${RAG_V5_SCHEMA_ENABLED:-1}
+      RAG_V5_QUERY_ENABLED: "0"
+      RAG_V5_PROCESSING_VERSION: ${RAG_V5_PROCESSING_VERSION:-rag-v5.0.0}
+      RAG_V5_CHUNK_TARGET_CHARS: ${RAG_V5_CHUNK_TARGET_CHARS:-1000}
+      RAG_V5_CHUNK_OVERLAP_CHARS: ${RAG_V5_CHUNK_OVERLAP_CHARS:-120}
+      RAG_V5_MIN_TABLE_CONFIDENCE: ${RAG_V5_MIN_TABLE_CONFIDENCE:-0.62}
+      RAG_V5_OCR_IMAGE_COVERAGE: ${RAG_V5_OCR_IMAGE_COVERAGE:-0.45}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./models:/models:ro
+    command: ["python", "-m", "app.rag.v5.reprocess"]
+    restart: "no"

@@ -1,0 +1,109 @@
+pdfrag RAG v5 - PowerShell installation / migration
+===================================================
+
+Validated Git HEAD:
+665655ecb1011bad2f08497f879e07403c508f56
+
+Run these commands from C:\Users\Alienware\pdfrag (or your actual repo root).
+
+1) IMPORTANT: preserve your current database and working tree.
+
+   git status
+   git rev-parse HEAD
+
+   Expected HEAD:
+   665655ecb1011bad2f08497f879e07403c508f56
+
+   Optional database backup:
+   docker compose -f docker-compose.yml -f docker-compose.smart-rag.yml exec -T postgres pg_dump -U pdfrag -d pdfrag > pdfrag-before-v5.sql
+
+2) Extract this ZIP into the repository root.
+
+   Expand-Archive -Path .\pdfrag-rag-v5-migration-665655e.zip -DestinationPath . -Force
+
+3) Apply the four small integration edits (config/main/service/Dockerfile).
+
+   py .\apply_v5_patch.py --repo .
+
+   If `py` is unavailable but Docker is available:
+   docker run --rm -v "${PWD}:/repo" -w /repo python:3.12-slim python apply_v5_patch.py --repo /repo
+
+   The script creates ROLLBACK_V5\ backups before editing existing files.
+
+4) Merge ONLY the v5 keys into your existing .env. Do not replace your secrets/settings.
+
+   powershell -ExecutionPolicy Bypass -File .\merge-v5-env.ps1
+
+   This deliberately leaves:
+   RAG_V5_QUERY_ENABLED=0
+
+5) Check the effective Compose configuration.
+
+   docker compose -f docker-compose.yml -f docker-compose.smart-rag.yml -f docker-compose.v5.yml config | Select-String "RAG_V5_|OCR_LANGUAGES|PRELOAD_EMBEDDING|EMBEDDING_LOCAL|start_period"
+
+6) Verify patch placement.
+
+   powershell -ExecutionPolicy Bypass -File .\verify-v5-install.ps1
+
+7) Rebuild the backend image. The Dockerfile now installs Hindi OCR in addition to English.
+
+   docker compose --progress plain -f docker-compose.yml -f docker-compose.smart-rag.yml -f docker-compose.v5.yml build --no-cache backend
+
+8) Start normal services. V4 continues answering because query cutover is still OFF.
+
+   docker compose -f docker-compose.yml -f docker-compose.smart-rag.yml -f docker-compose.v5.yml up -d
+   docker compose -f docker-compose.yml -f docker-compose.smart-rag.yml -f docker-compose.v5.yml ps
+
+9) PILOT v5 extraction first (3 PDFs) in a separate worker container.
+
+   docker compose -f docker-compose.yml -f docker-compose.smart-rag.yml -f docker-compose.v5.yml --profile v5-migration run --rm v5-worker python -m app.rag.v5.reprocess --limit 3
+
+10) Inspect diagnostics. Do not use --strict until all PDFs have been processed.
+
+   docker compose -f docker-compose.yml -f docker-compose.smart-rag.yml -f docker-compose.v5.yml exec backend python -m app.rag.v5.diagnostics
+
+11) If the pilot looks good, process the full ready corpus.
+
+   docker compose -f docker-compose.yml -f docker-compose.smart-rag.yml -f docker-compose.v5.yml --profile v5-migration run --rm v5-worker python -m app.rag.v5.reprocess
+
+   Re-running this command is resumable: documents that already have the current active v5 generation are skipped.
+
+12) Require complete v5 coverage before cutover.
+
+   docker compose -f docker-compose.yml -f docker-compose.smart-rag.yml -f docker-compose.v5.yml exec backend python -m app.rag.v5.diagnostics --strict
+
+   This must exit successfully and show v5_documents == ready_documents.
+   Also review low_quality_pages, table_rejected_pages and the sample warnings.
+
+13) Audit important known PDFs/rows before cutover (adapt the filename substring if needed).
+
+   docker compose -f docker-compose.yml -f docker-compose.smart-rag.yml -f docker-compose.v5.yml exec backend python -m app.rag.v5.audit_document --filename "Claims" --find "Fracture of Major Bone-Femur"
+
+   docker compose -f docker-compose.yml -f docker-compose.smart-rag.yml -f docker-compose.v5.yml exec backend python -m app.rag.v5.audit_document --filename "MRGR" --find "Train divided"
+
+14) CUT OVER only after diagnostics/audits pass.
+
+   powershell -ExecutionPolicy Bypass -File .\merge-v5-env.ps1 -EnableQuery
+
+   docker compose -f docker-compose.yml -f docker-compose.smart-rag.yml -f docker-compose.v5.yml up -d --force-recreate backend
+
+   docker compose -f docker-compose.yml -f docker-compose.smart-rag.yml -f docker-compose.v5.yml logs -f backend
+
+   Expected startup log contains the v5 query-pipeline message and DOES NOT install the v4 Smart-RAG runtime monkeypatch.
+
+15) Regression-test paraphrase families, not just one wording. Include:
+
+   - mid-section train evacuation passenger count / who counts / head-count responsibility
+   - train divide / divided / parted / misspellings
+   - BIC and TCMS definition variants
+   - current death/injury compensation and old-vs-amended values
+   - colloquial injury wording that must map to formal schedule rows conditionally
+   - unrelated second questions in the same chat (no topic bleed)
+   - genuine short follow-ups (history should resolve them)
+
+ROLLBACK QUERY CUTOVER (no database deletion):
+
+   powershell -ExecutionPolicy Bypass -File .\merge-v5-env.ps1 -DisableQuery
+   docker compose -f docker-compose.yml -f docker-compose.smart-rag.yml -f docker-compose.v5.yml up -d --force-recreate backend
+
+Never run `docker compose down -v` for this migration.
