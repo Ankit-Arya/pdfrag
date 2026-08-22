@@ -1,154 +1,131 @@
-IMS Assistant Retrieval v5.1
-============================
+IMS Live Activity / Working Panel v1
+====================================
 
-Goal
-----
-Make IMS behave more like a capable document assistant instead of a top-K chunk search engine,
-while remaining closed-book for metro facts.
+Purpose
+-------
+Adds a ChatGPT-style live "Working" experience to IMS Assistant v5.1 while preserving the existing SSE chat stream and closed-book PDF grounding.
 
-This is a QUERY-TIME patch. Existing successfully processed rag_v5_* generations are reused.
-No PDF reprocessing and no database migration are required.
+What it adds
+------------
+1. Rich structured progress schema:
+   actor, phase, status, operation_id, sequence, elapsed time, prompt/task summary, AI summary,
+   document/page/heading and safe metrics.
+2. Actor labels in the UI: AI / Backend / Search / Verification.
+3. Real counts from the live pipeline: routed documents, baseline candidates, heading matches,
+   scoped candidates, rerank pool, AI-ranked candidates, section expansion, final evidence, cited sources.
+4. Strong structural matches show actual filename, page and heading/rule/section metadata.
+5. Search rounds are shown separately (1/N, 2/N, 3/N) and persisted.
+6. Evidence-completeness review shows sufficient / more evidence needed and a concise safe summary.
+7. A collapsible Working panel stays open while answering and auto-collapses after the answer.
+8. Per-operation duration and total working time are shown.
+9. The safe activity trace is persisted in ChatMessage metadata, so it can be reopened after chat reload.
+10. AI transparency uses concise task/reasoning summaries only.
 
-Architecture added
-------------------
-1. Grounded acronym recovery
-   - Uses existing rag_v5_terminology first.
-   - If an uppercase internal abbreviation is missing, searches active PDF chunks and extracts only
-     explicit source patterns such as "Station Controller (SC)". It never invents an expansion.
+Important transparency boundary
+-------------------------------
+The patch intentionally DOES NOT expose private chain-of-thought, hidden model reasoning, raw system/developer prompts,
+credentials, SQL text, API keys or private scratch work. Instead it exposes safe summaries such as:
+- "Resolved question: ..."
+- "Rank candidate excerpts for governing relevance; do not answer."
+- "Evidence incomplete: missing applicability condition."
+- "Top evidence is <file>, page <n>, section <heading>."
 
-2. Semantic query planning remains AI-driven
-   - Existing smart-understanding layer already fixes typos/paraphrases.
-   - Patch strengthens it to produce corrected natural wording plus likely formal heading wording,
-     actor/object wording and requested output dimensions.
-   - User does not need to know the source document.
+This gives users useful live transparency without leaking protected reasoning or security-sensitive internals.
 
-3. Document-first routing
-   - Combines user filename/document hints, broad v5 results, corpus-wide vector evidence and strict FTS.
-   - A document hint is a preference, not a hard constraint. If the hint is wrong/incomplete, search can recover.
+Prerequisite
+------------
+IMS Assistant Retrieval v5.1 must already be applied to backend/app/rag/v5/service.py.
+The installer checks for retrieve_assistant_v51 and will stop safely if v5.1 is not active.
 
-4. Structural navigation
-   - Searches headings/section paths inside routed documents.
-   - Promotes governing/defining sections over incidental mentions.
-
-5. Scoped hybrid retrieval
-   - Re-runs vector + strict lexical search inside the strongest candidate documents.
-   - Keeps the original v5 broad retrieval as a safety net.
-
-6. AI evidence reranking
-   - Query model ranks candidate sections/chunks for directness and governing relevance.
-   - It is explicitly forbidden from answering or inventing facts.
-
-7. Section-complete expansion
-   - Expands top governing parent sections after reranking.
-   - Lists/procedures/navigation can therefore include multiple related rule sections rather than one lucky chunk.
-
-8. Bounded evidence search loop
-   - Evidence reviewer can trigger up to 3 targeted search rounds.
-   - Previous good evidence is accumulated rather than replaced.
-
-9. Better diagnostics
-   - Answer metadata uses answer_policy_version=rag-v5.1-assistant.
-   - primary_documents now reports routed document candidates.
-   - assistant_debug CLI shows interpretation, grounded terminology, routed docs and top evidence.
-
-Safety/grounding retained
--------------------------
-The final answer model still receives only retrieved PDF evidence and may not invent metro facts.
-The patch improves what evidence reaches the model; it does not relax grounding.
+No data rebuild
+---------------
+- No database migration.
+- No PDF reprocessing.
+- Existing rag_v5_* generations are reused.
+- No embedding rebuild.
 
 Files
 -----
-Installer:
-  apply_ims_assistant_v51_patch.py
+Replaced/added:
+  backend/app/rag/progress.py
+  frontend/src/components/ActivityTrace.vue
+  backend/tests/test_live_activity_progress.py
 
-Added:
-  backend/app/rag/v5/assistant_retrieval.py
-  backend/app/rag/v5/assistant_debug.py
-  backend/tests/test_v5_assistant_retrieval.py
-
-Modified by installer:
+Modified:
+  backend/app/models.py
+  backend/app/api.py
   backend/app/rag/v5/service.py
-  backend/app/rag/smart_understanding.py
-  docker-compose.v5.yml
-  merge-v5-env.ps1
+  backend/app/rag/v5/assistant_retrieval.py
+  frontend/src/services/api.ts
+  frontend/src/App.vue
+  frontend/src/components/ChatPanel.vue
 
 Apply
 -----
-From repository root:
+From the pdfrag repository root:
 
-  python .\apply_ims_assistant_v51_patch.py --repo .
+  python .\apply_ims_live_activity_patch.py --repo .
 
 Inspect:
 
-  git --no-pager diff -- backend/app/rag/v5/service.py backend/app/rag/smart_understanding.py docker-compose.v5.yml merge-v5-env.ps1 backend/app/rag/v5/assistant_retrieval.py backend/app/rag/v5/assistant_debug.py backend/tests/test_v5_assistant_retrieval.py
+  git --no-pager diff -- backend/app/rag/progress.py backend/app/models.py backend/app/api.py backend/app/rag/v5/service.py backend/app/rag/v5/assistant_retrieval.py frontend/src/services/api.ts frontend/src/App.vue frontend/src/components/ChatPanel.vue frontend/src/components/ActivityTrace.vue backend/tests/test_live_activity_progress.py
 
-Compile/test:
+Compile backend:
 
-  python -m py_compile backend\app\rag\v5\assistant_retrieval.py backend\app\rag\v5\assistant_debug.py backend\app\rag\v5\service.py backend\app\rag\smart_understanding.py
-  docker compose -f docker-compose.yml -f docker-compose.smart-rag.yml -f docker-compose.v5.yml run --rm backend pytest -q backend/tests/test_v5_assistant_retrieval.py
+  python -m py_compile backend\app\rag\progress.py backend\app\models.py backend\app\api.py backend\app\rag\v5\service.py backend\app\rag\v5\assistant_retrieval.py
 
-Enable/refresh environment
---------------------------
-If v5 query mode is already enabled, rerun the helper so new v5.1 tuning keys are written to .env:
+Optional focused test:
 
-  powershell -ExecutionPolicy Bypass -File .\merge-v5-env.ps1 -EnableQuery
+  docker compose -f docker-compose.yml -f docker-compose.smart-rag.yml -f docker-compose.v5.yml run --rm backend pytest -q backend/tests/test_live_activity_progress.py
 
-Build and recreate backend only:
-
-  docker compose -f docker-compose.yml -f docker-compose.smart-rag.yml -f docker-compose.v5.yml build backend
-  docker compose -f docker-compose.yml -f docker-compose.smart-rag.yml -f docker-compose.v5.yml up -d --force-recreate backend
-
-No v5-worker/reprocess command is needed.
-
-Debug before UI testing
------------------------
-Examples:
-
-  docker compose -f docker-compose.yml -f docker-compose.smart-rag.yml -f docker-compose.v5.yml exec backend python -m app.rag.v5.assistant_debug --question "on which page number of MRGR, duties of SC are defined"
-
-  docker compose -f docker-compose.yml -f docker-compose.smart-rag.yml -f docker-compose.v5.yml exec backend python -m app.rag.v5.assistant_debug --question "duties of train operator as per MRGR 2020"
-
-  docker compose -f docker-compose.yml -f docker-compose.smart-rag.yml -f docker-compose.v5.yml exec backend python -m app.rag.v5.assistant_debug --question "explain provision of hand signals in DMRC"
-
-  docker compose -f docker-compose.yml -f docker-compose.smart-rag.yml -f docker-compose.v5.yml exec backend python -m app.rag.v5.assistant_debug --question "use of alcohal in dmrc"
-
-For the first query, the debug output should route MRGR strongly and should put a Station Controller
-responsibility/duty heading above incidental SC mentions. Exact rule/page depends on what the active
-processed PDF actually contains.
-
-Default tuning
+Build/recreate
 --------------
-RAG_V51_ASSISTANT_ENABLED=1
-RAG_V51_AI_RERANK_ENABLED=1
-RAG_V51_MAX_SEARCH_ROUNDS=3
-RAG_V51_ROUTE_DOCUMENTS=8
-RAG_V51_ROUTE_PER_QUERY=80
-RAG_V51_SCOPED_PER_ARM=56
-RAG_V51_RERANK_CANDIDATES=48
-RAG_V51_FINAL_CANDIDATES=64
-RAG_V51_SECTION_EXPANSION_ENABLED=1
-RAG_V51_SECTION_SEEDS=10
-RAG_V51_MAX_SECTION_CHUNKS=12
+Both backend and frontend changed:
 
-Cost/latency
-------------
-Compared with v5.0, a normal query usually adds one low-effort query-model rerank call.
-If evidence is incomplete, the existing evidence critic may trigger additional bounded search rounds.
-This intentionally spends more retrieval/reasoning effort for accuracy. If API/latency pressure is high,
-reduce RAG_V51_MAX_SEARCH_ROUNDS to 2 and/or RAG_V51_RERANK_CANDIDATES to 36 before disabling reranking.
+  docker compose -f docker-compose.yml -f docker-compose.smart-rag.yml -f docker-compose.v5.yml build backend frontend
 
-Rollback / A-B switch
--------------------
-For a quick retrieval fallback without touching data, set RAG_V51_ASSISTANT_ENABLED=0 and recreate backend.
-That makes the v5.1 wrapper use the existing v5 broad retrieval as its candidate source.
-For a full code rollback, the installer creates .bak-before-ims-assistant-v51 backups for modified existing files.
-Restore those four backups and delete the three added files, then rebuild/recreate backend.
-Do not delete rag_v5_* data and do not reprocess PDFs for rollback.
+  docker compose -f docker-compose.yml -f docker-compose.smart-rag.yml -f docker-compose.v5.yml up -d --force-recreate backend frontend
 
-Important expectation
----------------------
-No RAG system can guarantee ChatGPT-perfect answers across arbitrary noisy PDFs. This patch addresses the
-specific architectural gap shown by IMS: correct evidence is often present but loses to incidental chunks.
-It upgrades retrieval from one broad top-K search to document routing + structural navigation + scoped
-hybrid retrieval + AI reranking + completeness expansion + bounded evidence search, while keeping the
-closed-book grounding constraint.
+Do NOT run the v5 reprocessor.
+
+Expected live UI
+----------------
+Example:
+
+  Working · 11.8s
+
+  AI            Question interpreted
+                Resolved question: duties of Station Controller ...
+
+  Search        Document routing complete
+                8 routed documents
+
+  Search        Strong structural match found
+                Responsibilities of Station Controller
+                02. MRGR 2020.pdf · p. 99
+
+  AI            AI evidence ranking complete
+                48 candidate pool · 12 AI-ranked
+
+  Verification  More evidence needed
+                AI summary: missing applicability/exception evidence
+
+  Search        Search round 2 of 3
+
+  Verification  Evidence sufficient
+
+  AI            Writing the grounded answer
+
+  Verification  Grounding verified
+
+After the answer arrives the panel becomes:
+
+  Worked for 14.2s · 13 steps
+
+and is collapsed by default.
+
+Rollback
+--------
+The installer creates .bak-before-ims-live-activity-v1 backups for modified existing files.
+Restore those backups, delete ActivityTrace.vue and test_live_activity_progress.py if desired, then rebuild backend/frontend.
+No database rollback or PDF reprocessing is required.
