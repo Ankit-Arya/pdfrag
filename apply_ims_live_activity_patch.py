@@ -424,9 +424,26 @@ def patch_chat_panel(source: str) -> str:
     old_helpers = '''const visibleProgress = computed(() => props.progress.slice(-6))\nconst currentProgress = computed(() => props.progress[props.progress.length - 1] ?? null)\n\nfunction progressPercent(event: ChatProgressEvent): number | null {\n  if (typeof event.current !== 'number' || typeof event.total !== 'number' || event.total <= 0) {\n    return null\n  }\n  return Math.max(0, Math.min(100, Math.round((event.current / event.total) * 100)))\n}\n\nfunction isActiveProgress(event: ChatProgressEvent): boolean {\n  return currentProgress.value?.stage === event.stage\n}\n\n'''
     source = replace_once(source, old_helpers, "", "legacy work progress helpers")
 
-    evidence_anchor = '''          <details\n            v-if="message.response?.evidence.length"\n'''
-    activity_insert = '''          <ActivityTrace\n            v-if="message.role === 'assistant' && message.response?.activity?.length"\n            :events="message.response.activity"\n          />\n\n''' + evidence_anchor
-    source = replace_once(source, evidence_anchor, activity_insert, "completed Working panel")
+    # The ChatPanel used optional chaining on `evidence` before this patch was
+    # packaged (`message.response?.evidence?.length`). Older builds used
+    # `message.response?.evidence.length`. Match either form so the installer
+    # remains compatible with both and can safely resume a partially applied run.
+    evidence_pattern = re.compile(
+        r'          <details\n            v-if="message\.response\?\.evidence(?:\?\.|\.)length"\n'
+    )
+    evidence_matches = list(evidence_pattern.finditer(source))
+    if len(evidence_matches) != 1:
+        raise RuntimeError(
+            f"completed Working panel: expected exactly one evidence panel anchor, found {len(evidence_matches)}"
+        )
+    activity_insert = '''          <ActivityTrace
+            v-if="message.role === 'assistant' && message.response?.activity?.length"
+            :events="message.response.activity"
+          />
+
+'''
+    match = evidence_matches[0]
+    source = source[: match.start()] + activity_insert + source[match.start() :]
 
     pattern = re.compile(
         r'''          <section class="work-progress" aria-live="polite" aria-label="Answer preparation progress">[\s\S]*?          </section>\n          <button class="cancel-link"'''

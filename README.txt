@@ -129,3 +129,11 @@ Rollback
 The installer creates .bak-before-ims-live-activity-v1 backups for modified existing files.
 Restore those backups, delete ActivityTrace.vue and test_live_activity_progress.py if desired, then rebuild backend/frontend.
 No database rollback or PDF reprocessing is required.
+
+v1.1 installer compatibility fix
+--------------------------------
+The live-activity installer now accepts both ChatPanel evidence guards:
+  message.response?.evidence?.length
+  message.response?.evidence.length
+This fixes the "completed Working panel: expected exactly one anchor, found 0" error
+and is safe to rerun after a partial v1 installation; already-marked files are left intact.
