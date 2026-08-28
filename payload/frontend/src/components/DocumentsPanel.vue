@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
+import DocumentChunkExplorer from './DocumentChunkExplorer.vue'
 import {
   downloadDocument,
   listDocuments,
@@ -7,7 +8,7 @@ import {
   type KnowledgeStatus,
 } from '../services/api'
 
-const props = defineProps<{
+defineProps<{
   knowledge: KnowledgeStatus | null
 }>()
 
@@ -17,6 +18,7 @@ const status = ref('ready')
 const busy = ref(false)
 const error = ref('')
 const downloadingId = ref<string | null>(null)
+const inspectingDocument = ref<DocumentRecord | null>(null)
 
 const filtered = computed(() => {
   const needle = query.value.trim().toLowerCase()
@@ -59,18 +61,28 @@ async function download(record: DocumentRecord): Promise<void> {
   }
 }
 
+function inspectChunks(record: DocumentRecord): void {
+  inspectingDocument.value = record
+}
+
 onMounted(() => {
   void refresh()
 })
 </script>
 
 <template>
-  <main class="content-shell documents-shell">
+  <DocumentChunkExplorer
+    v-if="inspectingDocument"
+    :document="inspectingDocument"
+    @close="inspectingDocument = null"
+  />
+
+  <main v-else class="content-shell documents-shell">
     <header class="topbar documents-topbar">
       <div>
         <span class="eyebrow">Shared knowledge</span>
         <h1>Documents</h1>
-        <p>Browse the PDFs available to IMS without starting a chat.</p>
+        <p>Browse the PDFs available to IMS and inspect their active RAG v5 chunks.</p>
       </div>
       <div class="document-header-stat">
         <strong>{{ knowledge?.ready_documents ?? 0 }}</strong>
@@ -122,6 +134,14 @@ onMounted(() => {
             <small v-if="document.error">{{ document.error }}</small>
           </div>
           <span class="document-status" :class="document.status">{{ document.status }}</span>
+          <button
+            type="button"
+            class="document-inspect"
+            :disabled="document.status !== 'ready'"
+            @click="inspectChunks(document)"
+          >
+            Inspect chunks
+          </button>
           <button
             type="button"
             class="document-download"
@@ -233,9 +253,9 @@ onMounted(() => {
 .document-grid { display: grid; gap: 8px; }
 .document-card {
   display: grid;
-  grid-template-columns: 38px minmax(0, 1fr) auto auto;
+  grid-template-columns: 38px minmax(0, 1fr) auto auto auto;
   align-items: center;
-  gap: 11px;
+  gap: 9px;
   padding: 12px 13px;
   border: 1px solid #dde6e2;
   border-radius: 12px;
@@ -274,7 +294,8 @@ onMounted(() => {
 }
 .document-status.ready { background: #e8f6ef; color: #2d7158; }
 .document-status.failed { background: #fff0ef; color: #a34e48; }
-.document-download {
+.document-download,
+.document-inspect {
   min-height: 32px;
   padding: 0 10px;
   border: 1px solid #d5e0db;
@@ -284,11 +305,24 @@ onMounted(() => {
   font-size: 8px;
   font-weight: 800;
 }
+.document-inspect { border-color: #bfd4ca; background: #edf6f2; color: #32684f; }
+.document-download:disabled,
+.document-inspect:disabled { opacity: .45; cursor: default; }
 
+@media (max-width: 900px) {
+  .document-card { grid-template-columns: 34px minmax(0, 1fr) auto; }
+  .document-inspect,
+  .document-download { grid-row: 2; }
+  .document-inspect { grid-column: 2; justify-self: start; }
+  .document-download { grid-column: 3; }
+}
 @media (max-width: 760px) {
   .documents-toolbar { grid-template-columns: 1fr; }
   .document-card { grid-template-columns: 34px minmax(0, 1fr); }
   .document-status,
+  .document-inspect,
   .document-download { grid-column: 2; justify-self: start; }
+  .document-inspect,
+  .document-download { grid-row: auto; }
 }
 </style>
