@@ -1,0 +1,13 @@
+{
+  "version": "rag-v5.5.1-virtual-chunk-id-guard",
+  "base": "rag-v5.5-procedure-integrity",
+  "runtime_files": [
+    "backend/app/rag/v5/assistant_retrieval.py"
+  ],
+  "tests": [
+    "backend/tests/test_v551_virtual_chunk_ids.py"
+  ],
+  "database_migration": false,
+  "embedding_rebuild": false,
+  "document_reprocessing": false
+}
