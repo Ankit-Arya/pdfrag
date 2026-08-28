@@ -1,0 +1,43 @@
+# v6 evidence-workspace complex-query acceptance set
+# These are behavior tests, not hard-coded runtime cases.
+
+# Quantitative/conditional + cross-document variation
+What should be the speed of train if 25% of its brakes are isolated
+If 50% brakes got isolated in RS-3 train, what should be its speed?
+What happens if more than two bogies have brakes isolated? Compare only materially different applicable rules.
+
+# Procedure + scope-specific differences
+Explain procedure of door isolation
+What should a train operator do if a saloon door cannot be closed and isolated normally?
+Explain the complete procedure and restrictions when a train door is isolated, including when the train must be withdrawn.
+
+# Multi-document responsibility/scenario reasoning
+during train to track evacuation at mid section, is it necessary to count the number of passengers reaching at platform from the train and who will count it
+During passenger detrainment in mid-section, who counts passengers, who tallies the count, and what changes on a UTO line?
+
+# Entity/list completeness
+members of DMT
+What are the agencies assisting DMT and how are they different from DMT members?
+
+# Definition enumeration
+What is BIC?
+full form of BIC and where is each meaning used
+
+# Noisy semantic retrieval
+wake up process
+wake up test before passenger service
+track work
+Track work and track-side work in non-traffic hours
+
+# Time/absence rule and source wording variation
+3 month absence
+TO absence from duty for 3 months - what is required before resuming normal duty?
+If a train operator has not worked on a section for a long period, what road-learning requirement applies?
+
+# Complex synthesis
+Compare the applicable restrictions, speed limits and withdrawal requirements when braking capability is reduced across the relevant rolling-stock manuals.
+Explain all materially different cases for a defective train with braking problems, but do not mix normal fault handling with rescue movement unless rescue becomes necessary.
+
+# Negative-claim safety
+Does RS-3 have any percentage-based rule for brake isolation? Search carefully before concluding that it does not.
+Is passenger counting never required during train-to-track evacuation? Answer only if the sources justify a universal statement.

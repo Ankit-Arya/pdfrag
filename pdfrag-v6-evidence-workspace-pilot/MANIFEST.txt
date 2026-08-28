@@ -1,0 +1,20 @@
+pdfrag-v6-evidence-workspace-pilot
+
+Files:
+- apply_ims_v6_evidence_workspace_pilot.py
+- README-v6-evidence-workspace-pilot.txt
+- MANIFEST.txt
+- backend/app/rag/v6/__init__.py
+- backend/app/rag/v6/evidence_workspace.py
+- backend/tests/test_v6_evidence_workspace.py
+- scripts/acceptance_queries.txt
+
+Runtime modified after installer applies:
+- backend/app/rag/v5/service.py
+- backend/app/rag/v5/synthesis_retrieval.py
+
+Baseline:
+- IMS RAG v5.5 procedure-integrity
+- IMS RAG v5.5.1 virtual/synthetic chunk-id UUID guard
+
+No DB migration / embedding rebuild / full PDF reprocessing required for initial tests.
