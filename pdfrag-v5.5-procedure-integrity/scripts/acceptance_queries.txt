@@ -1,0 +1,28 @@
+# v5.5 representative acceptance set
+# These are examples only; runtime code contains no case-specific answers.
+
+# Cross-scope threshold / procedure integrity
+What should be the speed of train if 25% of its brakes are isolated
+What should be done if more than half of a system's braking units are unavailable
+What action is required when two units fail to apply or release
+Compare the applicable isolation procedure across train types
+
+# Existing v5.4 entity/list completeness must not regress
+members of DMT
+List the members, roles and designations of the committee
+What are the types of signals
+
+# Definition enumeration must not regress
+What is BIC?
+full form of DMT
+
+# Semantic / noisy wording regression cases
+wake up process
+track work
+3 month absence
+TO absence from duty
+
+# Scope identity cases
+What is the procedure for RS-CAF
+What is the procedure for Airport Line
+Compare RS-1 and RS-13 procedure

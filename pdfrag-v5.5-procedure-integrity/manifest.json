@@ -1,0 +1,15 @@
+{
+  "name": "pdfrag-v5.5-procedure-integrity",
+  "version": "5.5",
+  "base_required": "v5.4 smart-completeness",
+  "repository": "Ankit-Arya/pdfrag",
+  "database_migration": false,
+  "embedding_rebuild": false,
+  "full_reprocessing_required_for_first_test": false,
+  "files": [
+    "apply_ims_v55_procedure_integrity_patch.py",
+    "README-v5.5-procedure-integrity.txt",
+    "backend/tests/test_v55_procedure_integrity.py",
+    "scripts/acceptance_queries.txt"
+  ]
+}
