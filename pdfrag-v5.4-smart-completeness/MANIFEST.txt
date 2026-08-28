@@ -1,0 +1,17 @@
+Package: pdfrag-v5.4-smart-completeness
+Base: IMS RAG v5.3 coverage-first
+
+Included:
+- apply_ims_v54_smart_completeness_patch.py
+- backend/tests/test_v54_smart_completeness.py
+- scripts/acceptance_queries.txt
+- README-v5.4-smart-completeness.txt
+
+Runtime files transformed on apply:
+- backend/app/rag/v5/retrieval_completeness.py
+- backend/app/rag/v5/synthesis_retrieval.py
+- backend/app/rag/v5/service.py
+- backend/app/rag/v5/layout.py
+
+The installer exports exact transformed replacement copies under:
+- pdfrag-v5.4-replacement-files/

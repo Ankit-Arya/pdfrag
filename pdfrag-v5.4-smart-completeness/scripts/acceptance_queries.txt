@@ -1,0 +1,49 @@
+IMS RAG v5.4 acceptance query families
+======================================
+
+Run these against your own corpus. The nouns below are examples of query SHAPES, not hard-coded behavior.
+
+1. ENTITY / LIST ENUMERATION
+   - members of DMT
+   - types of <a known category in your PDFs>
+   - components of <a known system>
+   - duties of <a known role>
+
+   Expected:
+   - governing list/table/section is enumerated completely
+   - documents that merely mention the topic do not become answer headings
+   - diagnostics may still show rejected/routed documents
+
+2. DEFINITIONS / FULL FORMS
+   - What is <acronym>?
+   - full form of <acronym>
+
+   Expected:
+   - all explicit source-defined meanings
+   - all available PDF/page locations for each meaning
+   - no source collapse when the same meaning exists in multiple PDFs
+
+3. CROSS-SCOPE PROCEDURES
+   - What happens if <failure/condition>?
+   - What to do if <failure/condition>?
+   - <procedure name>
+
+   Expected:
+   - every materially applicable RS/Line governing procedure is retained
+   - identical procedures in different applicable scopes remain separately cited
+   - unrelated RS/Line documents do not appear merely because they were routed
+
+4. EXPLICIT SCOPE
+   - Only RS-<n>: what should be done if <condition>?
+
+   Expected:
+   - named scope is pinned
+   - other RS/Line scopes excluded when "only/just/solely/specifically" is used
+
+5. USER WORDING VS SOURCE WORDING
+   - Ask a colloquial or slightly incorrect operational condition for which the PDFs contain a nearby formal condition.
+
+   Expected:
+   - supported action/value first
+   - one concise clarification note at the end when needed
+   - no negative opening when useful evidence answers the operational intent
