@@ -31,6 +31,7 @@ jobs:
           python apply_v5_table_parallel_hotfix.py --repo .
           python apply_ims_assistant_v51_patch.py --repo .
           python apply_ims_v51_runtime_hotfix_1.py --repo .
+          python apply_ims_live_activity_patch.py --repo .
           python apply_ims_chunk_search_patch.py --repo .
           python apply_ims_chunk_search_frontend_hotfix.py --repo .
           python apply_ims_chunk_search_scroll_hotfix_v2.py --repo .
@@ -38,11 +39,22 @@ jobs:
           python apply_ims_ui_v2_synthesis_v52_patch.py --repo .
           python apply_ims_documents_panel_props_hotfix.py --repo .
           python apply_ims_v521_deployment_patch.py --repo .
+          python apply_pdfrag_pdf_chunk_explorer_v1.py --repo .
           python pdfrag-rag-v5.3-coverage-first-deployment/apply_ims_v53_coverage_first_patch.py --repo .
           python pdfrag-v5.4-smart-completeness/apply_ims_v54_smart_completeness_patch.py --repo .
           python pdfrag-v5.5-procedure-integrity/apply_ims_v55_procedure_integrity_patch.py --repo .
           python pdfrag-v5.5.1-virtual-chunk-id-hotfix/apply_ims_v551_virtual_chunk_id_hotfix.py --repo .
           python pdfrag-v6-evidence-workspace-pilot/apply_ims_v6_evidence_workspace_pilot.py --repo .
+
+      - name: Validate materialized source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m compileall -q backend/app
+          cd frontend
+          npm ci
+          npm run build
+          cd ..
 
       - name: Build canonical standalone tree
         shell: bash
@@ -56,15 +68,15 @@ jobs:
           mkdir -p standalone/scripts
           cp scripts/create_audit_logs.sql standalone/scripts/ 2>/dev/null || true
           find standalone -type f \( -name '*.bak' -o -name '*.bak-*' -o -name '*.before-*' -o -name '*.pyc' \) -delete
-          find standalone -type d \( -name '__pycache__' -o -name '.pytest_cache' -o -name '.mypy_cache' -o -name '.ruff_cache' \) -prune -exec rm -rf {} +
+          find standalone -type d \( -name '__pycache__' -o -name '.pytest_cache' -o -name '.mypy_cache' -o -name '.ruff_cache' -o -name 'node_modules' -o -name 'dist' \) -prune -exec rm -rf {} +
           rm -rf standalone/backend/app-old standalone/backend/rag_ocr_upgrade
           python -m compileall -q standalone/backend/app
-          printf '%s\n' '5cd58d2627d1612348b796250c3947a7637f8bd2 + cumulative runtime through v6' > standalone/BASELINE.txt
+          printf '%s\n' '5cd58d2627d1612348b796250c3947a7637f8bd2 + cumulative runtime through v6 + complete historical frontend contracts' > standalone/BASELINE.txt
 
       - name: Upload standalone source
         uses: actions/upload-artifact@v4
         with:
-          name: pdfrag-standalone-through-v6
+          name: pdfrag-standalone-through-v6-v71
           path: standalone
           if-no-files-found: error
           retention-days: 2
