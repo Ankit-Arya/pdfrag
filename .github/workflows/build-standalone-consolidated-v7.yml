@@ -39,7 +39,11 @@ jobs:
           python apply_ims_ui_v2_synthesis_v52_patch.py --repo .
           python apply_ims_documents_panel_props_hotfix.py --repo .
           python apply_ims_v521_deployment_patch.py --repo .
-          python apply_pdfrag_pdf_chunk_explorer_v1.py --repo .
+          python apply_pdfrag_pdf_chunk_explorer_v1.py --repo . || {
+            test -f frontend/src/components/DocumentChunkExplorer.vue
+            grep -q 'def inspect_document_v5_chunks' backend/app/api.py
+            grep -q 'export async function listDocumentChunks' frontend/src/services/api.ts
+          }
           python pdfrag-rag-v5.3-coverage-first-deployment/apply_ims_v53_coverage_first_patch.py --repo .
           python pdfrag-v5.4-smart-completeness/apply_ims_v54_smart_completeness_patch.py --repo .
           python pdfrag-v5.5-procedure-integrity/apply_ims_v55_procedure_integrity_patch.py --repo .
