@@ -34,7 +34,9 @@ jobs:
           python apply_ims_chunk_search_patch.py --repo .
           python apply_ims_chunk_search_frontend_hotfix.py --repo .
           python apply_ims_chunk_search_scroll_hotfix_v2.py --repo .
+          ln -sf styles.css frontend/src/style.css
           python apply_ims_ui_v2_synthesis_v52_patch.py --repo .
+          rm -f frontend/src/style.css
           python apply_ims_v521_deployment_patch.py --repo .
           python pdfrag-rag-v5.3-coverage-first-deployment/apply_ims_v53_coverage_first_patch.py --repo .
           python pdfrag-v5.4-smart-completeness/apply_ims_v54_smart_completeness_patch.py --repo .
