@@ -1,0 +1,70 @@
+name: Build standalone consolidated v7
+
+on:
+  push:
+    branches:
+      - standalone-consolidated-v7-build
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout snapshot
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Materialize cumulative runtime source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python apply_v5_patch.py --repo . --allow-drift
+          python apply_v5_table_parallel_hotfix.py --repo .
+          python apply_ims_assistant_v51_patch.py --repo .
+          python apply_ims_v51_runtime_hotfix_1.py --repo .
+          python apply_ims_chunk_search_patch.py --repo .
+          python apply_ims_chunk_search_frontend_hotfix.py --repo .
+          python apply_ims_chunk_search_scroll_hotfix_v2.py --repo .
+          python apply_ims_documents_panel_props_hotfix.py --repo . || true
+          python apply_ims_v52_installer_compat_repair_v4.py --repo .
+          python apply_ims_ui_v2_synthesis_v52_patch.py --repo .
+          python apply_ims_v521_deployment_patch.py --repo .
+          python pdfrag-rag-v5.3-coverage-first-deployment/apply_ims_v53_coverage_first_patch.py --repo .
+          python pdfrag-v5.4-smart-completeness/apply_ims_v54_smart_completeness_patch.py --repo .
+          python pdfrag-v5.5-procedure-integrity/apply_ims_v55_procedure_integrity_patch.py --repo .
+          python pdfrag-v5.5.1-virtual-chunk-id-hotfix/apply_ims_v551_virtual_chunk_id_hotfix.py --repo .
+          python pdfrag-v6-evidence-workspace-pilot/apply_ims_v6_evidence_workspace_pilot.py --repo .
+
+      - name: Build canonical standalone tree
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p standalone
+          cp -a backend frontend nginx models standalone/
+          cp docker-compose.yml docker-compose.smart-rag.yml docker-compose.v5.yml standalone/
+          cp .env.example .env.smart-rag.example .env.v5.example standalone/ 2>/dev/null || true
+          cp LICENSE standalone/ 2>/dev/null || true
+          mkdir -p standalone/scripts
+          cp scripts/create_audit_logs.sql standalone/scripts/ 2>/dev/null || true
+          find standalone -type f \( -name '*.bak' -o -name '*.bak-*' -o -name '*.before-*' -o -name '*.pyc' \) -delete
+          find standalone -type d \( -name '__pycache__' -o -name '.pytest_cache' -o -name '.mypy_cache' -o -name '.ruff_cache' \) -prune -exec rm -rf {} +
+          rm -rf standalone/backend/app-old standalone/backend/rag_ocr_upgrade
+          python -m compileall -q standalone/backend/app
+          printf '%s\n' '5cd58d2627d1612348b796250c3947a7637f8bd2 + cumulative runtime through v6' > standalone/BASELINE.txt
+
+      - name: Upload standalone source
+        uses: actions/upload-artifact@v4
+        with:
+          name: pdfrag-standalone-through-v6
+          path: standalone
+          if-no-files-found: error
+          retention-days: 2
